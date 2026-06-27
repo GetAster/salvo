@@ -33,6 +33,17 @@ where
     }
 }
 
+/// Request/response extension marker recorded by
+/// [`Request::web_transport_owned`](crate::http::Request::web_transport_owned).
+///
+/// The handler asked for an *owned* session so it can move it into a task that
+/// outlives `Handler::handle`. If that task still holds the session when the
+/// handler returns, the connection has been handed off: the HTTP/3 accept loop
+/// for this connection stops cleanly instead of reporting the shared session
+/// as an error.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WebTransportOwnedHandOff;
+
 /// Builder used to serve HTTP/3 connections.
 pub struct Builder {
     inner: salvo_http3::server::Builder,
@@ -268,10 +279,28 @@ async fn process_web_transport(
         .await
         .map_err(|e| IoError::other(format!("failed to call hyper service : {e}")))?;
 
-    if let Some(session) = take_unique_arc_extension::<
-        WebTransportSession<salvo_http3::quinn::Connection, Bytes>,
-    >(response.extensions_mut(), "WebTransport session")?
+    let handed_off = response
+        .extensions_mut()
+        .remove::<WebTransportOwnedHandOff>()
+        .is_some();
+    let session = match response
+        .extensions_mut()
+        .remove::<Arc<WebTransportSession<salvo_http3::quinn::Connection, Bytes>>>()
     {
+        Some(session) => match Arc::try_unwrap(session) {
+            Ok(session) => Some(session),
+            // `Request::web_transport_owned()` moved the session into a task that is still
+            // running. That task now owns the HTTP/3 connection; stop this accept loop
+            // without treating the hand-off as an error.
+            Err(_shared) if handed_off => {
+                tracing::debug!("WebTransport session handed off to an owned task");
+                return Ok(None);
+            }
+            Err(_shared) => return Err(IoError::other("WebTransport session is still shared")),
+        },
+        None => None,
+    };
+    if let Some(session) = session {
         // `WebTransportSession::accept` already sent the successful CONNECT response. Restore the
         // connection without passing its stream through the normal response writer, which would
         // send a second response on the accepted CONNECT stream.
