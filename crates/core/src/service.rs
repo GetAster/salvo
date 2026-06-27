@@ -389,6 +389,12 @@ impl HyperHandler {
                 {
                     res.extensions.insert(session);
                 }
+                if let Some(handoff) = req
+                    .extensions
+                    .remove::<crate::conn::quinn::WebTransportOwnedHandOff>()
+                {
+                    res.extensions.insert(handoff);
+                }
                 if let Some(conn) = req.extensions.remove::<Arc<
                     Mutex<salvo_http3::server::Connection<salvo_http3::quinn::Connection, Bytes>>,
                 >>() {
