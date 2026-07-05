@@ -10,10 +10,7 @@ use bytes::Buf;
 use futures_util::{Future, future::poll_fn, ready};
 use h3::{
     ConnectionState, SharedState,
-    error::{
-        Code, ConnectionError, StreamError, connection_error_creators::CloseStream,
-        internal_error::InternalConnectionError,
-    },
+    error::{ConnectionError, StreamError, connection_error_creators::CloseStream},
     frame::FrameStream,
     proto::frame::Frame,
     quic::{self, OpenStreams, WriteBuf},
@@ -96,24 +93,19 @@ where
         let shared = conn.inner.shared.clone();
         let config = shared.settings();
 
+        // Do NOT hard-require WT/datagram declarations in the CLIENT's settings.
+        // Only draft-02 clients (Chrome) send ENABLE_WEBTRANSPORT; ratified-era
+        // clients (Safari/WebKit) send neither it nor WT_MAX_SESSIONS — for them
+        // the extended CONNECT with :protocol=webtransport IS the declaration of
+        // support. Rejecting here surfaced as H3_SETTINGS_ERROR killing the whole
+        // connection for Safari 26. Keep the signals as debug logs only.
         if !config.enable_webtransport() {
-            return Err(StreamError::ConnectionError(
-                conn.inner
-                    .handle_connection_error(InternalConnectionError::new(
-                        Code::H3_SETTINGS_ERROR,
-                        "webtransport is not supported by client".to_string(),
-                    )),
-            ));
+            tracing::debug!(
+                "client sent no explicit webtransport setting (ratified-era client?) — accepting"
+            );
         }
-
         if !config.enable_datagram() {
-            return Err(StreamError::ConnectionError(
-                conn.inner
-                    .handle_connection_error(InternalConnectionError::new(
-                        Code::H3_SETTINGS_ERROR,
-                        "datagrams are not supported by client".to_string(),
-                    )),
-            ));
+            tracing::debug!("client sent no H3_DATAGRAM setting — accepting session anyway");
         }
 
         // The peer is responsible for validating our side of the webtransport support.
@@ -136,7 +128,8 @@ where
 
         //= https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.3
         let response = Response::builder()
-            // This is the only header that chrome cares about.
+            // Chrome's draft-02 negotiation header; ratified-era clients
+            // (Safari/Network.framework) ignore it (A/B verified).
             .header("sec-webtransport-http3-draft", "draft02")
             .status(StatusCode::OK)
             .body(())
