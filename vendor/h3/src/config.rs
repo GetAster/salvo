@@ -46,6 +46,13 @@ pub struct Settings {
 impl From<&frame::Settings> for Settings {
     fn from(settings: &frame::Settings) -> Self {
         let defaults: Self = Default::default();
+        // A peer signals WebTransport support with whichever code point its
+        // draft era uses: draft-02 sends ENABLE_WEBTRANSPORT, draft-10+ (WebKit)
+        // sends WT_MAX_SESSIONS > 0, draft-07..09 sent 0xc671706a. Treat any of
+        // them as "peer supports WebTransport" so one server serves them all.
+        let ratified_max_sessions = settings
+            .get(frame::SettingId::WT_MAX_SESSIONS)
+            .or_else(|| settings.get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07));
         Self {
             max_field_section_size: settings
                 .get(frame::SettingId::MAX_HEADER_LIST_SIZE)
@@ -53,9 +60,11 @@ impl From<&frame::Settings> for Settings {
             enable_webtransport: settings
                 .get(frame::SettingId::ENABLE_WEBTRANSPORT)
                 .map(|value| value != 0)
+                .or(ratified_max_sessions.map(|value| value != 0))
                 .unwrap_or(defaults.enable_webtransport),
             max_webtransport_sessions: settings
                 .get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS)
+                .or(ratified_max_sessions)
                 .unwrap_or(defaults.max_webtransport_sessions),
             enable_datagram: settings
                 .get(frame::SettingId::H3_DATAGRAM)
@@ -127,6 +136,21 @@ impl TryFrom<Config> for frame::Settings {
         settings.insert(frame::SettingId::H3_DATAGRAM, enable_datagram as u64)?;
         settings.insert(
             frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
+            max_webtransport_sessions,
+        )?;
+
+        // Ratified-era advertisement (see frame.rs). Empirically A/B'd against
+        // Apple's Network.framework WebTransport client (Safari/iPadOS/macOS 26,
+        // 2026-07): it keys on 0xc671706a (the draft-07..09 code point — omit it
+        // and Apple cancels the CONNECT), tolerates the draft-02 pair and
+        // 0x14e9cd29, and REJECTS sessions when the draft-13 WT_INITIAL_MAX_*
+        // settings (0x2b61/0x2b64/0x2b65) are present — do NOT advertise those.
+        settings.insert(
+            frame::SettingId::WT_MAX_SESSIONS,
+            max_webtransport_sessions,
+        )?;
+        settings.insert(
+            frame::SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07,
             max_webtransport_sessions,
         )?;
 
