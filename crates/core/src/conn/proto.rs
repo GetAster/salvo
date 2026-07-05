@@ -80,6 +80,18 @@ impl HttpBuilder {
         }
     }
 
+    /// Whether TCP (H1/H2) responses advertise `Alt-Svc: h3` pointing clients
+    /// at the QUIC listener (default true). Disable when only WebTransport
+    /// should use QUIC: some clients (Safari/Network.framework) migrate plain
+    /// fetches onto H3 mid-page and can wedge them silently, while WebTransport
+    /// itself connects directly and never needs the Alt-Svc hint.
+    #[cfg(feature = "quinn")]
+    #[must_use]
+    pub fn auto_alt_svc_header(mut self, enabled: bool) -> Self {
+        self.quinn.auto_alt_svc_header(enabled);
+        self
+    }
+
     /// Serve a connection with the given service.
     #[allow(unused_variables)]
     pub async fn serve_connection<I, S, B>(
