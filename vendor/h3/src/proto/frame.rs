@@ -406,6 +406,11 @@ impl SettingId {
                 | SettingId::ENABLE_CONNECT_PROTOCOL
                 | SettingId::ENABLE_WEBTRANSPORT
                 | SettingId::WEBTRANSPORT_MAX_SESSIONS
+                | SettingId::WEBTRANSPORT_MAX_SESSIONS_DRAFT07
+                | SettingId::WT_MAX_SESSIONS
+                | SettingId::WT_INITIAL_MAX_DATA
+                | SettingId::WT_INITIAL_MAX_STREAMS_UNI
+                | SettingId::WT_INITIAL_MAX_STREAMS_BIDI
                 | SettingId::H3_DATAGRAM,
         )
     }
@@ -455,9 +460,25 @@ setting_identifiers! {
     H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC= 0xFFD277,
 
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
+
+    // Ratified-era WebTransport code points. WebKit (Safari 26.4+) only speaks
+    // these; it ignores the draft-02 pair above, cancels the extended CONNECT,
+    // and the page sees "connection failed". Advertising every era is legal —
+    // unknown settings MUST be ignored (RFC 9114 §7.2.4.1) — so Chrome
+    // (draft-02) and Safari (draft-10+) can both negotiate against one server.
+    // draft-ietf-webtrans-http3-07..-09 SETTINGS_WEBTRANSPORT_MAX_SESSIONS:
+    WEBTRANSPORT_MAX_SESSIONS_DRAFT07 = 0xc671706a,
+    // draft-ietf-webtrans-http3-10+ / final registry code points:
+    // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-13#section-10.4
+    WT_MAX_SESSIONS = 0x14e9cd29,
+    WT_INITIAL_MAX_DATA = 0x2b61,
+    WT_INITIAL_MAX_STREAMS_UNI = 0x2b64,
+    WT_INITIAL_MAX_STREAMS_BIDI = 0x2b65,
 }
 
-const SETTINGS_LEN: usize = 8;
+// Sized for every setting a peer may legitimately send across WT drafts
+// (grease + the 12 supported ids above, with headroom).
+const SETTINGS_LEN: usize = 16;
 
 #[derive(Debug, PartialEq)]
 pub struct Settings {
@@ -659,35 +680,28 @@ mod tests {
 
     #[test]
     fn settings_frame() {
+        // Build fixed-size entry arrays without spelling out SETTINGS_LEN slots
+        // (the array grew when the WebTransport draft-era setting ids were added).
+        let mut sent = [(SettingId::NONE, 0); SETTINGS_LEN];
+        sent[0] = (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1);
+        sent[1] = (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2);
+        sent[2] = (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3);
+        sent[3] = (SettingId(95), 0);
+        let mut expected = [(SettingId::NONE, 0); SETTINGS_LEN];
+        expected[0] = (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1);
+        expected[1] = (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2);
+        expected[2] = (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3);
+        // check without the Grease setting because this is ignored
         codec_frame_check(
             Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    (SettingId(95), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
+                entries: sent,
                 len: 4,
             }),
             &[
                 4, 18, 6, 128, 0, 250, 209, 1, 128, 0, 250, 210, 7, 128, 0, 250, 211, 64, 95, 0,
             ],
             Frame::Settings(Settings {
-                entries: [
-                    (SettingId::MAX_HEADER_LIST_SIZE, 0xfad1),
-                    (SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2),
-                    (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
-                    // check without the Grease setting because this is ignored
-                    (SettingId(0), 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                    (SettingId::NONE, 0),
-                ],
+                entries: expected,
                 len: 3,
             }),
         );

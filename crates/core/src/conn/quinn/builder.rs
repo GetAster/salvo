@@ -80,6 +80,15 @@ impl Builder {
             .enable_webtransport(true)
             .enable_extended_connect(true)
             .enable_datagram(true)
+            // MUST stay 1 while this stack is single-session: advertising
+            // WT_MAX_SESSIONS > 1 flips Apple's Network.framework client into a
+            // multi-session mode this server doesn't implement (no session
+            // table / WT flow-control capsules) — sessions then establish
+            // (ready resolves) but NF refuses stream allocation: page-side
+            // createBidirectionalStream() rejects InvalidStateError and no
+            // incoming streams surface. Empirically 1 = fully working with
+            // Safari/NF; 64 = half-open sessions. Reload/pooling races are
+            // handled elsewhere (few-use tickets, no Alt-Svc).
             .max_webtransport_sessions(1)
             // h3 0.0.8 can leave aioquic/curl clients waiting for stream end
             // when a GREASE frame is sent just before finishing the response.
