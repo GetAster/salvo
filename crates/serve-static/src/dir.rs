@@ -8,11 +8,11 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::SystemTime;
 
-use salvo_core::fs::NamedFile;
+use salvo_core::fs::{NamedFile, extension_content_encoding};
 use salvo_core::handler::Handler;
-use salvo_core::http::header::{ACCEPT_ENCODING, VARY};
+use salvo_core::http::header::ACCEPT_ENCODING;
 use salvo_core::http::{
-    self, HeaderMap, HeaderValue, Request, Response, StatusCode, StatusError, mime,
+    self, HeaderValue, Method, Request, Response, StatusCode, StatusError, append_vary_header, mime,
 };
 use salvo_core::routing::{
     decode_url_path, encode_url_path, normalize_url_path, redirect_to_dir_url,
@@ -73,21 +73,6 @@ impl From<CompressionAlgo> for HeaderValue {
             CompressionAlgo::Gzip => Self::from_static("gzip"),
             CompressionAlgo::Zstd => Self::from_static("zstd"),
         }
-    }
-}
-
-fn append_vary_accept_encoding(headers: &mut HeaderMap) {
-    let already_varies = headers
-        .get_all(VARY)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|value| {
-            let value = value.trim();
-            value == "*" || value.eq_ignore_ascii_case("accept-encoding")
-        });
-    if !already_varies {
-        headers.append(VARY, HeaderValue::from_static("Accept-Encoding"));
     }
 }
 
@@ -153,11 +138,37 @@ where
 /// use salvo_serve_static::StaticDir;
 ///
 /// let router = Router::new().push(
-///     Router::with_path("static/<**>").get(
+///     Router::with_path("static/{**}").get(
 ///         StaticDir::new(["assets", "static"])
 ///             .defaults("index.html")
 ///             .auto_list(true),
 ///     ),
+/// );
+/// ```
+///
+/// `HEAD` requests are supported when the route is configured to match them. This lets clients
+/// and caches check file metadata such as `Content-Length`, `ETag`, and `Last-Modified` without
+/// downloading the response body.
+///
+/// **Security note**: a `HEAD` request still follows the same file lookup and metadata path as
+/// `GET`. A client can send a very small request that makes the server touch the filesystem.
+/// Enable `HEAD` at your own risk.
+///
+/// You can match both methods with a composed method filter:
+///
+/// ```
+/// use salvo_core::prelude::*;
+/// use salvo_core::routing::{Filter, filters};
+/// use salvo_serve_static::StaticDir;
+///
+/// let router = Router::new().push(
+///     Router::with_path("static/{**}")
+///         .filter(filters::get().or(filters::head()))
+///         .goal(
+///             StaticDir::new(["assets", "static"])
+///                 .defaults("index.html")
+///                 .auto_list(true),
+///         ),
 /// );
 /// ```
 #[non_exhaustive]
@@ -179,6 +190,10 @@ pub struct StaticDir {
     pub defaults: Vec<String>,
     /// Fallback file to serve when requested file isn't found
     pub fallback: Option<String>,
+    /// Overrides the `Content-Disposition` type for every served file
+    pub disposition_type: Option<String>,
+    /// Whether to send `X-Content-Type-Options: nosniff`
+    pub use_content_type_options: bool,
 }
 impl Debug for StaticDir {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -191,6 +206,8 @@ impl Debug for StaticDir {
             .field("compressed_variations", &self.compressed_variations)
             .field("defaults", &self.defaults)
             .field("fallback", &self.fallback)
+            .field("disposition_type", &self.disposition_type)
+            .field("use_content_type_options", &self.use_content_type_options)
             .finish()
     }
 }
@@ -214,7 +231,37 @@ impl StaticDir {
             compressed_variations,
             defaults: vec![],
             fallback: None,
+            disposition_type: None,
+            use_content_type_options: true,
         }
+    }
+
+    /// Sets the `Content-Disposition` type used for every served file, e.g.
+    /// `inline` or `attachment`.
+    ///
+    /// By default the type is derived per file from its content type: `inline`
+    /// for text, image, video and audio, `attachment` for everything else
+    /// including XML-based documents such as `image/svg+xml` and `text/xml`.
+    ///
+    /// Forcing `inline` makes every file in the directory render in the browser,
+    /// so only do it for directories whose contents you control. An SVG served
+    /// inline runs its own `<script>` in the serving origin, which is stored XSS
+    /// when the directory holds user uploads.
+    #[inline]
+    #[must_use]
+    pub fn disposition_type(mut self, disposition_type: impl Into<String>) -> Self {
+        self.disposition_type = Some(disposition_type.into());
+        self
+    }
+
+    /// Specifies whether to send `X-Content-Type-Options: nosniff`.
+    ///
+    /// Default is true.
+    #[inline]
+    #[must_use]
+    pub fn use_content_type_options(mut self, value: bool) -> Self {
+        self.use_content_type_options = value;
+        self
     }
 
     /// Sets include_dot_files.
@@ -444,22 +491,20 @@ impl Handler for StaticDir {
         _ctrl: &mut FlowCtrl,
     ) {
         let req_path = req.uri().path();
+        let decoded_path;
         let rel_path = if let Some(rest) = req.params().tail() {
             rest
         } else {
-            &*decode_url_path(req_path)
+            decoded_path = decode_url_path(req_path);
+            decoded_path.as_ref()
         };
         let rel_path = normalize_url_path(rel_path);
         let mut files: HashMap<String, Metadata> = HashMap::new();
         let mut dirs: HashMap<String, Metadata> = HashMap::new();
-        let is_dot_file = Path::new(&rel_path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.starts_with('.'))
-            .unwrap_or(false);
+        let has_dot_segment = rel_path.split('/').any(|part| part.starts_with('.'));
         let mut abs_path = None;
         let roots = self.canonical_roots().await;
-        if self.include_dot_files || !is_dot_file {
+        if self.include_dot_files || !has_dot_segment {
             for root in &roots {
                 // Use a single async symlink_metadata call for file type checks, then verify
                 // the canonical target stays under the canonical root before serving it.
@@ -527,11 +572,25 @@ impl Handler for StaticDir {
                 .as_deref()
                 .map(|ext| self.is_compressed_ext(ext))
                 .unwrap_or(false);
+            // A `.svgz` already is a gzip stream. Serving a precompressed variant of
+            // one would stack a second coding on top, and only the outer coding can
+            // be reported, so the client would strip that and be left holding gzip
+            // bytes labelled `image/svg+xml`. Serve the file itself instead.
+            let is_self_coded_ext = ext
+                .as_deref()
+                .map(|ext| extension_content_encoding(ext).is_some())
+                .unwrap_or(false);
             let mut content_encoding = None;
             let mut varies_on_accept_encoding = false;
             let content_type = mime_infer::from_path(&abs_path).first();
+            // Captured before the compressed-variant lookup may replace the path:
+            // a download must be named after the resource that was requested, not
+            // after the sidecar the bytes happen to be read from.
+            let requested_name = abs_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
 
-            let named_path = if !is_compressed_ext {
+            let named_path = if !is_compressed_ext && !is_self_coded_ext {
                 if !self.compressed_variations.is_empty() {
                     let mut new_abs_path = None;
                     let header = req
@@ -592,16 +651,30 @@ impl Handler for StaticDir {
                 if let Some(threshold) = self.preload_threshold {
                     builder = builder.preload_threshold(threshold);
                 }
+                if req.method() == Method::HEAD {
+                    builder = builder.preload_threshold(0);
+                }
                 if let Some(content_type) = content_type {
                     builder = builder.content_type(content_type);
                 }
+                if let Some(requested_name) = requested_name {
+                    builder = builder.disposition_name(requested_name);
+                }
+                if let Some(disposition_type) = &self.disposition_type {
+                    builder = builder.disposition_type(disposition_type.clone());
+                }
+                builder = builder.use_content_type_options(self.use_content_type_options);
                 (builder, varies_on_accept_encoding)
             };
             if let Ok(named_file) = builder.build().await {
                 let headers = req.headers();
-                named_file.send(headers, res).await;
+                if req.method() == Method::HEAD {
+                    named_file.send_head(headers, res).await;
+                } else {
+                    named_file.send(headers, res).await;
+                }
                 if varies_on_accept_encoding {
-                    append_vary_accept_encoding(res.headers_mut());
+                    append_vary_header(res.headers_mut(), "accept-encoding");
                 }
             } else {
                 res.render(StatusError::internal_server_error().brief("read file failed"));
@@ -638,7 +711,7 @@ impl Handler for StaticDir {
                 .map(|(name, metadata)| DirInfo::new(name, &metadata))
                 .collect();
             dirs.sort_by(|a, b| a.name.cmp(&b.name));
-            let root = CurrentInfo::new(decode_url_path(req_path), files, dirs);
+            let root = CurrentInfo::new(decode_url_path(req_path).into_owned(), files, dirs);
             res.status_code(StatusCode::OK);
             match format.subtype().as_ref() {
                 "plain" => res.render(Text::Plain(list_text(&root))),
@@ -665,7 +738,7 @@ fn list_xml(current: &CurrentInfo) -> String {
                 xml,
                 "<dir><name>{}</name><modified>{}</modified><link>{}</link></dir>",
                 xml_escape(&dir.name),
-                dir.modified.format(&format).expect("format time failed"),
+                dir.modified.format(&format).unwrap_or_else(|_| "-".into()),
                 encode_url_path(&dir.name),
             );
         }
@@ -674,7 +747,7 @@ fn list_xml(current: &CurrentInfo) -> String {
                 xml,
                 "<file><name>{}</name><modified>{}</modified><size>{}</size><link>{}</link></file>",
                 xml_escape(&file.name),
-                file.modified.format(&format).expect("format time failed"),
+                file.modified.format(&format).unwrap_or_else(|_| "-".into()),
                 file.size,
                 encode_url_path(&file.name),
             );
@@ -692,6 +765,9 @@ fn is_safe_relative_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
+/// Escape the five XML special characters. Also used for HTML text nodes and
+/// the page title in the directory listing: the escape set is identical, and
+/// unlike percent-encoding it is an actual markup escaper.
 fn xml_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -733,10 +809,12 @@ fn list_html(current: &CurrentInfo) -> String {
             .trim_end_matches('/')
             .split('/')
         {
-            let encoded = encode_url_path(seg);
+            // URL-encode the href, but entity-escape the visible text: percent
+            // encoding is a URL escaper, not an HTML one, and it also renders
+            // non-ASCII names as unreadable `%xx` runs.
             link.push('/');
-            link.push_str(&encoded);
-            let _ = write!(out, r#"/<a href="{link}">{encoded}</a>"#);
+            link.push_str(&encode_url_path(seg));
+            let _ = write!(out, r#"/<a href="{link}">{}</a>"#, xml_escape(seg));
         }
     }
     let mut html = format!(
@@ -745,7 +823,7 @@ fn list_html(current: &CurrentInfo) -> String {
         <meta name="viewport" content="width=device-width">
         <title>{}</title>
         <style>{}</style></head><body><header><h3>Index of: "#,
-        encode_url_path(&current.path),
+        xml_escape(&current.path),
         HTML_STYLE,
     );
     header_link(&mut html, &current.path);
@@ -763,25 +841,23 @@ fn list_html(current: &CurrentInfo) -> String {
         );
         let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
         for dir in &current.dirs {
-            let encoded = encode_url_path(&dir.name);
             let _ = write!(
                 html,
                 r#"<tr><td>{}</td><td><a href="./{}/">{}</a></td><td>{}</td><td></td></tr>"#,
                 DIR_ICON,
-                encoded,
-                encoded,
-                dir.modified.format(&format).expect("format time failed"),
+                encode_url_path(&dir.name),
+                xml_escape(&dir.name),
+                dir.modified.format(&format).unwrap_or_else(|_| "-".into()),
             );
         }
         for file in &current.files {
-            let encoded = encode_url_path(&file.name);
             let _ = write!(
                 html,
                 r#"<tr><td>{}</td><td><a href="./{}">{}</a></td><td>{}</td><td>{}</td></tr>"#,
                 FILE_ICON,
-                encoded,
-                encoded,
-                file.modified.format(&format).expect("format time failed"),
+                encode_url_path(&file.name),
+                xml_escape(&file.name),
+                file.modified.format(&format).unwrap_or_else(|_| "-".into()),
                 human_size(file.size)
             );
         }
@@ -801,7 +877,7 @@ fn list_text(current: &CurrentInfo) -> String {
         let _ = writeln!(
             txt,
             "[DIR]  {}  {}",
-            dir.modified.format(&format).expect("format time failed"),
+            dir.modified.format(&format).unwrap_or_else(|_| "-".into()),
             dir.name,
         );
     }
@@ -810,7 +886,7 @@ fn list_text(current: &CurrentInfo) -> String {
             txt,
             "{:>10}  {}  {}",
             human_size(file.size),
-            file.modified.format(&format).expect("format time failed"),
+            file.modified.format(&format).unwrap_or_else(|_| "-".into()),
             file.name,
         );
     }
@@ -856,7 +932,33 @@ const HOME_ICON: &str = r#"<svg aria-hidden="true" data-icon="home" viewBox="0 0
 
 #[cfg(test)]
 mod tests {
-    use crate::dir::{human_size, is_safe_relative_path, xml_escape};
+    use crate::dir::{
+        CurrentInfo, DirInfo, FileInfo, human_size, is_safe_relative_path, list_html, xml_escape,
+    };
+
+    #[test]
+    fn test_list_html_escapes_visible_names() {
+        // Names in the listing are attacker-influenced only when the served
+        // directory is writable by untrusted parties, but the text nodes must be
+        // entity-escaped regardless — percent-encoding is a URL escaper, not an
+        // HTML one. (Names here need not be creatable on every filesystem; the
+        // renderer takes them as plain strings.)
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let file = temp.path().join("probe");
+        std::fs::write(&file, b"x").expect("write file");
+        let metadata = std::fs::metadata(&file).expect("metadata");
+
+        let files = vec![FileInfo::new("a&b'<c>.txt".to_owned(), &metadata)];
+        let dirs = vec![DirInfo::new(r#"d"ir&"#.to_owned(), &metadata)];
+        let html = list_html(&CurrentInfo::new("pa&th".to_owned(), files, dirs));
+
+        // Visible text is entity-escaped...
+        assert!(html.contains("a&amp;b&apos;&lt;c&gt;.txt"));
+        assert!(html.contains("d&quot;ir&amp;"));
+        assert!(html.contains("<title>pa&amp;th</title>"));
+        // ...and the raw markup-significant name never appears anywhere.
+        assert!(!html.contains("<c>.txt"));
+    }
 
     #[tokio::test]
     async fn test_convert_bytes_to_units() {

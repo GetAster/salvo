@@ -519,7 +519,14 @@ where
             return Err(Error::other("upstreams is empty"));
         }
 
-        let path = (self.url_path_getter)(req, depot).unwrap_or_default();
+        let path = (self.url_path_getter)(req, depot).unwrap_or_else(|| {
+            // A `None` from the path getter means "no extra path"; the request is
+            // forwarded to the upstream root. Log it so a misconfigured custom getter
+            // (one that fails to extract the intended segment) is observable instead
+            // of silently proxying to the upstream root.
+            tracing::debug!("url_path_getter returned None; forwarding to upstream root path");
+            String::new()
+        });
         if self.strict_path_normalization_enabled {
             if contains_ambiguous_path_escape(&path) {
                 return Err(Error::other("ambiguous percent-encoded path"));
@@ -881,7 +888,6 @@ mod tests {
 
     #[test]
     fn test_host_header_handling() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let uri = Uri::from_str("http://host.tld/test").unwrap();
         let mut req = Request::new();
         let depot = Depot::new();
@@ -930,7 +936,6 @@ mod tests {
 
     #[test]
     fn test_proxy_default_host_header_getter_includes_port() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         // `Proxy::new` now defaults to the standards-compliant getter, which keeps
         // a non-default upstream port in the forwarded `Host`.
         let proxy = Proxy::new(vec!["http://host.tld:8080"], HyperClient::default());
@@ -1100,8 +1105,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_websocket_connection_with_split_connection_headers() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
         let upstream_router = Router::with_path("ws").goal(websocket_echo);
         let (upstream_addr, upstream_server) = spawn_server(upstream_router).await;
 

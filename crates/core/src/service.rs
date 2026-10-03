@@ -1,4 +1,5 @@
 use std::fmt::{self, Debug, Formatter};
+use std::future::pending;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 
@@ -10,12 +11,12 @@ use hyper::{Method, Request as HyperRequest, Response as HyperResponse};
 
 use crate::catcher::{Catcher, write_error_default};
 use crate::conn::SocketAddr;
-use crate::fuse::ArcFusewire;
+use crate::fuse::FuseConfig;
 use crate::handler::{Handler, WhenHoop};
 use crate::http::body::{ReqBody, ResBody};
 use crate::http::{Mime, Request, Response, StatusCode};
 use crate::routing::{FlowCtrl, PathState, Router};
-use crate::{Depot, async_trait};
+use crate::{ConnCtrl, Depot, async_trait};
 
 /// Service http request.
 #[non_exhaustive]
@@ -152,7 +153,8 @@ impl Service {
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
         http_scheme: Scheme,
-        fusewire: Option<ArcFusewire>,
+        fuse_config: Option<FuseConfig>,
+        conn_ctrl: ConnCtrl,
         alt_svc_h3: Option<HeaderValue>,
     ) -> HyperHandler {
         HyperHandler {
@@ -165,7 +167,8 @@ impl Service {
                 hoops: self.hoops.clone(),
                 allowed_media_types: self.allowed_media_types.clone(),
             }),
-            fusewire,
+            fuse_config,
+            conn_ctrl,
             alt_svc_h3,
         }
     }
@@ -179,6 +182,7 @@ impl Service {
             request.remote_addr.clone(),
             request.scheme.clone(),
             None,
+            ConnCtrl::new(),
             None,
         )
         .handle(request)
@@ -232,7 +236,8 @@ pub struct HyperHandler {
     pub(crate) remote_addr: SocketAddr,
     pub(crate) http_scheme: Scheme,
     pub(crate) state: Arc<HyperHandlerState>,
-    pub(crate) fusewire: Option<ArcFusewire>,
+    pub(crate) fuse_config: Option<FuseConfig>,
+    pub(crate) conn_ctrl: ConnCtrl,
     pub(crate) alt_svc_h3: Option<HeaderValue>,
 }
 impl Debug for HyperHandler {
@@ -252,22 +257,29 @@ impl HyperHandler {
     /// Handle [`Request`] and returns [`Response`].
     pub fn handle(&self, mut req: Request) -> impl Future<Output = Response> + 'static {
         let state = self.state.clone();
+        let conn_ctrl = self.conn_ctrl.clone();
         req.local_addr = self.local_addr.clone();
         req.remote_addr = self.remote_addr.clone();
+        // Expose the connection control on the request so protocol-upgrade handlers
+        // (e.g. WebSocket) can relax the transport fuse timers for the long-lived
+        // connection they are about to take over.
+        req.extensions_mut().insert(conn_ctrl.clone());
         #[cfg(not(feature = "cookie"))]
         let mut res = Response::new();
         #[cfg(feature = "cookie")]
-        let mut res = Response::with_cookies(req.cookies.clone());
+        let mut res = Response::with_request_cookies(&req.cookies);
         if let Some(alt_svc_h3) = &self.alt_svc_h3
             && !res.headers().contains_key(ALT_SVC)
         {
             res.headers_mut().insert(ALT_SVC, alt_svc_h3.clone());
         }
         let mut depot = Depot::new();
-        let mut path_state = PathState::new(req.uri().path());
 
         async move {
+            let path = req.uri().path().to_owned();
+            let mut path_state = PathState::from_owned_path(path);
             if let Some(dm) = state.router.detect(&mut req, &mut path_state).await {
+                path_state.params.seal();
                 req.params = path_state.params;
                 #[cfg(feature = "matched-path")]
                 {
@@ -280,13 +292,14 @@ impl HyperHandler {
                 handlers.extend(dm.hoops);
                 handlers.push(DEFAULT_STATUS_OK_HANDLER.clone());
                 handlers.push(dm.goal);
-                let mut ctrl = FlowCtrl::new(handlers);
+                let mut ctrl = FlowCtrl::with_conn(handlers, conn_ctrl.clone());
                 ctrl.call_next(&mut req, &mut depot, &mut res).await;
                 // Set it to default status code again if any hoop set status code to None.
                 if res.status_code.is_none() {
                     res.status_code = Some(StatusCode::OK);
                 }
             } else if !state.hoops.is_empty() {
+                path_state.params.seal();
                 req.params = path_state.params;
                 // Set default status code before service hoops executed.
                 // We hope all hoops in service can get the correct status code.
@@ -295,7 +308,7 @@ impl HyperHandler {
                 } else {
                     res.status_code = Some(StatusCode::NOT_FOUND);
                 }
-                let mut ctrl = FlowCtrl::new(state.hoops.clone());
+                let mut ctrl = FlowCtrl::with_conn(state.hoops.clone(), conn_ctrl.clone());
                 ctrl.call_next(&mut req, &mut depot, &mut res).await;
                 // Set it to default status code again if any hoop set status code to None.
                 if res.status_code.is_none() && path_state.once_ended {
@@ -352,7 +365,9 @@ impl HyperHandler {
                 && has_error
             {
                 if let Some(catcher) = &state.catcher {
-                    catcher.catch(&mut req, &mut depot, &mut res).await;
+                    catcher
+                        .catch(&mut req, &mut depot, &mut res, conn_ctrl)
+                        .await;
                 } else {
                     write_error_default(&req, &mut res, None);
                 }
@@ -429,9 +444,19 @@ where
             }
         }
         let mut request = Request::from_hyper(req, scheme);
-        request.body.set_fusewire(self.fusewire.clone());
+        request.body.set_fuse_config(self.fuse_config);
         let response = self.handle(request);
-        Box::pin(async move { Ok(response.await.into_hyper()) })
+        let conn_ctrl = self.conn_ctrl.clone();
+        Box::pin(async move {
+            let response = response.await;
+            // Do not return a response to Hyper after a handler abort. Yielding
+            // Pending here lets the connection driver observe the abort signal
+            // and drop the entire protocol connection first.
+            if conn_ctrl.is_aborted() {
+                pending::<()>().await;
+            }
+            Ok(response.into_hyper())
+        })
     }
 }
 

@@ -68,17 +68,20 @@ impl TryToTokens for ToParameters {
         let (impl_generics, ty_generics, where_clause) = self.generics.split_for_impl();
 
         let ex_life = &Lifetime::new("'__macro_gen_ex", Span::call_site());
-        let ex_lifetime: GenericParam = LifetimeParam::new(ex_life.clone()).into();
+        let ex_lifetime = GenericParam::Lifetime(LifetimeParam::new(ex_life.clone()));
         let mut ex_generics = self.generics.clone();
         ex_generics.params.insert(0, ex_lifetime);
         let ex_impl_generics = ex_generics.split_for_impl().0;
 
+        // Container-level config is spelled `parameters(...)`, but the singular
+        // `parameter(...)` is accepted as an alias so the key matches its
+        // field-level counterpart (see `resolve_field_features`).
         let mut parameters_features = self
             .attrs
             .iter()
             .filter(|attr| attr.path().is_ident("salvo"))
             .filter_map(|attr| {
-                attribute::find_nested_list(attr, "parameters")
+                attribute::find_nested_list_any(attr, &["parameters", "parameter"])
                     .ok()
                     .flatten()
             })
@@ -91,22 +94,6 @@ impl TryToTokens for ToParameters {
             .into_iter()
             .reduce(|acc, item| acc.merge(item));
         let serde_container = serde_util::parse_container(&self.attrs).map_err(Diagnostic::from)?;
-
-        // #[param] is only supported over fields
-        if self.attrs.iter().any(|attr| {
-            attr.path().is_ident("salvo")
-                && attribute::find_nested_list(attr, "parameter")
-                    .ok()
-                    .flatten()
-                    .is_some()
-        }) {
-            return Err(Diagnostic::spanned(
-                ident.span(),
-                DiagLevel::Error,
-                "found `parameter` attribute in unsupported context",
-            )
-            .help("Did you mean `parameters`?"));
-        }
 
         let names = parameters_features.as_mut().and_then(|features| {
             let to_parameters_names = pop_feature!(features => Feature::ToParametersNames(_));
@@ -123,7 +110,11 @@ impl TryToTokens for ToParameters {
                 default_parameter_in
             {
                 match default_parameter_in {
-                    ParameterIn::Query => quote! { #salvo::extract::metadata::SourceFrom::Query },
+                    // `querystring` describes the whole query string as one value; salvo
+                    // extracts from the same place, so it shares `SourceFrom::Query`.
+                    ParameterIn::Query | ParameterIn::QueryString => {
+                        quote! { #salvo::extract::metadata::SourceFrom::Query }
+                    }
                     ParameterIn::Header => quote! { #salvo::extract::metadata::SourceFrom::Header },
                     ParameterIn::Path => quote! { #salvo::extract::metadata::SourceFrom::Param },
                     ParameterIn::Cookie => quote! { #salvo::extract::metadata::SourceFrom::Cookie },
@@ -415,7 +406,10 @@ impl Parameter<'_> {
             .iter()
             .filter_map(|attr| {
                 if attr.path().is_ident("salvo") {
-                    attribute::find_nested_list(attr, "parameter")
+                    // Field-level config is spelled `parameter(...)`; the plural
+                    // `parameters(...)` is accepted as an alias so the key matches
+                    // its container-level counterpart.
+                    attribute::find_nested_list_any(attr, &["parameter", "parameters"])
                         .ok()
                         .flatten()
                         .map(|metas| {
@@ -488,7 +482,12 @@ impl Parameter<'_> {
         });
         if let Some(parameter_in) = param_features.pop_parameter_in_feature() {
             let source = match parameter_in {
-                attributes::ParameterIn(crate::parameter::ParameterIn::Query) => {
+                // `querystring` describes the whole query string as one value; salvo extracts
+                // from the same place, so it shares `SourceFrom::Query`.
+                attributes::ParameterIn(
+                    crate::parameter::ParameterIn::Query
+                    | crate::parameter::ParameterIn::QueryString,
+                ) => {
                     quote! { #salvo::extract::metadata::Source::new(#salvo::extract::metadata::SourceFrom::Query, #salvo::extract::metadata::SourceParser::Smart) }
                 }
                 attributes::ParameterIn(crate::parameter::ParameterIn::Header) => {

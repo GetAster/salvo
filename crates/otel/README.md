@@ -21,7 +21,7 @@
 <a href="https://docs.rs/salvo"><img alt="Documentation" src="https://docs.rs/salvo/badge.svg" /></a>
 <a href="https://crates.io/crates/salvo"><img alt="Download" src="https://img.shields.io/crates/d/salvo.svg" /></a>
 <a href="https://github.com/rust-secure-code/safety-dance/"><img alt="unsafe forbidden" src="https://img.shields.io/badge/unsafe-forbidden-success.svg" /></a>
-<a href="https://blog.rust-lang.org/2025/12/11/Rust-1.92.0/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.92%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2026/03/05/Rust-1.94.0/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.94%2B-blue" /></a>
 <br>
 <a href="https://salvo.rs">
     <img alt="Website" src="https://img.shields.io/badge/https-salvo.rs-%23f00" />
@@ -52,24 +52,42 @@ OpenTelemetry integration for the Salvo web framework. This crate provides middl
 
 | Middleware | Purpose |
 |------------|---------|
-| `Metrics` | Collects HTTP request metrics (latency, status codes, etc.) |
+| `Metrics` | Records the HTTP server metrics of the semantic conventions |
 | `Tracing` | Adds distributed tracing spans to requests |
 
 ## Collected Metrics
 
-The `Metrics` middleware collects:
-- `http.server.request.duration` - Request duration histogram
-- `http.server.active_requests` - Number of in-flight requests
-- `http.server.request.body.size` - Request body size
-- `http.server.response.body.size` - Response body size
+The `Metrics` middleware records:
 
-## Trace Attributes
+| Name | Instrument | Unit |
+|------|------------|------|
+| `http.server.request.duration` | histogram | `s` |
+| `http.server.active_requests` | up-down counter | `{request}` |
+| `http.server.request.body.size` | histogram | `By` |
+| `http.server.response.body.size` | histogram | `By` |
 
-The `Tracing` middleware adds standard HTTP semantic conventions:
-- `http.method` - HTTP method
-- `http.route` - Matched route pattern
-- `http.status_code` - Response status code
-- `http.url` - Request URL
+There is no request or error counter: the duration histogram already carries the
+request count — a Prometheus exporter renders it as
+`http_server_request_duration_seconds_count` — and failures are selected by
+filtering on `error.type` or `http.response.status_code`.
+
+## Attributes
+
+Both middlewares follow the [HTTP semantic conventions][semconv] for attribute
+names and values: `http.request.method`, `http.route`,
+`http.response.status_code`, `url.scheme`, `url.path`, `url.query`,
+`network.protocol.version` and `error.type`.
+
+The request target is reported as the matched route template (`/users/{id}`)
+rather than the requested URI, so the number of metric time series stays
+proportional to the number of routes rather than growing with traffic. Requests
+with a method the conventions do not name are reported as `_OTHER`; list your
+own with `Metrics::with_known_methods`.
+
+`http.route` needs the `matched-path` feature, which is enabled by default —
+through the `salvo` crate, by its own `matched-path` feature.
+
+[semconv]: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/
 
 ## Installation
 

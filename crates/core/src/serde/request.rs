@@ -16,53 +16,38 @@ use crate::http::header::HeaderMap;
 use crate::serde::{CowValue, FlatValue, VecValue};
 use crate::{Depot, Request};
 
-/// Type alias for depot value extractor functions.
-/// Each extractor attempts to extract a specific type from the Depot and convert it to `Cow<str>`.
-type DepotExtractFn = for<'a> fn(&'a Depot, &str) -> Option<Cow<'a, str>>;
-
-/// Registry of depot value extractors.
-/// Extractors are tried in order until one succeeds.
-/// String types that can be borrowed are listed first for efficiency.
-static DEPOT_EXTRACTORS: &[DepotExtractFn] = &[
-    // Borrowable string types (most common, listed first)
-    |d, k| d.get::<String>(k).ok().map(|v| Cow::Borrowed(v.as_str())),
-    |d, k| d.get::<&'static str>(k).ok().map(|v| Cow::Borrowed(*v)),
-    |d, k| {
-        d.get::<Arc<String>>(k)
-            .ok()
-            .map(|v| Cow::Borrowed(v.as_str()))
-    },
-    |d, k| d.get::<Arc<str>>(k).ok().map(|v| Cow::Borrowed(&**v)),
-    // Signed integer types
-    |d, k| d.get::<i8>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<i16>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<i32>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<i64>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<i128>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<isize>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    // Unsigned integer types
-    |d, k| d.get::<u8>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<u16>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<u32>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<u64>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<u128>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<usize>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    // Floating point types
-    |d, k| d.get::<f32>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    |d, k| d.get::<f64>(k).ok().map(|v| Cow::Owned(v.to_string())),
-    // Boolean
-    |d, k| d.get::<bool>(k).ok().map(|v| Cow::Owned(v.to_string())),
-];
-
 /// Helper function to extract a value from Depot and convert it to a `Cow<str>`.
 /// Supports `String`, `&str`, `Arc<String>`, `Arc<str>`, and common primitive types (integers,
 /// floats, bool).
+///
+/// Does a single map lookup and then probes the candidate types with cheap
+/// `downcast_ref`s, rather than one map lookup per candidate type.
 fn get_depot_value<'a>(depot: &'a Depot, key: &str) -> Option<Cow<'a, str>> {
-    for extractor in DEPOT_EXTRACTORS {
-        if let Some(value) = extractor(depot, key) {
-            return Some(value);
-        }
+    let any = depot.get_any(key)?;
+    // Borrowable string types (most common, listed first).
+    if let Some(v) = any.downcast_ref::<String>() {
+        return Some(Cow::Borrowed(v.as_str()));
     }
+    if let Some(v) = any.downcast_ref::<&'static str>() {
+        return Some(Cow::Borrowed(*v));
+    }
+    if let Some(v) = any.downcast_ref::<Arc<String>>() {
+        return Some(Cow::Borrowed(v.as_str()));
+    }
+    if let Some(v) = any.downcast_ref::<Arc<str>>() {
+        return Some(Cow::Borrowed(&**v));
+    }
+    // Numeric and boolean types, rendered to an owned string.
+    macro_rules! try_display {
+        ($($t:ty),* $(,)?) => {$(
+            if let Some(v) = any.downcast_ref::<$t>() {
+                return Some(Cow::Owned(v.to_string()));
+            }
+        )*};
+    }
+    try_display!(
+        i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool
+    );
     None
 }
 
@@ -238,23 +223,32 @@ impl<'de> RequestDeserializer<'de> {
                 .expect("`MapAccess::next_value` called before next_key");
 
             let parser = self.real_parser(source);
-            if source.from == SourceFrom::Body && parser == SourceParser::Json {
-                // For JSON body parsing, value is always borrowed from the request payload.
-                // panic because this indicates a bug in the program rather than an expected
-                // failure.
+            let parse_json = parser == SourceParser::Json
+                && match source.from {
+                    SourceFrom::Body => true,
+                    #[cfg(feature = "cookie")]
+                    SourceFrom::Cookie => true,
+                    _ => false,
+                };
+            if parse_json {
+                // JSON body and cookie values are borrowed from the request. A missing value
+                // indicates a bug in the deserializer rather than an expected parse failure.
                 let value = self
                     .field_str_value
                     .take()
                     .expect("MapAccess::next_value called before next_key");
-                // Body JSON values are always borrowed from the request payload
+                // JSON values from these sources are always borrowed from the request.
                 let Cow::Borrowed(s) = value else {
-                    return Err(ValError::custom("JSON body value must be borrowed"));
+                    return Err(ValError::custom("JSON source value must be borrowed"));
                 };
                 let mut de = serde_json::Deserializer::new(serde_json::de::StrRead::new(s));
-                seed.deserialize(&mut de)
+                let value = seed
+                    .deserialize(&mut de)
                     // Preserve the underlying serde_json error (line/column and the
                     // expected/actual type) instead of a generic message.
-                    .map_err(ValError::custom)
+                    .map_err(ValError::custom)?;
+                de.end().map_err(ValError::custom)?;
+                Ok(value)
             } else if let Some(value) = self.field_str_value.take() {
                 seed.deserialize(CowValue(value))
             } else if let Some(value) = self.field_vec_value.take() {
@@ -858,6 +852,69 @@ mod tests {
                 p2: "921",
                 s: "abcd-good"
             }
+        );
+    }
+
+    #[cfg(feature = "cookie")]
+    #[tokio::test]
+    async fn test_de_request_with_json_cookie() {
+        #[derive(Deserialize, Serialize, Eq, PartialEq, Debug)]
+        struct AuthToken<'a> {
+            pkce_verifier: &'a str,
+            csrf_token: &'a str,
+            nonce: &'a str,
+            from_url: Option<&'a str>,
+        }
+
+        #[derive(Deserialize, Extractible, Eq, PartialEq, Debug)]
+        struct RequestData<'a> {
+            #[serde(borrow)]
+            #[salvo(extract(source(from = "cookie", parse = "json")))]
+            tok: AuthToken<'a>,
+        }
+
+        let expected = AuthToken {
+            pkce_verifier: "verifier",
+            csrf_token: "csrf",
+            nonce: "nonce",
+            from_url: Some("/dashboard"),
+        };
+        let cookie = cookie::Cookie::new(
+            "tok",
+            serde_json::to_string(&expected).expect("serialize cookie value"),
+        );
+        let mut req = TestClient::get("http://127.0.0.1:8698/callback")
+            .add_header("cookie", cookie.encoded().to_string(), true)
+            .build();
+        let mut depot = Depot::new();
+
+        let data: RequestData<'_> = req.extract(&mut depot).await.unwrap();
+        assert_eq!(data.tok, expected);
+    }
+
+    #[cfg(feature = "cookie")]
+    #[tokio::test]
+    async fn test_de_request_rejects_trailing_data_in_json_cookie() {
+        #[derive(Deserialize, Extractible, Debug)]
+        struct RequestData {
+            #[salvo(extract(source(from = "cookie", parse = "json")))]
+            tok: serde_json::Value,
+        }
+
+        let cookie = cookie::Cookie::new("tok", r#"{"valid":true}junk"#);
+        let mut req = TestClient::get("http://127.0.0.1:8698/callback")
+            .add_header("cookie", cookie.encoded().to_string(), true)
+            .build();
+        let mut depot = Depot::new();
+
+        let result: Result<RequestData, _> = req.extract(&mut depot).await;
+        let error = match result {
+            Ok(data) => panic!("accepted JSON cookie with trailing data: {:?}", data.tok),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("trailing characters"),
+            "unexpected extraction error: {error}"
         );
     }
 

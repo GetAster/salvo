@@ -22,6 +22,7 @@
 //! | `unix` | Listener based on Unix socket | ❌ |
 //! | `anyhow` | Integrate with the [`anyhow`](https://crates.io/crates/anyhow) crate | ❌ |
 //! | `eyre` | Integrate with the [`eyre`](https://crates.io/crates/eyre) crate | ❌ |
+//! | `rfc9457` | RFC 9457 Problem Details responses | ❌ |
 #![doc(html_favicon_url = "https://salvo.rs/favicon-32x32.png")]
 #![doc(html_logo_url = "https://salvo.rs/images/logo.svg")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -70,7 +71,7 @@ cfg_feature! {
     pub use proto::webtransport;
 }
 
-pub use self::conn::Listener;
+pub use self::conn::{ConnCtrl, Listener};
 pub use self::depot::Depot;
 pub use self::error::{BoxedError, Error};
 pub use self::extract::Extractible;
@@ -89,6 +90,10 @@ pub mod prelude {
 
     pub use crate::depot::Depot;
     pub use crate::http::{Request, Response, StatusCode, StatusError};
+    cfg_feature! {
+        #![feature = "rfc9457"]
+        pub use crate::http::{NoExtensions, PlainProblem, Problem};
+    }
     cfg_feature! {
         #![feature ="rustls"]
         pub use crate::conn::RustlsListener;
@@ -109,7 +114,7 @@ pub mod prelude {
         #![all(feature = "unix", unix)]
         pub use crate::conn::UnixListener;
     }
-    pub use crate::conn::{JoinedListener, Listener, TcpListener};
+    pub use crate::conn::{ConnCtrl, JoinedListener, Listener, TcpListener};
     pub use crate::handler::{self, Handler};
     pub use crate::routing::{FlowCtrl, Router};
     cfg_feature! {

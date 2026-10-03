@@ -46,6 +46,7 @@ full = [
     "aws-lc-rs",
     "matched-path",
     "socket2",
+    "rfc9457",
 ]
 cookie = ["dep:cookie"]
 fix-http1-request-uri = ["http1"]
@@ -72,6 +73,7 @@ test = [
 ]
 socket2 = ["dep:socket2"]
 matched-path = []
+rfc9457 = []
 tls12 = ["tokio-rustls?/tls12"]
 
 [dependencies]
@@ -130,6 +132,7 @@ tokio = { workspace = true, features = [
     "macros",
     "net",
     "rt-multi-thread",
+    "sync",
     "time",
 ] }
 tokio-native-tls = { workspace = true, optional = true }
@@ -147,8 +150,20 @@ zstd = { workspace = true, optional = true, features = ["default"] }
 nix = { workspace = true, optional = true, features = ["fs", "user"] }
 
 [dev-dependencies]
+criterion = { workspace = true }
 fastrand = { workspace = true }
-rustls = { workspace = true, features = ["aws-lc-rs"] }
+# Both backends on purpose: this makes rustls unable to pick a provider from crate features,
+# which is exactly the situation that used to panic. See `conn::rustls::default_crypto_provider`.
+rustls = { workspace = true, features = ["aws-lc-rs", "ring"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "router_detect"
+harness = false
+
+[[bench]]
+name = "service_dispatch"
+harness = false

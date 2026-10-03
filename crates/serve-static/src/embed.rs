@@ -6,6 +6,7 @@ use rust_embed::{EmbeddedFile, Metadata, RustEmbed};
 use salvo_core::handler::Handler;
 use salvo_core::http::header::{
     ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE,
+    X_CONTENT_TYPE_OPTIONS,
 };
 use salvo_core::http::headers::{ContentLength, ContentRange, HeaderMapExt};
 use salvo_core::http::mime::fill_mime_charset_if_need;
@@ -121,6 +122,8 @@ fn render_embedded_data(
             .parse()
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
+    res.headers_mut()
+        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
 
     // ETag generation and If-None-Match check.
     let hash = hex::encode(metadata.sha256_hash());
@@ -283,10 +286,12 @@ where
         res: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
+        let decoded_path;
         let req_path = if let Some(rest) = req.params().tail() {
             rest
         } else {
-            &*decode_url_path(req.uri().path())
+            decoded_path = decode_url_path(req.uri().path());
+            decoded_path.as_ref()
         };
         let req_path = normalize_url_path(req_path);
         let mut key_path = Cow::Borrowed(&*req_path);
