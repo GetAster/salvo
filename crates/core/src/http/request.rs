@@ -789,13 +789,23 @@ impl Request {
         /// mutually exclusive with [`web_transport_mut`](Self::web_transport_mut):
         /// once an owned clone is handed out the refcount is > 1, so a subsequent
         /// `web_transport_mut` would report the session as already in use.
+        ///
+        /// Hand-off semantics: if a clone returned here is still alive when the
+        /// handler returns (it was moved into a spawned task), the connection
+        /// is handed off to that task and salvo stops serving further HTTP/3
+        /// requests on it without logging an error. If every clone has been
+        /// dropped by then, salvo reclaims the HTTP/3 connection and keeps
+        /// accepting requests on it, exactly as for
+        /// [`web_transport_mut`](Self::web_transport_mut).
         pub async fn web_transport_owned(&mut self) -> Result<Arc<crate::proto::WebTransportSession<salvo_http3::quinn::Connection, Bytes>>, crate::Error> {
             if !self.is_wt_connect() {
                 return Err(crate::Error::Other("no web transport".into()));
             }
             // Already accepted (by this method or `web_transport_mut`'s store): clone it.
             if let Some(session) = self.extensions.get::<Arc<crate::proto::WebTransportSession<salvo_http3::quinn::Connection, Bytes>>>() {
-                return Ok(session.clone());
+                let session = session.clone();
+                self.extensions.insert(crate::conn::quinn::WebTransportOwnedHandOff);
+                return Ok(session);
             }
             // Otherwise accept it now (same handshake as `web_transport_mut`) and
             // store the `Arc` so both accessors observe one session.
@@ -812,6 +822,7 @@ impl Request {
                         .ok_or_else(|| crate::Error::Other("web transport stream should not used twice".into()))?;
                     let session = Arc::new(crate::proto::WebTransportSession::accept(stream, conn).await?);
                     self.extensions.insert(session.clone());
+                    self.extensions.insert(crate::conn::quinn::WebTransportOwnedHandOff);
                     Ok(session)
                 }
                 (Some(conn), None) => {
