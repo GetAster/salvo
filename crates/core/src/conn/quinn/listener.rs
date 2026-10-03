@@ -62,6 +62,7 @@ where
     /// scheduling knobs you name (pacing, send/stream windows, congestion
     /// control). Applies to both the initial bind and hot config reloads.
     #[inline]
+    #[must_use]
     pub fn transport_config_tuner(
         mut self,
         tuner: impl Fn(&mut ::quinn::TransportConfig) + Send + Sync + 'static,
