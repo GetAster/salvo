@@ -20,6 +20,8 @@ pub(crate) use builder::WebTransportOwnedHandOff;
 mod listener;
 #[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
 mod handoff_tests;
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+mod transport_acked_tests;
 pub use listener::{QuinnAcceptor, QuinnListener};
 
 /// HTTP/3 connection.

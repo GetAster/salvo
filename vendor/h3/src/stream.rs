@@ -436,6 +436,11 @@ impl<S, B> BufRecvStream<S, B> {
             _marker: PhantomData,
         }
     }
+
+    /// Borrow the transport stream for its completion signal after a send FIN.
+    pub fn stream_ref(&self) -> &S {
+        &self.stream
+    }
 }
 
 impl<B, S: RecvStream> BufRecvStream<S, B> {
