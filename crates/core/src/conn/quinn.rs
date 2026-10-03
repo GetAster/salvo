@@ -17,6 +17,8 @@ use crate::service::HyperHandler;
 mod builder;
 pub use builder::Builder;
 mod listener;
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+mod transport_acked_tests;
 pub use listener::{QuinnAcceptor, QuinnListener};
 
 /// HTTP/3 connection.

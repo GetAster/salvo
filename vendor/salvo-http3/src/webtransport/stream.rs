@@ -136,6 +136,14 @@ impl<S, B> SendStream<S, B> {
     }
 }
 
+#[cfg(feature = "quinn")]
+impl<B: Buf> SendStream<h3_quinn::SendStream<B>, B> {
+    /// Resolve true only when QUIC acknowledges this stream's FIN and all data.
+    pub fn transport_acked(&self) -> impl std::future::Future<Output = bool> + Send + 'static {
+        self.stream.stream_ref().transport_acked()
+    }
+}
+
 impl<S, B> quic::SendStreamUnframed<B> for SendStream<S, B>
 where
     S: quic::SendStreamUnframed<B>,
