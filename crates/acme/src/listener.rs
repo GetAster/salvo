@@ -210,11 +210,10 @@ impl<T> AcmeListenerBuilder<T> {
     /// Sets the key type for certificate private keys.
     ///
     /// `EcdsaP256` is the default and recommended key type for newly generated
-    /// certificates. RSA variants are available for compatibility, but must be
-    /// selected explicitly.
+    /// certificates.
     ///
     /// Available types: `EcdsaP256` (default), `EcdsaP384`, `EcdsaP521`,
-    /// `Rsa2048`, `Rsa4096`, `Rsa8192`, `Ed25519`.
+    /// `Ed25519`. RSA keys are not supported (certon's `rsa-keys` is off).
     #[inline]
     #[must_use]
     pub fn key_type(self, key_type: KeyType) -> Self {

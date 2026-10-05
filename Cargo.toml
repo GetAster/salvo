@@ -47,7 +47,9 @@ salvo-craft = { version = "1.0.1", path = "crates/craft", default-features = fal
 salvo-craft-macros = { version = "1.0.1", path = "crates/craft-macros", default-features = false }
 salvo-tus = { version = "1.0.1", path = "crates/tus", default-features = false }
 
-certon = "0.3"
+# No `rsa-keys`: the `rsa` crate has an unfixed timing side-channel advisory
+# (RUSTSEC-2023-0071) and ECDSA / Ed25519 cover every ACME CA we target.
+certon = { version = "0.3", default-features = false, features = ["aws-lc-rs", "zerossl", "dns-01"] }
 
 aead = "0.6"
 aes-gcm = "0.11"

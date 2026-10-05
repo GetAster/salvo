@@ -213,10 +213,9 @@ impl AcmeConfigBuilder {
     /// Sets the key type for certificate private keys.
     ///
     /// Defaults to [`KeyType::EcdsaP256`], which is the recommended key type
-    /// for newly generated certificates. RSA variants are available for
-    /// compatibility, but must be selected explicitly.
-    /// Available types: `EcdsaP256`, `EcdsaP384`, `EcdsaP521`, `Rsa2048`,
-    /// `Rsa4096`, `Rsa8192`, `Ed25519`.
+    /// for newly generated certificates.
+    /// Available types: `EcdsaP256`, `EcdsaP384`, `EcdsaP521`, `Ed25519`.
+    /// RSA keys are not supported (certon's `rsa-keys` is off).
     #[inline]
     #[must_use]
     pub fn key_type(mut self, key_type: KeyType) -> Self {
@@ -395,11 +394,11 @@ mod tests {
     fn test_acme_config_builder_key_type() {
         let config = AcmeConfig::builder()
             .add_domain("example.com")
-            .key_type(KeyType::Rsa4096)
+            .key_type(KeyType::EcdsaP384)
             .build()
             .unwrap();
 
-        assert!(matches!(config.key_type, KeyType::Rsa4096));
+        assert!(matches!(config.key_type, KeyType::EcdsaP384));
     }
 
     #[test]
