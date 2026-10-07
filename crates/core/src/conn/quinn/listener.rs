@@ -1,6 +1,7 @@
 //! QuinnListener and its implementations.
 use std::error::Error as StdError;
 use std::fmt::{self, Debug, Formatter};
+use std::future::IntoFuture;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -9,14 +10,14 @@ use std::vec;
 use futures_util::stream::{BoxStream, StreamExt};
 use http::uri::Scheme;
 use salvo_http3::quinn::Endpoint;
-use salvo_http3::quinn::quinn::Incoming;
+use salvo_http3::quinn::quinn::{Incoming, IncomingFuture};
 use tokio_util::sync::CancellationToken;
 
 use super::{QuinnConnection, QuinnCoupler};
 use crate::Error;
 use crate::conn::quinn::ServerConfig;
 use crate::conn::{Accepted, Acceptor, Holding, IntoConfigStream, Listener};
-use crate::fuse::{ArcFusePolicy, FuseAction, FuseInfo, TransProto};
+use crate::fuse::{ArcFusePolicy, FuseAction, FuseConfig, FuseInfo, TransProto};
 use crate::http::Version;
 
 /// Consumer hook to tune the `quinn::TransportConfig` salvo applies to every
@@ -186,6 +187,16 @@ pub struct QuinnAcceptor {
     // Parking it here keeps it alive if the `accept` future is dropped during async admission
     // (e.g. a `JoinedListener`'s `select!` picking the other listener).
     pending: Option<Incoming>,
+    // Once admitted, retain the handshake and its original metadata across cancellation.
+    handshaking: Option<PendingHandshake>,
+}
+
+struct PendingHandshake {
+    incoming: IncomingFuture,
+    fuse_config: Option<FuseConfig>,
+    local_addr: crate::conn::SocketAddr,
+    remote_addr: SocketAddr,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl Debug for QuinnAcceptor {
@@ -213,6 +224,7 @@ impl QuinnAcceptor {
             endpoint,
             cancel_reload,
             pending: None,
+            handshaking: None,
         }
     }
 }
@@ -236,62 +248,78 @@ impl Acceptor for QuinnAcceptor {
         fuse_policy: Option<ArcFusePolicy>,
     ) -> IoResult<Accepted<Self::Coupler, Self::Stream>> {
         loop {
-            // Resume an incoming a cancelled call parked, or accept a new one.
-            let new_conn = match self.pending.take() {
-                Some(incoming) => incoming,
-                None => match self.endpoint.accept().await {
+            if self.handshaking.is_none() {
+                // Admission may be cancelled too: keep the unadmitted incoming parked.
+                let new_conn = match self.pending.take() {
                     Some(incoming) => incoming,
-                    None => return Err(IoError::other("quinn accept error")),
-                },
-            };
-            let remote_addr = new_conn.remote_address();
-            let local_addr = self.holdings[0].local_addr.clone();
-            // Park the incoming across the async admission below so a dropped `accept` future
-            // (e.g. a `JoinedListener` picking the other listener) leaves it for the next call.
-            self.pending = Some(new_conn);
-            let fuse_config = match &fuse_policy {
-                Some(policy) => match policy
-                    .decide(&FuseInfo {
-                        trans_proto: TransProto::Quic,
-                        remote_addr: remote_addr.into(),
-                        local_addr: local_addr.clone(),
-                    })
-                    .await
-                {
-                    FuseAction::Accept(config) => Some(config),
-                    FuseAction::Reject => {
-                        self.pending = None;
+                    None => match self.endpoint.accept().await {
+                        Some(incoming) => incoming,
+                        None => return Err(IoError::other("quinn accept error")),
+                    },
+                };
+                let remote_addr = new_conn.remote_address();
+                let local_addr = self.holdings[0].local_addr.clone();
+                self.pending = Some(new_conn);
+                let fuse_config = match &fuse_policy {
+                    Some(policy) => match policy
+                        .decide(&FuseInfo {
+                            trans_proto: TransProto::Quic,
+                            remote_addr: remote_addr.into(),
+                            local_addr: local_addr.clone(),
+                        })
+                        .await
+                    {
+                        FuseAction::Accept(config) => Some(config),
+                        FuseAction::Reject => {
+                            self.pending = None;
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                // Do not await between consuming the Incoming and storing its future.
+                // Subsequent calls resume this handshake without re-running admission or
+                // extending the original timeout, even if their policy has changed.
+                let deadline = fuse_config
+                    .and_then(|config| config.tls_handshake_timeout)
+                    .map(|timeout| tokio::time::Instant::now() + timeout);
+                self.handshaking = Some(PendingHandshake {
+                    incoming: self.pending.take().expect("incoming parked above").into_future(),
+                    fuse_config,
+                    local_addr,
+                    remote_addr,
+                    deadline,
+                });
+            }
+            let handshake = self.handshaking.as_mut().expect("handshake parked above");
+            // QUIC uses the fuse handshake deadline here and the body timeout in H3.
+            // Transport idle/write-stall limits remain governed by Quinn itself.
+            // Preserve Tokio's ready-first timeout semantics: a handshake completed
+            // while accept was unpolled can still win against an elapsed timer.
+            let connected = match handshake.deadline {
+                Some(deadline) => {
+                    if let Ok(result) = tokio::time::timeout_at(deadline, &mut handshake.incoming).await {
+                        result
+                    } else {
+                        self.handshaking = None;
                         continue;
                     }
-                },
-                None => None,
+                }
+                None => (&mut handshake.incoming).await,
             };
-            // Admission passed: take the incoming back to complete the handshake below.
-            //
-            // NOTE: the handshake await that follows is not itself cancellation-safe — if this
-            // future is dropped mid-handshake the connection is lost. Parking a mid-flight
-            // handshake future is materially more involved; only the admission phase is parked
-            // here, which closes the gap the async `FusePolicy` introduced.
-            let new_conn = self.pending.take().expect("incoming parked above");
-            // Of the fuse timeouts, QUIC enforces the handshake timeout here and the
-            // request-body timeout via the H3 body. The transport idle and write-stall
-            // timeouts are TCP/byte-stream concepts handled by `StraightStream`; QUIC relies on
-            // quinn's own `max_idle_timeout` and per-stream flow control instead (see the
-            // `FuseConfig` field docs).
-            let connected = match fuse_config.and_then(|config| config.tls_handshake_timeout) {
-                Some(timeout) => match tokio::time::timeout(timeout, new_conn).await {
-                    Ok(result) => result,
-                    Err(_) => continue,
-                },
-                None => new_conn.await,
-            };
+            let PendingHandshake {
+                fuse_config,
+                local_addr,
+                remote_addr,
+                ..
+            } = self.handshaking.take().expect("completed handshake");
             return match connected {
                 Ok(conn) => Ok(Accepted {
                     coupler: QuinnCoupler,
                     stream: QuinnConnection::new(conn),
                     fuse_config,
                     conn_ctrl: crate::conn::ConnCtrl::new(),
-                    local_addr: self.holdings[0].local_addr.clone(),
+                    local_addr,
                     remote_addr: remote_addr.into(),
                     http_scheme: self.holdings[0].http_scheme.clone(),
                 }),
@@ -300,3 +328,7 @@ impl Acceptor for QuinnAcceptor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "accept_cancellation_tests.rs"]
+mod accept_cancellation_tests;
