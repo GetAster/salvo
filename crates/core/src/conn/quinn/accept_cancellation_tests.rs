@@ -206,6 +206,37 @@ async fn handshake_deadline_survives_repeated_cancellation() {
 }
 
 #[tokio::test]
+async fn completed_handshake_resumed_after_deadline_keeps_tokio_ready_first_semantics() {
+    let (mut acceptor, client) = endpoints();
+    let connecting = incoming(&mut acceptor, &client).await;
+    let config = FuseConfig::disabled().with_tls_handshake_timeout(Duration::from_secs(1));
+    let mut accept = Box::pin(acceptor.accept(Some(Arc::new(config))));
+    poll_pending(accept.as_mut()).await;
+    drop(accept);
+    let deadline = acceptor.handshaking.as_ref().unwrap().deadline.unwrap();
+
+    // The independent Quinn driver completes while accept is cancelled. Observe
+    // server HANDSHAKE_DONE at the client before the original budget expires.
+    // The stored IncomingFuture remains unpolled until the late resume below.
+    let conn = timeout(deadline.saturating_duration_since(tokio::time::Instant::now()),
+        handshake_done(connecting)).await.expect("handshake must complete within its original budget");
+    assert!(tokio::time::Instant::now() < deadline);
+    tokio::time::sleep_until(deadline).await;
+    assert!(tokio::time::Instant::now() >= deadline);
+    assert_eq!(acceptor.handshaking.as_ref().unwrap().deadline, Some(deadline));
+
+    // Tokio Timeout polls the inner future before its elapsed timer. Keep that
+    // existing contract rather than rejecting a connection that already completed
+    // within budget solely because the next accept call was scheduled late.
+    let accepted = timeout(STEP, acceptor.accept(None)).await.unwrap().unwrap();
+    assert_eq!(accepted.remote_addr.into_std().unwrap(), client.local_addr().unwrap());
+    assert_eq!(accepted.fuse_config, Some(config));
+    assert!(conn.close_reason().is_none());
+    assert!(acceptor.handshaking.is_none());
+    conn.close(0u32.into(), b"done");
+}
+
+#[tokio::test]
 async fn handshake_error_clears_pending_state() {
     let (mut acceptor, client) = endpoints();
     let invalid = client.connect(acceptor.socket, "not-localhost.invalid").unwrap();

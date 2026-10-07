@@ -294,6 +294,8 @@ impl Acceptor for QuinnAcceptor {
             let handshake = self.handshaking.as_mut().expect("handshake parked above");
             // QUIC uses the fuse handshake deadline here and the body timeout in H3.
             // Transport idle/write-stall limits remain governed by Quinn itself.
+            // Preserve Tokio's ready-first timeout semantics: a handshake completed
+            // while accept was unpolled can still win against an elapsed timer.
             let connected = match handshake.deadline {
                 Some(deadline) => {
                     if let Ok(result) = tokio::time::timeout_at(deadline, &mut handshake.incoming).await {
