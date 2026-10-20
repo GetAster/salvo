@@ -267,3 +267,55 @@ async fn transport_acked_resolves_false_on_peer_stop() {
     assert_eq!(outcome, Some(false));
     client.close();
 }
+
+/// A cancelled pending read must leave both identity and STOP control usable.
+struct PendingReadThenStop {
+    report: Mutex<Option<oneshot::Sender<u64>>>,
+}
+#[handler]
+impl PendingReadThenStop {
+    async fn handle(&self, req: &mut Request) -> Result<(), crate::Error> {
+        use salvo_http3::quic::RecvStream as _;
+        use tokio::io::AsyncReadExt;
+        let session = req.web_transport_mut().await?;
+        let Ok(Some(AcceptedBi::BidiStream(_, stream))) = session.accept_bi().await else {
+            return Err(crate::Error::Other("no WebTransport bidi stream".into()));
+        };
+        let (_send, mut recv) = stream.split();
+        let id = recv.recv_id().into_inner();
+        let mut byte = [0u8; 1];
+        assert!(
+            timeout(Duration::from_millis(20), recv.read(&mut byte))
+                .await
+                .is_err()
+        );
+        assert_eq!(recv.recv_id().into_inner(), id);
+        recv.stop_sending(37);
+        if let Some(tx) = self.report.lock().unwrap().take() {
+            let _ = tx.send(id);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_read_preserves_recv_id_and_stop_sending_application_code() {
+    let (tx, rx) = oneshot::channel();
+    let router = Router::with_path("wt").goal(PendingReadThenStop {
+        report: Mutex::new(Some(tx)),
+    });
+    let (addr, _server) = serve_one(router).await;
+    let mut client = connect(addr).await;
+    let (_connect_stream, session_id) = client.open_session("/wt").await;
+    let (send, _recv) = client.open_wt_bidi(session_id).await;
+    let stopped = timeout(STEP, send.stopped())
+        .await
+        .expect("STOP timed out")
+        .expect("connection failed");
+    assert_eq!(stopped, Some(37u32.into()));
+    assert_eq!(
+        timeout(STEP, rx).await.unwrap().unwrap(),
+        u64::from(send.id())
+    );
+    client.close();
+}
