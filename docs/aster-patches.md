@@ -4,35 +4,38 @@ This repository is Aster's soft fork of [salvo-rs/salvo](https://github.com/salv
 
 ## Branch and tag model
 
-- `main` is the front door: upstream's README with an Aster preamble, plus this ledger. Nothing is built from `main`.
-- `upgrade/<version>` is the patched integration line for one upstream release wave: the upstream release plus the patches in this ledger. Consumers pin it by commit.
-- Topic branches carry one change each and are named for what the change is, for example `feat/read-into` or `security/plumtree-bounds`. Each is based on the upstream release tag and is cherry-picked with `git cherry-pick -x` onto the upgrade branch, so every upgrade-branch commit names its source.
-- Release tags mark the commits that are released and pinned. Published tags are never moved or rewritten. Historical tags in this repository use several schemes (listed below); new tags use `aster-<repo>-v<version>`, where `<version>` is the published version of the repository's main package (for example `aster-salvo-v1.0.4`, `aster-fory-v1.7.6-aster.1`).
-- `main` is refreshed by merging upstream `main` into it. It is not force-pushed.
+- `main` is upstream `main` plus one commit: the Aster README preamble and this ledger. Nothing is built from `main`. It is refreshed with `git merge upstream/main` and is never reset or force-pushed. Ledger edits are commits on `main`, never on `upgrade/*`.
+- `upgrade/<repo>-v<upstream version>` (for example `upgrade/iroh-v1.4.0`, `upgrade/iroh-blobs-v0.103.1`) is the patched integration line: the upstream release plus the patches in this ledger. A new upstream base always gets a new branch, cut from the upstream release tag; Aster-only fixes and re-pins append to the current branch. Per-minor names (`upgrade/iroh-blobs-v0.103`, `upgrade/salvo-v1.0`, …) are historical. Consumers pin commits on it. Published `upgrade/*` branches and tags are never rewritten; a failed attempt is superseded by new commits and a new version.
+- Topic branches carry one change each, are named for the change (for example `feat/read-into`, `security/plumtree-bounds`), are based on the upstream release tag, and are cherry-picked with `git cherry-pick -x` onto the upgrade branch, so every upgrade-branch commit names its source.
+- Version: the upstream version if Aster's registry has never served that version or a higher one in the series; otherwise the next patch above Aster's highest published version. A re-pin without a code change keeps the version and takes the tag suffix `-p<n>`.
+- Tags: `aster-<repo>-v<published version>` (re-pins `aster-<repo>-v<published version>-p<n>`), created only after the Aster consumer trial passes against those exact commits, because tags cannot be moved.
+- The fork manifest is `iroh-fork-manifest.toml` in the Aster repository (the only copy).
+- Aster does not submit patches upstream; upstream maintainers are welcome to take any patch here.
 
-Tag schemes used in this repository:
+Historical and current tag schemes in this repository:
 
 - `aster-salvo-YYYY-MM-DD`, the date of an absorption or release, with `.n` for a second release the same day: `aster-salvo-2026-06-27`, `-2026-07-05`, `-2026-10-03`, `-2026-10-03.2`, `-2026-10-05`, `-2026-10-07`, `-2026-10-11`.
+- `aster-salvo-v<published version>`, the current scheme for new tags (the next is `aster-salvo-v1.0.5`). The two schemes below are legacy.
 - `v<upstream version>-aster.<n>`, since 2026-10-03, on the same commit as the dated tag: `v1.0.0-aster.1` … `v1.0.0-aster.5`. `<n>` was bumped for each re-assembly on the same upstream version and reset to 1 for a new upstream release.
 - `archive/<branch>`, keeping a deleted or re-cut patch branch's original commit resolvable: `archive/quinn-webtransport-raw-connection`, and `archive/<branch>-pre-1.0` for the six branches re-cut on v1.0.0.
 
-Topic branches in this repository predate the `feat/`/`fix/` naming and are named for the change directly (for example `quinn-default-keepalive`). Each holds exactly one commit; see "Patches".
+Topic branches in this repository predate the `feat/`/`fix/` naming and are named for the change directly (for example `quinn-default-keepalive`). Each holds exactly one commit; see "Patches". Some are stacked by design rather than based on the upstream tag, because they build on another patch: S4 on S1, S5 on S2, S7 on S5 (and S9 on the assembled 1.0.3 line, for the transport-ACK tests). Check each with `git cherry -v <branch base> <branch>` against its own base, which should list exactly one `+`.
 
 ## Current release
 
 | Field | Value |
 |---|---|
 | Upstream base | `v1.0.0` (`50035977` is the merge of `v1.0.0` into the old `main`) |
-| Integration branch | `upgrade/salvo-v1.0` |
+| Integration branch | `upgrade/salvo-v1.0` (a historical per-minor name; the next upstream base gets `upgrade/salvo-v<upstream version>`, for example `upgrade/salvo-v1.0.1`) |
 | Tags | `v1.0.0-aster.5` / `aster-salvo-2026-10-11` |
 | Pinned commit | `35aa745dfca50c2e5a640c0d0c93153b033fa931` |
 | Crate versions | all 22 Salvo crates 1.0.4; `h3-quinn` 0.0.12; `salvo-http3` 0.7.2; `h3` 0.0.9; `h3-datagram` 0.0.3 |
-| Status | source and tags published; the 1.0.4 registry wave awaits the Aster verification release |
+| Status | source, tags and the 1.0.4 registry wave published (the Aster registry serves all 22 Salvo crates at 1.0.4) |
 | Source repository | `https://forge.emrul.dev/Aster/salvo.git` |
 
-Until this release, salvo's `main` was itself the pinned integration line: upstream merged in, patches cherry-picked on top, never force-pushed. `upgrade/salvo-v1.0` now holds that line at the same commit, and `main` becomes the front door.
+Until this release, salvo's `main` was itself the pinned integration line: upstream merged in, patches cherry-picked on top, never force-pushed. `upgrade/salvo-v1.0` now holds that line at the same commit, and `main` became upstream `main` plus one commit (the README preamble and this ledger).
 
-Remotes: `origin` is `https://emrul@forge.emrul.dev/Aster/salvo.git` (Forgejo: integration line, patch branches, tags); `github` is `https://github.com/aster-rpc/salvo` (GitHub copy; not pushed by the 2026-10-03 absorption); `upstream` is `https://github.com/salvo-rs/salvo` (read-only).
+Remotes: `origin` is `https://emrul@forge.emrul.dev/Aster/salvo.git` (Forge: `main`, integration line, patch branches, tags; push here only); `upstream` is `https://github.com/salvo-rs/salvo` (read-only). The Forge push-mirrors this repository to `github.com/getaster/salvo`; nothing is pushed to GitHub directly. (Earlier checkouts had a `github` remote for `github.com/aster-rpc/salvo`; it is retired.)
 
 Pin block for source-tree builds (`[patch.crates-io]`). The fork patches `h3`, `h3-quinn`, `h3-datagram` and `salvo-http3` internally, and `[patch.crates-io]` does not cross workspaces, so every root re-declares the whole family at the same rev:
 
@@ -57,7 +60,7 @@ Everything in the Aster product family must build one identical Salvo. Mismatche
 | The Aster repository | `Cargo.toml` `[patch.crates-io]` (salvo, salvo_core, salvo_macros, salvo-http3, h3, h3-quinn, h3-datagram) |
 | portal_desktop | Aster registry, exact `salvo = "=<version>"` (no patch block) |
 | portal-agent | Aster registry, exact `salvo = "=<version>"` (moving off its git patch block with the 2026-10-03 update) |
-| Fork manifest (a record, not a build) | `[forks.salvo]` and the `salvo_patch_crates_io` snippet in the canonical manifest (`docs/aster-fork-manifest.toml` in the Aster iroh fork) and its synced copy (`iroh-fork-manifest.toml` in the Aster repository). Update both; they drift silently otherwise. |
+| Fork manifest (a record, not a build) | `[forks.salvo]` and the `salvo_patch_crates_io` snippet in `iroh-fork-manifest.toml` in the Aster repository (the only copy). |
 
 Since Aster 0.3.355 the whole Salvo family (all 22 crates plus the h3 stack) is published to the Aster registry, so registry consumers can enable any Salvo feature. Keep it that way. The published `salvo` names every sub-crate as an optional dependency, and one left out of the published set keeps its crates.io source: at an Aster-local version that crates.io lacks, publishing fails (v0.3.353 stopped at `salvo-cache ^1.0.1`); at one it has, consumers get a second `salvo_core`. The Aster publisher's `publish-native-stack.py check` rejects a published crate with a path dependency on an unpublished sibling.
 
@@ -92,7 +95,7 @@ On 2026-10-03 (v1.0.0) nothing graduated: all six patches then existing were sti
 
 ## Porting to a new upstream release
 
-1. Fetch upstream and tags (`git fetch upstream --tags`). Prefer a release tag over a moving upstream `main`.
+1. Fetch upstream and tags (`git fetch upstream --tags`) and mirror the release tag to the Forge (`git push origin <upstream-tag>`). Prefer a release tag over a moving upstream `main`.
 2. **Triage upstream's new commits against every patch: did upstream land an equivalent?** Signals: `git cherry -v <upstream-tag> <branch>` shows `-` (upstream supplied an equivalent; for stacked branches read the result for the branch's own tip commit), or an upstream commit touches the same API surface (for example adds a `web_transport_*` accessor or exposes the raw quinn connection) and covers the use case. Compare against the upstream tag, never against the integration line, which already holds copies of the patches. `git cherry` compares by patch-id, not commit hash, so it detects an equivalent change under a different SHA; the upstream tag answers "did upstream absorb this?", the integration line answers "is this patch in our assembly?".
 
    ```bash
@@ -106,7 +109,23 @@ On 2026-10-03 (v1.0.0) nothing graduated: all six patches then existing were sti
    done
    ```
 
-3. Build the new integration branch from the upstream tag and apply the patch branches in stack order: keepalive (S1) → stream-control (S2) → owned (S3) → tuner (S4) → ratified (S5) → alt-svc (S6) → transport-acked (S7) → cancellation-safe accept (S8) → cancellation-safe receive control (S9); then S10 and a fresh version-bump commit. Take the higher version if upstream also ships one of the Aster-local versions (for example a Salvo 1.0.x or h3 0.0.9).
+   For a stacked branch (S4, S5, S7, S9) this lists the commits it sits on as well; read the line for the branch's own tip commit. To confirm a branch still holds exactly one patch, run `git cherry -v <branch base> <branch>` against its own base.
+
+3. Build the new integration branch in a separate worktree cut from the upstream tag, and cherry-pick the patches in stack order S1 → S10: keepalive (S1) → stream-control (S2) → owned (S3) → tuner (S4) → ratified (S5) → alt-svc (S6) → transport-acked (S7) → cancellation-safe accept (S8) → cancellation-safe receive control (S9) → certon features (S10); then a version-bump commit.
+
+   ```bash
+   git worktree add -b upgrade/salvo-v<upstream version> ../salvo-v<upstream version> <upstream-tag>
+   cd ../salvo-v<upstream version>
+   # S1 6eef79d8, S2 8d263509, S3 7dc523f3, S4 f0a7a7ae, S5 690fc04d,
+   # S6 8b195ee6, S7 be8b54f4 (keep both `mod` lines against S3), S8 097f8ac6,
+   # S9 9a38a8a9, S10 b636f542 (integration-line commit; no topic branch)
+   git cherry-pick -x 6eef79d8 8d263509 7dc523f3 f0a7a7ae 690fc04d \
+                      8b195ee6 be8b54f4 097f8ac6 9a38a8a9 b636f542
+   # version-bump commit, then
+   git push origin upgrade/salvo-v<upstream version>
+   ```
+
+   Version: publish the next patch above the highest Aster-published Salvo version (1.0.4 → 1.0.5 on base v1.0.1). Bump h3/h3-quinn/salvo-http3 only if their src changed. If upstream itself ships a version Aster has already published (for example a Salvo 1.0.x or h3 0.0.9), take the next patch above both.
 4. Completeness check: the assembled stack on the upstream tag must equal the previous integration line's tree apart from upstream's changes. `git cherry -v <integration-line> <branch>` no longer reliably prints `-` for every patch, because the old line carried pre-1.0 copies and split S3/S4 across two commits each, so their patch-ids differ; use tree equality instead.
 5. Build and smoke-test the consumers (below), then tag (below).
 
@@ -118,19 +137,18 @@ Retiring a patch that upstream accepted:
 
 If a patch is partly subsumed, keep the branch but trim its commit to the still-missing delta, then re-cherry-pick the slimmed patch.
 
-Never rewrite published history: consumers pin a git rev, and rewriting would invalidate every pinned rev. Each new integration line only gains commits, and a consumer pinned to an old rev keeps building; bumping is a deliberate edit.
+Never rewrite published history: consumers pin a git rev, and rewriting would invalidate every pinned rev. Each new integration line only gains commits, and a consumer pinned to an old rev keeps building; bumping is a deliberate edit. A failed attempt is superseded by new commits and a new version; no `--force` push is ever used.
 
-Tagging, after the consumers build green:
+Tagging, only after the Aster consumer trial passes against these exact commits (tags cannot be moved):
 
 ```bash
-git tag aster-salvo-YYYY-MM-DD          # date of the absorption (legacy scheme)
-git tag v<upstream-version>-aster.<n>   # same commit (legacy scheme)
-git push origin <branch> <dated-tag> <semver-tag>
+git tag -a aster-salvo-v<published version> -m "Aster salvo v<published version>" <commit>   # e.g. aster-salvo-v1.0.5
+git push origin upgrade/salvo-v<upstream> aster-salvo-v<published version>
 ```
 
-Tags are immutable and point at the fully assembled line. Push tags to `origin` (Forgejo) explicitly. Consumers should prefer the semver-style tag over raw revs. New tags use `aster-<crate>-v<published version>`.
+Tags are immutable and point at the fully assembled line. Push to `origin` (Forge) only. Consumers should prefer the tag over raw revs. The dated `aster-salvo-YYYY-MM-DD` and `v<upstream-version>-aster.<n>` tags are legacy and are not created any more.
 
-When the pinned commit moves, bump every consumer's pin to match, and update `[forks.salvo]` plus the `salvo_patch_crates_io` snippet in both manifest copies. Smoke test after a bump:
+When the pinned commit moves, bump every consumer's pin to match, and update `[forks.salvo]` plus the `salvo_patch_crates_io` snippet in `iroh-fork-manifest.toml` in the Aster repository (the only copy). Update this ledger on `main` (merge upstream `main` first). Smoke test after a bump:
 
 ```bash
 # in the Aster repository
