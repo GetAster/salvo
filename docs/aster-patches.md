@@ -6,7 +6,7 @@ This repository is Aster's soft fork of [salvo-rs/salvo](https://github.com/salv
 
 - `main` is upstream `main` plus one commit: the Aster README preamble and this ledger. Nothing is built from `main`. It is refreshed with `git merge upstream/main` and is never reset or force-pushed. Ledger edits are commits on `main`, never on `upgrade/*`.
 - `upgrade/<repo>-v<upstream version>` (for example `upgrade/iroh-v1.4.0`, `upgrade/iroh-blobs-v0.103.1`) is the patched integration line: the upstream release plus the patches in this ledger. A new upstream base always gets a new branch, cut from the upstream release tag; Aster-only fixes and re-pins append to the current branch. Per-minor names (`upgrade/iroh-blobs-v0.103`, `upgrade/salvo-v1.0`, …) are historical. Consumers pin commits on it. Published `upgrade/*` branches and tags are never rewritten; a failed attempt is superseded by new commits and a new version.
-- Topic branches carry one change each, are named for the change (for example `feat/read-into`, `security/plumtree-bounds`), are based on the upstream release tag, and are cherry-picked with `git cherry-pick -x` onto the upgrade branch, so every upgrade-branch commit names its source.
+- Topic branches carry one change each, are named for the change (for example `feat/read-into`, `security/plumtree-bounds`), are based on the upstream release tag (or, for a patch that builds on another, on that prerequisite patch's commit), and are cherry-picked with `git cherry-pick -x` onto the upgrade branch, so every upgrade-branch commit names its source. A topic branch that must be re-cut for a new upstream base gets a new name, `<topic>-v<upstream version>` (for example `wt-transport-acked-v1.0.1`); the old branch stays as it was, nothing is force-pushed.
 - Version: the upstream version if Aster's registry has never served that version or a higher one in the series; otherwise the next patch above Aster's highest published version. A re-pin without a code change keeps the version and takes the tag suffix `-p<n>`.
 - Tags: `aster-<repo>-v<published version>` (re-pins `aster-<repo>-v<published version>-p<n>`), created only after the Aster consumer trial passes against those exact commits, because tags cannot be moved.
 - The fork manifest is `iroh-fork-manifest.toml` in the Aster repository (the only copy).
@@ -15,22 +15,22 @@ This repository is Aster's soft fork of [salvo-rs/salvo](https://github.com/salv
 Historical and current tag schemes in this repository:
 
 - `aster-salvo-YYYY-MM-DD`, the date of an absorption or release, with `.n` for a second release the same day: `aster-salvo-2026-06-27`, `-2026-07-05`, `-2026-10-03`, `-2026-10-03.2`, `-2026-10-05`, `-2026-10-07`, `-2026-10-11`.
-- `aster-salvo-v<published version>`, the current scheme for new tags (the next is `aster-salvo-v1.0.5`). The two schemes below are legacy.
+- `aster-salvo-v<published version>`, the current scheme for new tags (first: `aster-salvo-v1.0.5`). The two schemes below are legacy.
 - `v<upstream version>-aster.<n>`, since 2026-10-03, on the same commit as the dated tag: `v1.0.0-aster.1` … `v1.0.0-aster.5`. `<n>` was bumped for each re-assembly on the same upstream version and reset to 1 for a new upstream release.
 - `archive/<branch>`, keeping a deleted or re-cut patch branch's original commit resolvable: `archive/quinn-webtransport-raw-connection`, and `archive/<branch>-pre-1.0` for the six branches re-cut on v1.0.0.
 
-Topic branches in this repository predate the `feat/`/`fix/` naming and are named for the change directly (for example `quinn-default-keepalive`). Each holds exactly one commit; see "Patches". Some are stacked by design rather than based on the upstream tag, because they build on another patch: S4 on S1, S5 on S2, S7 on S5 (and S9 on the assembled 1.0.3 line, for the transport-ACK tests). Check each with `git cherry -v <branch base> <branch>` against its own base, which should list exactly one `+`.
+Topic branches in this repository predate the `feat/`/`fix/` naming and are named for the change directly (for example `quinn-default-keepalive`). Each holds exactly one commit; see "Patches". Some are stacked by design rather than based on the upstream tag, because they build on another patch: S4 on S1, S5 on S2. The `-v1.0.1` re-cuts (S3, S7, S9) sit on the v1.0.1 line: S3 on `v1.0.1`, S7 on the assembled S6 (`c524276a`), S9 on the assembled S7 (`ccc57bd7`), because their tests need the patches below them. Check each with `git cherry -v <branch base> <branch>` against its own base, which should list exactly one `+`.
 
 ## Current release
 
 | Field | Value |
 |---|---|
-| Upstream base | `v1.0.0` (`50035977` is the merge of `v1.0.0` into the old `main`) |
-| Integration branch | `upgrade/salvo-v1.0` (a historical per-minor name; the next upstream base gets `upgrade/salvo-v<upstream version>`, for example `upgrade/salvo-v1.0.1`) |
-| Tags | `v1.0.0-aster.5` / `aster-salvo-2026-10-11` |
-| Pinned commit | `35aa745dfca50c2e5a640c0d0c93153b033fa931` |
-| Crate versions | all 22 Salvo crates 1.0.4; `h3-quinn` 0.0.12; `salvo-http3` 0.7.2; `h3` 0.0.9; `h3-datagram` 0.0.3 |
-| Status | source, tags and the 1.0.4 registry wave published (the Aster registry serves all 22 Salvo crates at 1.0.4) |
+| Upstream base | `v1.0.1` |
+| Integration branch | `upgrade/salvo-v1.0.1` |
+| Tag | `aster-salvo-v1.0.5` |
+| Pinned commit | `80c472ac9e19bd6bba01e734fa2bf8503d569dd1` |
+| Crate versions | all 22 Salvo crates 1.0.5; `h3-quinn` 0.0.12; `salvo-http3` 0.7.2; `h3` 0.0.9; `h3-datagram` 0.0.3 (`vendor/` byte-identical to 1.0.4's `35aa745d`) |
+| Status | branch pushed; tag and the 1.0.5 registry wave follow the Aster consumer trial and the next Aster release (the registry serves 1.0.1, 1.0.3 and 1.0.4) |
 | Source repository | `https://forge.emrul.dev/Aster/salvo.git` |
 
 Until this release, salvo's `main` was itself the pinned integration line: upstream merged in, patches cherry-picked on top, never force-pushed. `upgrade/salvo-v1.0` now holds that line at the same commit, and `main` became upstream `main` plus one commit (the README preamble and this ledger).
@@ -40,16 +40,16 @@ Remotes: `origin` is `https://emrul@forge.emrul.dev/Aster/salvo.git` (Forge: `ma
 Pin block for source-tree builds (`[patch.crates-io]`). The fork patches `h3`, `h3-quinn`, `h3-datagram` and `salvo-http3` internally, and `[patch.crates-io]` does not cross workspaces, so every root re-declares the whole family at the same rev:
 
 ```toml
-salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
-salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
-salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
-salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
-h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
-h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
-h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "35aa745dfca50c2e5a640c0d0c93153b033fa931" }
+salvo        = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "80c472ac9e19bd6bba01e734fa2bf8503d569dd1" }
+salvo_core   = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "80c472ac9e19bd6bba01e734fa2bf8503d569dd1" }
+salvo_macros = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "80c472ac9e19bd6bba01e734fa2bf8503d569dd1" }
+salvo-http3  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "80c472ac9e19bd6bba01e734fa2bf8503d569dd1" }
+h3           = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "80c472ac9e19bd6bba01e734fa2bf8503d569dd1" }
+h3-quinn     = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "80c472ac9e19bd6bba01e734fa2bf8503d569dd1" }
+h3-datagram  = { git = "https://forge.emrul.dev/Aster/salvo.git", rev = "80c472ac9e19bd6bba01e734fa2bf8503d569dd1" }
 ```
 
-Workspace version spec: `salvo = "=1.0.4"`. Crates published to the Aster registry: `h3`, `h3-datagram`, `h3-quinn`, `salvo`, `salvo-acme`, `salvo-cache`, `salvo-compression`, `salvo-cors`, `salvo-craft`, `salvo-craft-macros`, `salvo-csrf`, `salvo-flash`, `salvo-http3`, `salvo-jwt-auth`, `salvo-oapi`, `salvo-oapi-macros`, `salvo-otel`, `salvo-proxy`, `salvo-rate-limiter`, `salvo-serde-util`, `salvo-serve-static`, `salvo-session`, `salvo-tus`, `salvo_core`, `salvo_extra`, `salvo_macros`.
+Workspace version spec: `salvo = "=1.0.5"`. The Aster repository also pins `salvo-http3` directly in `aster-transport-salvo/Cargo.toml` (`version = "=0.7.2"`, same `rev`); bump it with the patch block. Crates published to the Aster registry: `h3`, `h3-datagram`, `h3-quinn`, `salvo`, `salvo-acme`, `salvo-cache`, `salvo-compression`, `salvo-cors`, `salvo-craft`, `salvo-craft-macros`, `salvo-csrf`, `salvo-flash`, `salvo-http3`, `salvo-jwt-auth`, `salvo-oapi`, `salvo-oapi-macros`, `salvo-otel`, `salvo-proxy`, `salvo-rate-limiter`, `salvo-serde-util`, `salvo-serve-static`, `salvo-session`, `salvo-tus`, `salvo_core`, `salvo_extra`, `salvo_macros`.
 
 ### Consumers
 
@@ -58,30 +58,29 @@ Everything in the Aster product family must build one identical Salvo. Mismatche
 | Consumer | Pin location |
 |---|---|
 | The Aster repository | `Cargo.toml` `[patch.crates-io]` (salvo, salvo_core, salvo_macros, salvo-http3, h3, h3-quinn, h3-datagram) |
-| portal_desktop | Aster registry, exact `salvo = "=<version>"` (no patch block) |
-| portal-agent | Aster registry, exact `salvo = "=<version>"` (moving off its git patch block with the 2026-10-03 update) |
+| portal_desktop | Aster registry, exact `salvo = "=<version>"` (no patch block); on 2026-10-21 `salvo = "=1.0.3"`, `aster = "=0.3.794"` |
+| portal-agent | meant to move to the Aster registry, exact `salvo = "=<version>"`; on 2026-10-21 still `salvo = "0.93"` with a git patch block on `github.com/aster-rpc/salvo` `cdfdc90f` (pre-1.0, pre-absorption) |
 | Fork manifest (a record, not a build) | `[forks.salvo]` and the `salvo_patch_crates_io` snippet in `iroh-fork-manifest.toml` in the Aster repository (the only copy). |
 
 Since Aster 0.3.355 the whole Salvo family (all 22 crates plus the h3 stack) is published to the Aster registry, so registry consumers can enable any Salvo feature. Keep it that way. The published `salvo` names every sub-crate as an optional dependency, and one left out of the published set keeps its crates.io source: at an Aster-local version that crates.io lacks, publishing fails (v0.3.353 stopped at `salvo-cache ^1.0.1`); at one it has, consumers get a second `salvo_core`. The Aster publisher's `publish-native-stack.py check` rejects a published crate with a path dependency on an unpublished sibling.
 
 ## Patches
 
-Each topic branch carries exactly one commit. Keep it that way (one patch, one branch, one commit); if a patch grows a fixup, squash it before re-cherry-picking. Topic branches are not deleted after assembly: they are the canonical source of each patch and are re-cherry-picked after every upstream merge. All except the last two were re-cut on `v1.0.0` on 2026-10-03; check a branch with `git cherry -v <base> <branch>`, which should list exactly one `+`.
+Each topic branch carries exactly one commit. Keep it that way (one patch, one branch, one commit); if a patch grows a fixup, squash it before re-cherry-picking. Topic branches are not deleted after assembly: they are the canonical source of each patch and are re-cherry-picked after every upstream merge. S3, S7 and S9 were re-cut on v1.0.1 on 2026-10-21 as `<topic>-v1.0.1` branches; the others still apply unchanged from their `v1.0.0` cuts (2026-10-03); check a branch with `git cherry -v <base> <branch>`, which should list exactly one `+`.
 
 | Id | Topic branch (base) | What | Why / what in Aster depends on it | Commits (topic / integration) | Status | Conflict or porting notes |
 |---|---|---|---|---|---|---|
-| S1 | `quinn-default-keepalive` (`v1.0.0`) | Enables Quinn keep-alive for the HTTP/3 listener. | Keeps idle H3 links alive. | `6eef79d8` / older pre-1.0 copy on the integration line | carried | Apply first. Lives in `listener.rs`, preserved through the 2026-06-27 raw-quinn conflict resolution. Provides `build_transport_config`, which S4 needs. |
-| S2 | `wt-webtransport-stream-control` (`v1.0.0`) | Exposes WebTransport stream control. Adds the vendored h3 stack under `vendor/`. | Per-stream control for WebTransport. | `8d263509` / older pre-1.0 copy | carried | Apply second. S5 and S8 edit the `vendor/` tree this patch adds. |
-| S3 | `wt-web-transport-owned` (`v1.0.0`) | `Request::web_transport_owned()` returns an owned WebTransport session. Since 2026-10-03 it also carries the hand-off fix for upstream #1671/#1672: `web_transport_owned()` records a private `WebTransportOwnedHandOff` marker (forwarded to the response by `service.rs`). If the spawned task still holds the session when the handler returns, `process_web_transport` returns `Ok(None)` (clean hand-off, the accept loop ends, no "WebTransport session is still shared" error). If the Arc is unique again, upstream's split-and-reclaim path runs and the H3 connection keeps serving requests. A session shared without `web_transport_owned()` still gets upstream's error. | A handler can spawn the WebTransport session into its own task; portal_desktop uses only `web_transport_owned()`. | `7dc523f3` (includes the hand-off fix and tests) / split across two commits on the integration line, including `9ed1e06e` | carried | Interacts with upstream #1671/#1672 `take_unique_arc_extension`. Applies and compiles on bare `v1.0.0`, but its `handoff_tests` (`crates/core/src/conn/quinn/handoff_tests.rs`) pass only with S5 applied, because the vendored h3 test client sends no WebTransport SETTINGS and bare upstream rejects that with `H3_SETTINGS_ERROR`. They pass in the assembled line. |
-| S4 | `quinn-transport-config-tuner` (`quinn-default-keepalive`) | `QuinnListener::transport_config_tuner()` callback, `#[must_use]` since 2026-10-03. | The consumer tunes pacing, windows and congestion control on top of the keep-alive/idle defaults (real-time media). | `f0a7a7ae` / split across two commits on the integration line, including `c86d797c` (`#[must_use]`) | carried | Stacked on S1 because it needs `build_transport_config`. |
-| S5 | `wt-ratified-webkit-interop` (`wt-webtransport-stream-control`) | WebTransport interop with ratified-era clients (Safari/WebKit Network.framework): advertise `0xc671706a`/`0x14e9cd29`, omit the draft-13 flow-control ids, accept clients that send no WebTransport settings. | Safari 26.4+ (Network.framework) cancels draft-02-only servers. | `690fc04d` / older pre-1.0 copy | carried | Stacked on S2 (edits `vendor/`). `max_webtransport_sessions` must stay 1. |
-| S6 | `http-alt-svc-toggle` (`v1.0.0`) | Exposes the `HttpBuilder::auto_alt_svc_header` toggle. | Lets consumers keep page/API traffic on TCP (Safari migrates fetches onto H3 and wedges them); WebTransport dials QUIC directly. | `8b195ee6` / older pre-1.0 copy | carried | |
-| S7 | `wt-transport-acked` (`wt-ratified-webkit-interop`) | `SendStream::transport_acked()` resolves true only when QUIC acked the stream's FIN and all bytes (quinn `stopped() == Ok(None)`); a peer STOP or error is false. The future owns quinn's notifier, so the caller can still `reset_with_error_code(0)` a superseded stream. Edits `vendor/` (h3 `BufRecvStream::stream_ref()`, h3-quinn, salvo-http3). | Upstreamed into this fork from portal_desktop's `third_party/aster-wt-ack` (2026-10-03). portal_desktop can drop that directory and its registry `[patch]` once it consumes Aster with Salvo 1.0.1 or later. | `be8b54f4` / `c2c53442` | carried | Stacked on S5 (edits `vendor/`; its tests need ratified SETTINGS). Conflicts trivially with S3 in `crates/core/src/conn/quinn.rs`'s test-module list: keep both `mod` lines. Tests: `crates/core/src/conn/quinn/transport_acked_tests.rs`. |
-| S8 | `quinn-accept-cancellation-safe` (`v1.0.0`) | Retains an admitted QUIC handshake across cancelled accepts. `JoinedAcceptor` can select TCP after QUIC completes; the patch retains the `IncomingFuture`, the admitted fuse configuration, addresses and the original deadline until the next accept. | A cancelled accept no longer drops a completed QUIC handshake (the live Desktop cancellation trigger remains inferred from the evidence). | `097f8ac6f88b15a012e39ae184a42e311b4243fe` / `9eeed585` | carried | Apply after S7. Tests cover real QUIC cancellation/resume, admission/rejection, timeout, drop and the joined TCP winner. Tokio's original ready-first timeout semantics are preserved; a pending handshake still expires at its original deadline. Adopted and source-published 2026-10-07. |
-| S9 | `wt-recv-control-cancellation-safe` (`0cf945a9`, the assembled 1.0.3 predecessor; needs the transport-ACK tests) | Keeps Quinn receive ownership across pending reads: native `poll_read` with a lazy 64 KiB buffer keeps `STOP_SENDING` and stream identity usable after a cancelled or pending read. | Fixes the pending-read STOP/receive-ID panic. | `9a38a8a9` / `9a38a8a9` | carried | Apply last, after S8. Regression checks: a pending read, a stable receive ID, and STOP code 37 observed by the peer. |
-| S10 | none (committed on the integration line) | Builds the `salvo-acme` dependency certon without its `rsa-keys` feature. | ACME feature correction, 2026-10-05. | — / `b636f542` | carried | Not on a topic branch. |
+| S1 | `quinn-default-keepalive` (`v1.0.0`) | Enables Quinn keep-alive for the HTTP/3 listener. | Keeps idle H3 links alive. | `6eef79d8` / `6e5f308a` | carried | Apply first. Lives in `listener.rs`, preserved through the 2026-06-27 raw-quinn conflict resolution. Provides `build_transport_config`, which S4 needs. |
+| S2 | `wt-webtransport-stream-control` (`v1.0.0`) | Exposes WebTransport stream control. Adds the vendored h3 stack under `vendor/`. | Per-stream control for WebTransport. | `8d263509` / `4bc3eb0b` | carried | Apply second. S5 edits the `vendor/` tree this patch adds. |
+| S3 | `wt-web-transport-owned-v1.0.1` (`v1.0.1`; the `v1.0.0` cut is `wt-web-transport-owned`, `7dc523f3`) | `Request::web_transport_owned()` returns an owned WebTransport session. Since 2026-10-03 it also carries the hand-off fix for upstream #1671/#1672: `web_transport_owned()` records a private `WebTransportOwnedHandOff` marker (forwarded to the response by `service.rs`). If the spawned task still holds the session when the handler returns, `process_web_transport` returns `Ok(None)` (clean hand-off, the accept loop ends, no "WebTransport session is still shared" error). If the Arc is unique again, upstream's split-and-reclaim path runs and the H3 connection keeps serving requests. A session shared without `web_transport_owned()` still gets upstream's error. | A handler can spawn the WebTransport session into its own task; portal_desktop uses only `web_transport_owned()`. | `43a3a7a2` / `5299ac7b` | carried | Interacts with upstream #1671/#1672 `take_unique_arc_extension`. Applies and compiles on bare `v1.0.0`, but its `handoff_tests` (`crates/core/src/conn/quinn/handoff_tests.rs`) pass only with S5 applied, because the vendored h3 test client sends no WebTransport SETTINGS and bare upstream rejects that with `H3_SETTINGS_ERROR`. They pass in the assembled line. Re-cut on v1.0.1 (2026-10-21): the hand-off tests build `QuinnConnection::new(raw, handshake_done, None)`, upstream 1.0.1's constructor (#1711), and accept with `into_0rtt` as the accept loop does. |
+| S4 | `quinn-transport-config-tuner` (`quinn-default-keepalive`) | `QuinnListener::transport_config_tuner()` callback, `#[must_use]` since 2026-10-03. | The consumer tunes pacing, windows and congestion control on top of the keep-alive/idle defaults (real-time media). | `f0a7a7ae` / `8568e86e` | carried | Stacked on S1 because it needs `build_transport_config`. |
+| S5 | `wt-ratified-webkit-interop` (`wt-webtransport-stream-control`) | WebTransport interop with ratified-era clients (Safari/WebKit Network.framework): advertise `0xc671706a`/`0x14e9cd29`, omit the draft-13 flow-control ids, accept clients that send no WebTransport settings. | Safari 26.4+ (Network.framework) cancels draft-02-only servers. | `690fc04d` / `76d4957e` | carried | Stacked on S2 (edits `vendor/`). `max_webtransport_sessions` must stay 1. |
+| S6 | `http-alt-svc-toggle` (`v1.0.0`) | Exposes the `HttpBuilder::auto_alt_svc_header` toggle. | Lets consumers keep page/API traffic on TCP (Safari migrates fetches onto H3 and wedges them); WebTransport dials QUIC directly. | `8b195ee6` / `c524276a` | carried | |
+| S7 | `wt-transport-acked-v1.0.1` (`c524276a`, the assembled S6 on v1.0.1; the v1.0.0 cut is `wt-transport-acked` on S5, `be8b54f4`) | `SendStream::transport_acked()` resolves true only when QUIC acked the stream's FIN and all bytes (quinn `stopped() == Ok(None)`); a peer STOP or error is false. The future owns quinn's notifier, so the caller can still `reset_with_error_code(0)` a superseded stream. Edits `vendor/` (h3 `BufRecvStream::stream_ref()`, h3-quinn, salvo-http3). | Upstreamed into this fork from portal_desktop's `third_party/aster-wt-ack` (2026-10-03). portal_desktop can drop that directory and its registry `[patch]` once it consumes Aster with Salvo 1.0.1 or later. | `6f1645fd` / `ccc57bd7` | carried | Stacked on the S1–S6 assembly (edits `vendor/`; its tests need S5's ratified SETTINGS). Conflicts trivially with S3 in `crates/core/src/conn/quinn.rs`'s test-module list: keep both `mod` lines. Tests: `crates/core/src/conn/quinn/transport_acked_tests.rs`. The v1.0.1 re-cut adapts the tests to the 3-argument `QuinnConnection::new` (#1711). |
+| S9 | `wt-recv-control-cancellation-safe-v1.0.1` (`ccc57bd7`, the assembled S7 on v1.0.1; the v1.0.0-line cut is `wt-recv-control-cancellation-safe` on `0cf945a9`, `9a38a8a9`) | Keeps Quinn receive ownership across pending reads: native `poll_read` with a lazy 64 KiB buffer keeps `STOP_SENDING` and stream identity usable after a cancelled or pending read. | Fixes the pending-read STOP/receive-ID panic. | `b643fdd8` / `c4a3b65c` | carried | Apply after S7. The v1.0.1 re-cut drops its dependency on S8 (gone; see Upstreamed or dropped). Regression checks: a pending read, a stable receive ID, and STOP code 37 observed by the peer. |
+| S10 | none (committed on the integration line) | Builds the `salvo-acme` dependency certon without its `rsa-keys` feature. | ACME feature correction, 2026-10-05. | — / `5163264b` (`-x` of `b636f542`) | carried | Not on a topic branch. |
 
-Version-bump commits are not patches; redo them on each absorption so registry versions stay immutable: `d4cdbbd3` (1.0.1 family, h3 0.0.9, h3-quinn 0.0.11, salvo-http3 0.7.1, vendored h3-datagram 0.0.3), `e9b48e52` (1.0.2), `0cf945a9` (1.0.3), `35aa745d` (1.0.4, h3-quinn 0.0.12, salvo-http3 0.7.2).
+Version-bump commits are not patches; redo them on each absorption so registry versions stay immutable: `d4cdbbd3` (1.0.1 family, h3 0.0.9, h3-quinn 0.0.11, salvo-http3 0.7.1, vendored h3-datagram 0.0.3), `e9b48e52` (1.0.2), `0cf945a9` (1.0.3), `35aa745d` (1.0.4, h3-quinn 0.0.12, salvo-http3 0.7.2), `80c472ac` (1.0.5 on v1.0.1). Each one also carries what no patch commit does: `vendor/h3-datagram`, the vendored crates' versions in `vendor/*/Cargo.toml`, and in the root `Cargo.toml` the vendored versions (`salvo-http3 = "0.7.2"`, `h3-datagram = "0.0.3"`) plus the `h3-datagram = { path = "vendor/h3-datagram" }` `[patch.crates-io]` line. A bump that only sets the family version loses all of that. Take `vendor/` from the previous line (`git checkout <previous line> -- vendor`), carry those root lines over, set `[workspace.package] version`, and confirm `git diff --quiet <previous line> HEAD -- vendor` unless a vendored crate's source changed (then bump that crate only). Salvo has no `Cargo.lock`, so there is no lock to refresh.
 
 `vendor/h3-datagram` is crates.io 0.0.2 (sha256 `9d2c9f77…fdf0f`) with only its version (0.0.3) and its h3 requirement changed. It used to be a registry bridge, and its `^0.0.8` h3 requirement would have pulled in a second h3; the root `[patch.crates-io]` now maps `h3-datagram` too.
 
@@ -90,8 +89,9 @@ Version-bump commits are not patches; redo them on each absorption so registry v
 | Date | Patch (branch) | Landed upstream as | Status | Consumer impact |
 |---|---|---|---|---|
 | 2026-06-27 | `quinn-webtransport-raw-connection` (`3c3298b8`, "Expose raw Quinn connection to WebTransport") | [PR #1528](https://github.com/salvo-rs/salvo/pull/1528) "Expose Quinn connection for WebTransport requests" (commit `037a1577`, merged 2026-06-18) | upstreamed | Upstream named the accessor `Request::quinn_connection() -> Option<crate::proto::quinn::Connection>`; Aster had exposed it via the `QuinnConnection::quinn()` field plus a `::quinn::Connection` request extension. The Aster transport (`aster-transport-salvo`) uses only `web_transport_mut()` and portal_desktop only `web_transport_owned()`. Correction (2026-10-03): portal-agent did use the raw handle, reading `req.extensions().get::<quinn::Connection>()` (`transport.rs:6382`); that still works on upstream 1.0, which inserts the same extension, but portal-agent was pinned to `cdfdc90f` (pre-absorption) at the time; migrate it to `req.quinn_connection()` when it is bumped. Branch deleted; the original commit is not an ancestor of the integration line (which carries a cherry-picked copy plus upstream's version), so it is archived as tag `archive/quinn-webtransport-raw-connection`. Do not re-cherry-pick. |
+| 2026-10-21 | S8 `quinn-accept-cancellation-safe` (`097f8ac6`; integration `9eeed585` on `upgrade/salvo-v1.0`) | [PR #1711](https://github.com/salvo-rs/salvo/pull/1711) "finish QUIC handshakes on the connection task" (`9c36d16b`, in v1.0.1) | dropped (superseded) | Upstream solves the same problem better: the QUIC handshake finishes on the connection task, so a cancelled accept has nothing to lose, and v1.0.1 ships its own tests (`crates/core/src/test/quinn_accept.rs`: a joined accept keeps the QUIC handshake; a stalled handshake times out, does not block other connections, and does not hold up graceful stop). `git cherry -v v1.0.1` still shows `+`, because the code differs, not because the behaviour is missing. Migration note: no consumer edits. `aster-transport-salvo` (`tls.rs`) and `aster-expose` (`edge.rs`) use only the public `quinn(...).join(tcp).bind()` / `JoinedAcceptor::new` API, which is unchanged, and the Aster bump touched only pins. Code that constructs `QuinnConnection` itself (here only S3/S7's tests) now calls `QuinnConnection::new(raw, handshake_done, None)`. Bump to `aster-salvo-v1.0.5` (`80c472ac`). The branch is kept unchanged, so no archive tag is needed. Do not re-cherry-pick. |
 
-On 2026-10-03 (v1.0.0) nothing graduated: all six patches then existing were still `+` against `v1.0.0`.
+On 2026-10-21 (v1.0.1) S8 was dropped (above); the other eight topic branches are still `+` against `v1.0.1` (S10 has none). On 2026-10-03 (v1.0.0) nothing graduated: all six patches then existing were still `+` against `v1.0.0`.
 
 ## Porting to a new upstream release
 
@@ -100,39 +100,39 @@ On 2026-10-03 (v1.0.0) nothing graduated: all six patches then existing were sti
 
    ```bash
    for b in quinn-default-keepalive wt-webtransport-stream-control \
-            wt-web-transport-owned quinn-transport-config-tuner \
+            wt-web-transport-owned-v1.0.1 quinn-transport-config-tuner \
             wt-ratified-webkit-interop http-alt-svc-toggle \
-            wt-transport-acked quinn-accept-cancellation-safe \
-            wt-recv-control-cancellation-safe; do
+            wt-transport-acked-v1.0.1 \
+            wt-recv-control-cancellation-safe-v1.0.1; do
      echo "=== $b ==="
      git cherry -v <upstream-tag> "$b"   # '-' = upstream has an equivalent: graduate it
    done
    ```
 
-   For a stacked branch (S4, S5, S7, S9) this lists the commits it sits on as well; read the line for the branch's own tip commit. To confirm a branch still holds exactly one patch, run `git cherry -v <branch base> <branch>` against its own base.
+   For a stacked branch (S4, S5, S7, S9; S7 and S9 sit on assembled integration commits) this lists the commits it sits on as well; read the line for the branch's own tip commit. To confirm a branch still holds exactly one patch, run `git cherry -v <branch base> <branch>` against its own base.
 
-3. Build the new integration branch in a separate worktree cut from the upstream tag, and cherry-pick the patches in stack order S1 → S10: keepalive (S1) → stream-control (S2) → owned (S3) → tuner (S4) → ratified (S5) → alt-svc (S6) → transport-acked (S7) → cancellation-safe accept (S8) → cancellation-safe receive control (S9) → certon features (S10); then a version-bump commit.
+3. Build the new integration branch in a separate worktree cut from the upstream tag, and cherry-pick the patches in stack order S1 → S10: keepalive (S1) → stream-control (S2) → owned (S3) → tuner (S4) → ratified (S5) → alt-svc (S6) → transport-acked (S7) → cancellation-safe receive control (S9) → certon features (S10); then a version-bump commit (S8 was dropped at v1.0.1). A patch that no longer applies is re-cut as a new branch `<topic>-v<upstream version>`, based on the upstream tag or, when it builds on other patches, on the assembled commit it needs; never force-push the old branch.
 
    ```bash
    git worktree add -b upgrade/salvo-v<upstream version> ../salvo-v<upstream version> <upstream-tag>
    cd ../salvo-v<upstream version>
-   # S1 6eef79d8, S2 8d263509, S3 7dc523f3, S4 f0a7a7ae, S5 690fc04d,
-   # S6 8b195ee6, S7 be8b54f4 (keep both `mod` lines against S3), S8 097f8ac6,
-   # S9 9a38a8a9, S10 b636f542 (integration-line commit; no topic branch)
-   git cherry-pick -x 6eef79d8 8d263509 7dc523f3 f0a7a7ae 690fc04d \
-                      8b195ee6 be8b54f4 097f8ac6 9a38a8a9 b636f542
-   # version-bump commit, then
+   # S1 6eef79d8, S2 8d263509, S3 43a3a7a2, S4 f0a7a7ae, S5 690fc04d,
+   # S6 8b195ee6, S7 6f1645fd (keep both `mod` lines against S3),
+   # S9 b643fdd8, S10 b636f542 (integration-line commit; no topic branch)
+   git cherry-pick -x 6eef79d8 8d263509 43a3a7a2 f0a7a7ae 690fc04d \
+                      8b195ee6 6f1645fd b643fdd8 b636f542
+   # version-bump commit (keeps vendor/ byte-identical; see Patches), then
    git push origin upgrade/salvo-v<upstream version>
    ```
 
-   Version: publish the next patch above the highest Aster-published Salvo version (1.0.4 → 1.0.5 on base v1.0.1). Bump h3/h3-quinn/salvo-http3 only if their src changed. If upstream itself ships a version Aster has already published (for example a Salvo 1.0.x or h3 0.0.9), take the next patch above both.
+   Version: publish the next patch above the highest Aster-published Salvo version (1.0.4 → 1.0.5 on base v1.0.1). Bump h3/h3-quinn/salvo-http3 only if their src changed; otherwise `git diff --quiet <previous line> <new line> -- vendor` must hold. Bump the Aster repository's direct `salvo-http3` pin (`aster-transport-salvo/Cargo.toml`) with the rest of the family. If upstream itself ships a version Aster has already published (for example a Salvo 1.0.x or h3 0.0.9), take the next patch above both.
 4. Completeness check: the assembled stack on the upstream tag must equal the previous integration line's tree apart from upstream's changes. `git cherry -v <integration-line> <branch>` no longer reliably prints `-` for every patch, because the old line carried pre-1.0 copies and split S3/S4 across two commits each, so their patch-ids differ; use tree equality instead.
 5. Build and smoke-test the consumers (below), then tag (below).
 
 Retiring a patch that upstream accepted:
 
 1. Accept the upstream version; do not re-cherry-pick ours. Delete the redundant branch only after confirming the upstream API is a true superset. Before deleting, if the branch's commit is not an ancestor of the integration line (it usually is not), archive the original SHA as a tag so the graduated-patches table stays resolvable: `git tag archive/<branch> <sha> && git push origin archive/<branch>`.
-2. Check whether consumers must change (upstream's API may differ in name, signature or feature gating). If the Aster transport (`aster-transport-salvo`), `aster-expose` or portal_desktop must change, write a migration note (`salvo_migrations/<date>-<patch>.md`, kept by Aster maintainers) with: which patch graduated and the upstream commit/PR that replaced it; our API and upstream's side by side; the exact edits each consumer needs; and the rev to bump to.
+2. Check whether consumers must change (upstream's API may differ in name, signature or feature gating). If the Aster transport (`aster-transport-salvo`), `aster-expose` or portal_desktop must change, write the migration note in the patch's "Upstreamed or dropped" row (its Consumer impact column): which patch graduated and the upstream commit/PR that replaced it; our API and upstream's side by side; the exact edits each consumer needs (or that none are needed); and the tag to bump to. Each consumer's own `YYYYMMDD_Aster_Pin_Update.md` repeats the edits it needs.
 3. Move the row from "Patches" to "Upstreamed or dropped".
 
 If a patch is partly subsumed, keep the branch but trim its commit to the still-missing delta, then re-cherry-pick the slimmed patch.
@@ -152,7 +152,9 @@ When the pinned commit moves, bump every consumer's pin to match, and update `[f
 
 ```bash
 # in the Aster repository
-cargo check -p aster-transport-salvo -p aster-expose --features aster-expose/edge
+cargo check --all-targets -p aster-transport-salvo -p aster-expose --features aster-expose/edge
+cargo test -p aster-transport-salvo            # raw_webtransport.rs: >= 5 passing (CI gate)
+cargo test -p aster-expose --features edge --lib --tests
 # portal_desktop builds its own WebTransport path against web_transport_owned()
 ```
 
@@ -160,11 +162,18 @@ Validation used for releases: `cargo fmt` check; clippy (workspace, all features
 
 ## History
 
-### 2026-10-11: receive-control release (current)
+### 2026-10-21: upstream v1.0.1, 1.0.5 (current)
+
+- New integration branch `upgrade/salvo-v1.0.1`, cut from `v1.0.1` (`083a17e5`), tip `80c472ac9e19bd6bba01e734fa2bf8503d569dd1`; tag `aster-salvo-v1.0.5` on that commit once the Aster consumer trial passes. Stack: S1 `6e5f308a`, S2 `4bc3eb0b`, S3 `5299ac7b`, S4 `8568e86e`, S5 `76d4957e`, S6 `c524276a`, S7 `ccc57bd7`, S9 `c4a3b65c`, S10 `5163264b`, version commit `80c472ac`.
+- S8 dropped: upstream #1711 (`9c36d16b`) finishes QUIC handshakes on the connection task, which covers it (see Upstreamed or dropped; no consumer edits). S3, S7 and S9 re-cut as `wt-web-transport-owned-v1.0.1` (`43a3a7a2`, on `v1.0.1`), `wt-transport-acked-v1.0.1` (`6f1645fd`, on the assembled S6) and `wt-recv-control-cancellation-safe-v1.0.1` (`b643fdd8`, on the assembled S7): their tests build #1711's three-argument `QuinnConnection::new`, and S9 no longer sits on S8. The `v1.0.0` branches are unchanged. The integration commits carry both `-x` lines (original, then re-cut).
+- Versions: all 22 Salvo crates 1.0.5 (the registry serves 1.0.1, 1.0.3 and 1.0.4); h3 0.0.9, h3-quinn 0.0.12, salvo-http3 0.7.2 and h3-datagram 0.0.3 unchanged, `vendor/` byte-identical to `35aa745d`. 26 registry crates in all.
+- Validation on `80c472ac`: `salvo_core` 357 library tests passed, including the four hand-off, three transport-ACK/receive-control and upstream's four `quinn_accept` tests; workspace clippy (all targets) passes with the two baseline allowances (`collapsible_if`, `redundant_clone`). Aster's `aster-transport-salvo` suite passed against the pin, including all five raw WebTransport real-network tests.
+
+### 2026-10-11: receive-control release
 
 - Forgejo `main` and immutable tags `v1.0.0-aster.5` / `aster-salvo-2026-10-11` point at `35aa745dfca50c2e5a640c0d0c93153b033fa931`. Patch commit `9a38a8a9` (S9) fixes the pending-read STOP/receive-ID panic; the following version commit keeps registry versions immutable: all 22 Salvo crates 1.0.4, `h3-quinn` 0.0.12, `salvo-http3` 0.7.2; `h3` stays 0.0.9 and `h3-datagram` 0.0.3. The release was assembled in an isolated worktree, leaving the original developer checkout unchanged.
 - Validation at this exact release: 362 `salvo_core` library tests passed with `quinn,rustls`, including all 18 QUIC tests. All-target clippy passed with only the two existing baseline diagnostics allowed; strict clippy still reports them. Aster's full transport suite passed against this pin, including all five raw WebTransport real-network lifecycle/control tests. Registry publication and downstream consumer pins remain the consuming workspace's release gate.
-- This commit is now the tip of `upgrade/salvo-v1.0`.
+- This commit is the tip of `upgrade/salvo-v1.0`, the last release on upstream v1.0.0.
 
 ### 2026-10-07: cancellation-safe accept, 1.0.3 (source-published; registry pending)
 
