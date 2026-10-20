@@ -469,6 +469,14 @@ where
             writing: None,
         }
     }
+
+    /// Resolve only after QUIC acknowledges the FIN and all stream bytes. A peer STOP or
+    /// connection error is not delivery. The returned future owns quinn's notifier and may
+    /// outlive this wrapper, leaving the wrapper available for an explicit RESET.
+    pub fn transport_acked(&self) -> impl Future<Output = bool> + Send + 'static {
+        let stopped = self.stream.stopped();
+        async move { matches!(stopped.await, Ok(None)) }
+    }
 }
 
 impl<B> quic::SendStream<B> for SendStream<B>
