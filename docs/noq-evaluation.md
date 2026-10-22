@@ -11,6 +11,16 @@ consumer adoption and registry publication are separate steps. Existing crate
 versions are deliberately unchanged during evaluation. Do not publish this
 tree using those already allocated versions.
 
+## Why
+
+The benefit is one QUIC implementation across Iroh and HTTP/3: Aster's Noq
+patches and fixes also reach the browser-facing transport, there is one
+transport implementation to reason about, and upstream Quinn is removed from
+normal Salvo server builds. The cost is a permanent Salvo-fork patch to review
+on every Salvo or Noq upgrade. This candidate supersedes the 2026-05-22
+decision to retain two QUIC stacks: aliasing Noq at the dependency boundary
+now addresses the hard-coded Quinn types that blocked that approach.
+
 ## Design and maintenance
 
 The workspace and vendored `h3-quinn` dependency both alias package `noq` as
@@ -19,6 +29,12 @@ The workspace and vendored `h3-quinn` dependency both alias package `noq` as
 `salvo::proto::quinn` and `salvo_http3::quinn` names are retained. Their exposed
 QUIC types are now Noq types. There is one server backend, with no extra
 feature combinations for selecting between Quinn and Noq.
+
+Use `salvo::proto::noq` as the explicit transport name; `salvo::proto::quinn`
+is a compatibility re-export of the same crate. These types are incompatible
+with an independent upstream `quinn` dependency. Compiler diagnostics may
+render both as `quinn::Connection` because of the dependency alias; compare
+package/source identities when investigating such errors.
 
 The adapter drops the obsolete `ReadError::IllegalOrderedRead` arm. The
 existing hand-off and transport-ACK tests capture the peer address from
@@ -95,9 +111,12 @@ Evaluate in a separate Aster branch/worktree before changing production pins.
    shutdown waits for the actual final socket reference to be released.
 4. Port raw WebTransport diagnostics. Noq's `ConnectionStats` is cloneable,
    not `Copy`, and has aggregate counters rather than Quinn's `stats.path`.
-   Obtain RTT, congestion window and MTU from per-path statistics, define
-   which path the existing single-path API reports, and preserve a final
-   snapshot after close. Resolve peer addresses through Noq's path APIs;
+   Obtain RTT, congestion window and MTU from the active path. A browser
+   session has exactly one active path with multipath disabled; use
+   `PathId::ZERO` for this non-multipath connection, including after ordinary
+   connection migration. Keep byte/packet/loss counters connection-wide and
+   preserve both aggregate and active-path snapshots after close. Resolve
+   peer addresses through Noq's path APIs;
    established `Connection` has no Quinn-style `remote_address()` accessor.
 5. Run the Aster checks below, including socket rebind after stop, pending
    accept/read cancellation, peer stop/reset, FIN acknowledgements, datagrams,
@@ -114,10 +133,69 @@ Retain upstream Quinn for independent clients such as `wtransport` where
 needed. Check actual normal/build dependency edges rather than treating
 Quinn's presence in `Cargo.lock` as a failed migration.
 
-Acceptance also needs Chrome/Safari WebTransport checks and supported platform
-CI. A backend swap does not automatically share the Iroh endpoint, sockets,
-NAT traversal, or ALPN dispatch, and this candidate changes no congestion
-controller defaults.
+Acceptance also needs the transport-parameter and performance checks below,
+and supported platform CI. A backend swap does not automatically share the
+Iroh endpoint, sockets, NAT traversal, or ALPN dispatch. Salvo's configuration
+code continues to start with the backend's `TransportConfig::default()` plus
+5-second keep-alive and a 30-second idle timeout. This does **not** establish
+that Noq's defaults match upstream Quinn's defaults.
+
+## Browser-facing defaults and acceptance
+
+These are the defaults of the exact pinned Noq source, before a consumer's
+`transport_config_tuner` changes them. Review them again on every pin update.
+
+| Area | Pinned default / Salvo behaviour | Acceptance evidence |
+| --- | --- | --- |
+| Multipath | Disabled (`max_concurrent_multipath_paths = None`). | No multipath negotiation in Chrome/Safari; exactly one active path. |
+| n0 address discovery | Sending and receiving observed-address reports both disabled; no address-discovery transport parameter. | Capture both peers' transport parameters and verify absence. |
+| n0 NAT traversal and server handshake migration | NAT traversal disabled (`max_remote_nat_traversal_addresses = None`); server handshake migration disabled. | No NAT-traversal extension negotiation or frames on the browser listener. |
+| MTU discovery | Enabled when the socket permits it; 1200-byte starting/minimum MTU; default search ceiling 1452 bytes, also constrained by the peer. Reprobe interval 600 seconds; black-hole cooldown 60 seconds. Endpoint receive UDP-payload ceiling is 1472 bytes. | Record each peer's advertised maximum UDP payload, actual path MTU, probes and recovery on a constrained-MTU path. |
+| GSO/GRO | Send segmentation offload enabled; actual segment and receive coalescing support comes from the OS/socket. These are local capabilities, not QUIC transport parameters. | Record actual GSO/GRO capabilities and batching on Linux; compare an offload-disabled run. |
+| ECN | New paths initially attempt ECN; validation can disable marking if feedback is absent/invalid. ECN is validated through packet markings and ACK feedback, not a negotiated transport parameter. | Record marking/ACK_ECN validation and fallback on an ECN-disabled path. |
+| Congestion control and pacing | CUBIC; paced sending enabled. BBRv3 remains opt-in and supplies its own pacing rate when selected. | Record the selected controller and pacing behaviour; compare throughput and tail latency. |
+| ACK frequency | No custom ACK-frequency configuration; the protocol still advertises `min_ack_delay` at its timer granularity. | Record the peers' advertised support and any actual extension use; do not equate `ack_frequency_config = None` with absent negotiation. |
+| Idle/keep-alive | Salvo sets 30-second idle timeout and 5-second keep-alive. | Record the negotiated idle timeout and verify idle-session liveness. |
+
+Source references in the Noq pin: `noq-proto/src/config/transport.rs`
+(`TransportConfig::default`, `MtuDiscoveryConfig::default`),
+`noq-proto/src/config/mod.rs` (`EndpointConfig::new`),
+`noq-proto/src/address_discovery.rs`, `noq-proto/src/connection/paths.rs`,
+`noq-proto/src/connection/pacing.rs`, and `noq/src/runtime/tokio.rs`.
+
+For Chrome and Safari, save a qlog or decoded handshake capture showing both
+peers' transport parameters, ALPN `h3`, HTTP/3 CONNECT/WebTransport and
+datagram SETTINGS, extension negotiation and the active path. A successful
+CONNECT alone is insufficient. Check actual negotiated values against the
+table and explain any browser/version-specific differences. GSO/GRO, pacing
+and ECN require the local/packet-level evidence described above.
+
+## Performance gate before adoption
+
+Compare the original Quinn-backed Salvo assembly `80c472ac` against this Noq
+candidate using the same H3/WebTransport harness, application, TLS provider,
+configuration and host. Prefer Linux for meaningful GSO/GRO coverage. Reuse
+B1's harness when available; it remains a required adoption gate, not a
+completed result of this candidate's functional tests.
+
+Run repeated, interleaved trials with warm-up: clean LAN/WAN, constrained
+bandwidth, random loss, shallow/deep queues, and small requests alongside a
+bulk transfer. Record delivered application throughput, small-request
+p50/p95/p99 latency and failures, CPU, loss/retransmissions, and offload
+capabilities. First compare both backends using CUBIC; keep any Noq
+CUBIC-versus-BBRv3 experiment separate so a controller change is not attributed
+to the backend migration. Investigate consistent throughput, tail-latency or
+CPU regressions before adoption. A simulated Noq-only congestion-control
+benchmark cannot satisfy this Quinn-versus-Noq H3/WebTransport gate.
+
+## Proposed ledger entry on acceptance
+
+The canonical ledger is on Salvo `main`; this candidate does not change its
+release record. Add a row there when accepting the patch:
+
+| Topic / base | Reason and consumer impact | Upgrade/release notes |
+| --- | --- | --- |
+| `feat/noq-backend-v1.0.1`, based on the **1.0.5 assembly `80c472ac`**, not a bare upstream tag; stacked because it needs the vendored H3 and WebTransport patches, like the assembled-base exception in iroh-docs row 41. | One QUIC stack and patch set for Iroh and HTTP/3; supersedes the 2026-05-22 two-stack decision. Permanent backend-substitution patch. Existing `quinn` API names expose **Noq types**, incompatible with upstream Quinn; prefer `salvo::proto::noq`. Aster must port socket lifecycle and active-path statistics. | Review defaults and adapter APIs on every Salvo/Noq upgrade; require browser negotiation captures and the H3/WebTransport performance gate. Evaluation keeps existing versions only temporarily: **do not publish under already allocated versions**. Allocate fresh versions and propagate dependency requirements before adoption/publication. |
 
 After acceptance, allocate fresh registry versions for changed packages and
 propagate their requirements through the dependent Salvo family. Update the
