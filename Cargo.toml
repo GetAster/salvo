@@ -110,7 +110,7 @@ proc-macro-crate = { version = ">= 2, <= 4" }
 proc-macro2 = "1"
 # Keep the upstream dependency name so the Noq port stays small. The public
 # `quinn` feature/module now exposes Noq types; see docs/noq-evaluation.md.
-quinn = { package = "noq", version = "=1.4.0", git = "https://forge.emrul.dev/Aster/noq.git", rev = "535bd88409193ae577f445a3207351bb83525f4e", default-features = false }
+quinn = { package = "noq", version = "=1.4.1", git = "https://forge.emrul.dev/Aster/noq.git", rev = "13dcb5b7f60240d729580014356fca6ab7f18ce3", default-features = false }
 quote = "1"
 rand = "0.10"
 rcgen = "0.14"
