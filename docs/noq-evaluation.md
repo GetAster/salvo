@@ -3,10 +3,11 @@
 This candidate makes Salvo's HTTP/3 and WebTransport server use the same Noq
 fork as Aster's Iroh stack. It is based on Salvo `80c472ac9e19bd6bba01e734fa2bf8503d569dd1`
 (the 1.0.5 assembly on upstream v1.0.1). It was evaluated against Noq 1.4.0 at
-`535bd88409193ae577f445a3207351bb83525f4e`; on adoption it pins Noq 1.4.1 at
-`13dcb5b7f60240d729580014356fca6ab7f18ce3` (`upgrade/noq-v1.4.0`, which adds the
-BBRv3 fixes, receive-buffer compaction, the zero pacing-delay fix and the BBRv3
-default) from `https://forge.emrul.dev/Aster/noq.git`.
+`535bd88409193ae577f445a3207351bb83525f4e`; it was adopted on Noq 1.4.1
+(`13dcb5b7`: the BBRv3 fixes, receive-buffer compaction, the zero pacing-delay
+fix and the BBRv3 default) and now pins Noq 1.4.2 at
+`a3c70b7afe459cbf01122928f4f90d72063ab972` (`upgrade/noq-v1.4.0`, which adds
+incremental BBRv3 packet history) from `https://forge.emrul.dev/Aster/noq.git`.
 
 Branch: `feat/noq-backend-v1.0.1`, cherry-picked onto `upgrade/salvo-v1.0.1`.
 Consumer adoption and registry publication are separate steps. On the upgrade
