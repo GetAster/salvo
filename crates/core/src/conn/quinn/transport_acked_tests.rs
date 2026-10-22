@@ -80,6 +80,7 @@ async fn serve_one(router: Router) -> (SocketAddr, JoinHandle<std::io::Result<()
     let service = Service::new(router);
     let handle = tokio::spawn(async move {
         let incoming = endpoint.accept().await.expect("incoming connection");
+        let remote = incoming.remote_address();
         // Upstream 1.0.1 (#1711) hands the connection over before the handshake completes;
         // `serve_connection` awaits it, as the accept loop does.
         let (raw, handshake_done) = incoming
@@ -87,7 +88,6 @@ async fn serve_one(router: Router) -> (SocketAddr, JoinHandle<std::io::Result<()
             .expect("accept incoming")
             .into_0rtt()
             .expect("server connections always accept 0.5-RTT");
-        let remote = raw.remote_address();
         let hyper_handler = service.hyper_handler(
             crate::conn::SocketAddr::from(addr),
             crate::conn::SocketAddr::from(remote),
@@ -131,7 +131,7 @@ async fn connect(addr: SocketAddr) -> Client {
     tls.alpn_protocols = vec![b"h3".to_vec()];
     let crypto =
         ::quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client crypto");
-    let mut endpoint =
+    let endpoint =
         ::quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).expect("client endpoint");
     endpoint.set_default_client_config(::quinn::ClientConfig::new(Arc::new(crypto)));
     let conn = endpoint
