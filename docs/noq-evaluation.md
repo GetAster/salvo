@@ -8,10 +8,12 @@ fork as Aster's Iroh stack. It is based on Salvo `80c472ac9e19bd6bba01e734fa2bf8
 BBRv3 fixes, receive-buffer compaction, the zero pacing-delay fix and the BBRv3
 default) from `https://forge.emrul.dev/Aster/noq.git`.
 
-Branch: `feat/noq-backend-v1.0.1`. This is a source evaluation candidate;
-consumer adoption and registry publication are separate steps. Existing crate
-versions are deliberately unchanged during evaluation. Do not publish this
-tree using those already allocated versions.
+Branch: `feat/noq-backend-v1.0.1`, cherry-picked onto `upgrade/salvo-v1.0.1`.
+Consumer adoption and registry publication are separate steps. On the upgrade
+branch the changed family takes fresh versions: the Salvo crates 1.0.6,
+`h3-quinn` 0.0.13 and `salvo-http3` 0.7.3 (`h3` 0.0.9 and `h3-datagram` 0.0.3
+are unchanged). The evaluation branch itself kept the already allocated
+versions and must not be published.
 
 ## Why
 
