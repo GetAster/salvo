@@ -19,7 +19,7 @@ use crate::conn::quinn::QuinnAcceptor;
 use crate::conn::rustls::{Keycert, RustlsConfig, default_crypto_provider, read_trust_anchor};
 use crate::proto::quinn::udp::{RecvMeta, Transmit};
 use crate::proto::quinn::{
-    self, AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, TokioRuntime, UdpPoller,
+    self, AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, TokioRuntime, UdpSender,
 };
 use crate::{Router, Server};
 
@@ -38,14 +38,19 @@ struct Network(Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Datagram>>>>)
 #[derive(Debug)]
 struct Socket {
     addr: SocketAddr,
+    sender: Sender,
+    inbox: mpsc::UnboundedReceiver<Datagram>,
+}
+
+#[derive(Clone, Debug)]
+struct Sender {
     fate: Fate,
-    sent: AtomicUsize,
+    sent: Arc<AtomicUsize>,
     outbox: mpsc::UnboundedSender<(Instant, Datagram)>,
-    inbox: Mutex<mpsc::UnboundedReceiver<Datagram>>,
 }
 
 impl Network {
-    fn socket(&self, port: u16, fate: Fate) -> Arc<Socket> {
+    fn socket(&self, port: u16, fate: Fate) -> Box<Socket> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let (inbox_tx, inbox) = mpsc::unbounded_channel();
         self.0.lock().unwrap().insert(addr, inbox_tx);
@@ -60,46 +65,37 @@ impl Network {
                 }
             }
         });
-        Arc::new(Socket {
+        Box::new(Socket {
             addr,
-            fate,
-            sent: AtomicUsize::new(0),
-            outbox,
-            inbox: Mutex::new(inbox),
+            sender: Sender {
+                fate,
+                sent: Arc::new(AtomicUsize::new(0)),
+                outbox,
+            },
+            inbox,
         })
     }
 }
 
 impl AsyncUdpSocket for Socket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(AlwaysWritable)
-    }
-
-    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
-        let n = self.sent.fetch_add(1, Ordering::SeqCst);
-        if let Some(delay) = (self.fate)(n) {
-            let datagram = (transmit.destination, transmit.contents.to_vec());
-            let _ = self.outbox.send((Instant::now() + delay, datagram));
-        }
-        Ok(())
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        Box::pin(self.sender.clone())
     }
 
     fn poll_recv(
-        &self,
+        &mut self,
         cx: &mut Context<'_>,
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let Some((from, datagram)) = ready!(self.inbox.lock().unwrap().poll_recv(cx)) else {
+        let Some((from, datagram)) = ready!(self.inbox.poll_recv(cx)) else {
             return Poll::Pending;
         };
         bufs[0][..datagram.len()].copy_from_slice(&datagram);
-        meta[0] = RecvMeta {
-            addr: from,
-            len: datagram.len(),
-            stride: datagram.len(),
-            ..RecvMeta::default()
-        };
+        meta[0] = RecvMeta::default();
+        meta[0].addr = from;
+        meta[0].len = datagram.len();
+        meta[0].stride = datagram.len();
         Poll::Ready(Ok(1))
     }
 
@@ -108,15 +104,22 @@ impl AsyncUdpSocket for Socket {
     }
 }
 
-#[derive(Debug)]
-struct AlwaysWritable;
-impl UdpPoller for AlwaysWritable {
-    fn poll_writable(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+impl UdpSender for Sender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let n = self.sent.fetch_add(1, Ordering::SeqCst);
+        if let Some(delay) = (self.fate)(n) {
+            let datagram = (transmit.destination, transmit.contents.to_vec());
+            let _ = self.outbox.send((Instant::now() + delay, datagram));
+        }
         Poll::Ready(Ok(()))
     }
 }
 
-fn endpoint(socket: Arc<Socket>, server: Option<quinn::ServerConfig>) -> Endpoint {
+fn endpoint(socket: Box<Socket>, server: Option<quinn::ServerConfig>) -> Endpoint {
     let runtime = Arc::new(TokioRuntime);
     Endpoint::new_with_abstract_socket(EndpointConfig::default(), server, socket, runtime).unwrap()
 }
@@ -126,8 +129,9 @@ fn acceptor(network: &Network, port: u16, fate: Fate) -> QuinnAcceptor {
     let key = include_bytes!("../../certs/key.pem").as_slice();
     let config = RustlsConfig::new(Keycert::new().cert(cert).key(key));
     let socket = network.socket(port, fate);
-    let endpoint = endpoint(socket.clone(), Some(config.try_into().unwrap()));
-    QuinnAcceptor::new(endpoint, socket.addr, CancellationToken::new())
+    let addr = socket.addr;
+    let endpoint = endpoint(socket, Some(config.try_into().unwrap()));
+    QuinnAcceptor::new(endpoint, addr, CancellationToken::new())
 }
 
 fn client(network: &Network, port: u16, fate: Fate) -> Endpoint {
@@ -143,7 +147,7 @@ fn client(network: &Network, port: u16, fate: Fate) -> Endpoint {
         .chain([b"h3".to_vec()])
         .collect();
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
-    let mut endpoint = endpoint(network.socket(port, fate), None);
+    let endpoint = endpoint(network.socket(port, fate), None);
     endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
     endpoint
 }

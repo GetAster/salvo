@@ -1,3 +1,7 @@
+> **Aster Noq evaluation branch:** HTTP/3 and WebTransport use Aster's pinned
+> Noq fork behind the existing `quinn` API names. See
+> [the evaluation and consumer migration notes](docs/noq-evaluation.md).
+
 <div align="center">
 <p><img alt="Salvo" width="132" style="max-width:40%;min-width:60px;" src="https://salvo.rs/images/logo-text.svg" /></p>
 

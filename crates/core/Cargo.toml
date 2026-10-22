@@ -150,6 +150,9 @@ zstd = { workspace = true, optional = true, features = ["default"] }
 nix = { workspace = true, optional = true, features = ["fs", "user"] }
 
 [dev-dependencies]
+# Independent Quinn-based client verifies that the Noq server interoperates
+# with existing WebTransport clients. This is not a production backend.
+wtransport = { version = "0.7", default-features = false, features = ["ring", "dangerous-configuration"] }
 criterion = { workspace = true }
 fastrand = { workspace = true }
 # Both backends on purpose: this makes rustls unable to pick a provider from crate features,
