@@ -1,4 +1,8 @@
 //! `QuinnListener` and utils.
+//!
+//! In the Aster fork this module uses Noq. The `quinn` feature and API names
+//! are retained to keep the upstream patch small; exposed transport types are
+//! Noq types and are not interchangeable with upstream Quinn types.
 use std::fmt::{self, Debug, Formatter};
 use std::future::{Ready, ready};
 use std::io::Result as IoResult;
@@ -56,7 +60,7 @@ impl QuinnConnection {
         self.inner
     }
 
-    /// Get the underlying Quinn connection.
+    /// Get the underlying Noq connection (the upstream API name is retained).
     #[must_use]
     pub fn quinn(&self) -> &quinn::Connection {
         &self.raw

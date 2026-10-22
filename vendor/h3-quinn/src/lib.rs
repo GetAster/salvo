@@ -413,7 +413,6 @@ fn convert_read_error_to_stream_error(error: ReadError) -> StreamErrorIncoming {
             }
         }
         error @ ReadError::ClosedStream => StreamErrorIncoming::Unknown(Box::new(error)),
-        ReadError::IllegalOrderedRead => panic!("h3-quinn only performs ordered reads"),
         error @ ReadError::ZeroRttRejected => StreamErrorIncoming::Unknown(Box::new(error)),
     }
 }
