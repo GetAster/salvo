@@ -104,7 +104,7 @@ async fn borrowed(req: &mut Request) -> Result<(), crate::Error> {
 /// race the datagram response.
 #[handler]
 async fn interop_echo(req: &mut Request) -> Result<(), crate::Error> {
-    let raw = req.quinn_connection().expect("Noq connection extension");
+    let raw: crate::proto::noq::Connection = req.quinn_connection().expect("Noq connection extension");
     let session = req.web_transport_mut().await?;
     echo_one_stream(session)
         .await

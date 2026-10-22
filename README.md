@@ -1,6 +1,11 @@
 > **Aster Noq evaluation branch:** HTTP/3 and WebTransport use Aster's pinned
 > Noq fork behind the existing `quinn` API names. See
 > [the evaluation and consumer migration notes](docs/noq-evaluation.md).
+> **Type compatibility:** `QuinnListener`, `quinn_connection()` and
+> `salvo::proto::quinn` expose **Noq**, not upstream Quinn, types. Prefer
+> `salvo::proto::noq` when naming the transport directly. A separate upstream
+> `quinn::Connection` cannot be passed to these APIs or retrieved as their
+> request extension, even when compiler diagnostics display similar names.
 
 <div align="center">
 <p><img alt="Salvo" width="132" style="max-width:40%;min-width:60px;" src="https://salvo.rs/images/logo-text.svg" /></p>
