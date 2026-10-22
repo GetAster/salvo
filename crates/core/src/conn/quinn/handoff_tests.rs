@@ -99,6 +99,63 @@ async fn borrowed(req: &mut Request) -> Result<(), crate::Error> {
     Ok(())
 }
 
+/// Exercise an independent Quinn-based WebTransport client against Noq. Keep
+/// the session alive until the client closes so CONNECT reclamation cannot
+/// race the datagram response.
+#[handler]
+async fn interop_echo(req: &mut Request) -> Result<(), crate::Error> {
+    let raw = req.quinn_connection().expect("Noq connection extension");
+    let session = req.web_transport_mut().await?;
+    echo_one_stream(session)
+        .await
+        .map_err(|e| crate::Error::Other(e.into()))?;
+    let datagram = session.datagram_reader().read_datagram().await?;
+    session
+        .datagram_sender()
+        .send_datagram(datagram.into_payload())
+        .map_err(crate::Error::other)?;
+    raw.closed().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quinn_webtransport_client_interoperates_with_noq_server() {
+    timeout(STEP, async {
+        // Core's tests deliberately link both crypto providers.
+        let _ = (*default_crypto_provider()).clone().install_default();
+        let router = Router::with_path("wt").goal(interop_echo);
+        let (addr, server) = serve_one(router).await;
+        let endpoint = wtransport::Endpoint::client(
+            wtransport::ClientConfig::builder()
+                .with_bind_default()
+                .with_no_cert_validation()
+                .build(),
+        )
+        .expect("Quinn client endpoint");
+        let connection = endpoint
+            .connect(format!("https://{addr}/wt"))
+            .await
+            .expect("WebTransport CONNECT to Noq");
+        let (mut send, mut recv) = connection.open_bi().await.unwrap().await.unwrap();
+        send.write_all(b"Quinn to Noq").await.unwrap();
+        send.finish().await.unwrap();
+        let mut echoed = Vec::new();
+        recv.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"Quinn to Noq");
+
+        connection.send_datagram(b"datagram interop").unwrap();
+        let datagram = connection.receive_datagram().await.unwrap();
+        assert_eq!(&*datagram, b"datagram interop");
+        connection.close(0u32.into(), b"done");
+        // HTTP/3 shutdown after peer close may return a connection error; the
+        // important lifecycle assertion is that the serving task terminates.
+        let _ = server.await.expect("serving task should not panic");
+        endpoint.wait_idle().await;
+    })
+    .await
+    .expect("Quinn/Noq interoperability timed out");
+}
+
 /// (iv) Shares the session *without* `web_transport_owned()` (clones the Arc
 /// out of the extensions behind salvo's back) and keeps it past the handler.
 /// Upstream's "still shared" error must still be reported for this.
@@ -138,6 +195,7 @@ async fn serve_one(router: Router) -> (SocketAddr, JoinHandle<std::io::Result<()
     let service = Service::new(router);
     let handle = tokio::spawn(async move {
         let incoming = endpoint.accept().await.expect("incoming connection");
+        let remote = incoming.remote_address();
         // Upstream 1.0.1 (#1711) hands the connection over before the handshake completes;
         // `serve_connection` awaits it, as the accept loop does.
         let (raw, handshake_done) = incoming
@@ -145,7 +203,6 @@ async fn serve_one(router: Router) -> (SocketAddr, JoinHandle<std::io::Result<()
             .expect("accept incoming")
             .into_0rtt()
             .expect("server connections always accept 0.5-RTT");
-        let remote = raw.remote_address();
         let hyper_handler = service.hyper_handler(
             crate::conn::SocketAddr::from(addr),
             crate::conn::SocketAddr::from(remote),
@@ -185,7 +242,7 @@ async fn connect(addr: SocketAddr) -> Client {
     tls.alpn_protocols = vec![b"h3".to_vec()];
     let crypto =
         ::quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client crypto");
-    let mut endpoint =
+    let endpoint =
         ::quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).expect("client endpoint");
     endpoint.set_default_client_config(::quinn::ClientConfig::new(Arc::new(crypto)));
     let conn = endpoint
