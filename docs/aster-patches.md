@@ -96,6 +96,15 @@ Version-bump commits are not patches; redo them on each absorption so registry v
 
 On 2026-10-21 (v1.0.1) S8 was dropped (above); the other eight topic branches are still `+` against `v1.0.1` (S10 has none). On 2026-10-03 (v1.0.0) nothing graduated: all six patches then existing were still `+` against `v1.0.0`.
 
+## Planned: drop S1 and S4 at the next port
+
+Decided 2026-10-25. Upstream `QuinnListener::new` takes a complete `ServerConfig` and keeps its transport settings; S1 overwrites them with a 5 s keep-alive / 30 s idle timeout, and S4 exists only to let callers tune after that overwrite. At the next port, do not re-cherry-pick S1 or S4; move both rows to "Upstreamed or dropped" (dropped, not upstreamed).
+
+Consumers, in the same release:
+
+- **Aster** (`aster-transport-salvo/src/tls.rs`): `serve_https` and `serve_https_with` set the 5 s / 30 s defaults on the `ServerConfig` they build, then run the tuner, instead of calling `transport_config_tuner()`. Their signatures and documented behaviour stay. Check `aster-expose` (`edge.rs`) and any other `QuinnListener` use for reliance on S1's keep-alive.
+- **portal_desktop**: no code change (its actor listener sets its own transport config; its WebTransport server goes through `serve_https_with`). Migration note: `docs/20261025_Salvo_S1_S4_Removal_Migration.md` in that repository.
+
 ## Porting to a new upstream release
 
 1. Fetch upstream and tags (`git fetch upstream --tags`) and mirror the release tag to the Forge (`git push origin <upstream-tag>`). Prefer a release tag over a moving upstream `main`.
