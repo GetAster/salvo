@@ -59,9 +59,9 @@ optional = true
 
 [dependencies.quinn]
 package = "noq"
-version = "=1.4.2"
+version = "=1.4.3"
 git = "https://forge.emrul.dev/Aster/noq.git"
-rev = "a3c70b7afe459cbf01122928f4f90d72063ab972"
+rev = "de89867c975192d69438164bada087506133c5a4"
 features = ["futures-io"]
 default-features = false
 

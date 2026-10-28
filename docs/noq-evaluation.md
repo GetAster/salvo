@@ -5,9 +5,11 @@ fork as Aster's Iroh stack. It is based on Salvo `80c472ac9e19bd6bba01e734fa2bf8
 (the 1.0.5 assembly on upstream v1.0.1). It was evaluated against Noq 1.4.0 at
 `535bd88409193ae577f445a3207351bb83525f4e`; it was adopted on Noq 1.4.1
 (`13dcb5b7`: the BBRv3 fixes, receive-buffer compaction, the zero pacing-delay
-fix and the BBRv3 default) and now pins Noq 1.4.2 at
-`a3c70b7afe459cbf01122928f4f90d72063ab972` (`upgrade/noq-v1.4.0`, which adds
-incremental BBRv3 packet history) from `https://forge.emrul.dev/Aster/noq.git`.
+fix and the BBRv3 default), moved to Noq 1.4.2 (`a3c70b7a`, incremental BBRv3
+packet history) and now pins Noq 1.4.3 at
+`de89867c975192d69438164bada087506133c5a4` (`upgrade/noq-v1.4.0`, which adds
+adaptive reordering thresholds, the BBRv3 undo-state fix and the path's minimum
+RTT in `PathStats`) from `https://forge.emrul.dev/Aster/noq.git`.
 
 Branch: `feat/noq-backend-v1.0.1`, cherry-picked onto `upgrade/salvo-v1.0.1`.
 Consumer adoption and registry publication are separate steps. On the upgrade
