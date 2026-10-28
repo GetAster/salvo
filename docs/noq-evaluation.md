@@ -13,8 +13,8 @@ RTT in `PathStats`) from `https://forge.emrul.dev/Aster/noq.git`.
 
 Branch: `feat/noq-backend-v1.0.1`, cherry-picked onto `upgrade/salvo-v1.0.1`.
 Consumer adoption and registry publication are separate steps. On the upgrade
-branch the changed family takes fresh versions: the Salvo crates 1.0.6,
-`h3-quinn` 0.0.13 and `salvo-http3` 0.7.3 (`h3` 0.0.9 and `h3-datagram` 0.0.3
+branch the changed family takes fresh versions: the Salvo crates 1.0.7,
+`h3-quinn` 0.0.14 and `salvo-http3` 0.7.4 (`h3` 0.0.9 and `h3-datagram` 0.0.3
 are unchanged). The evaluation branch itself kept the already allocated
 versions and must not be published.
 

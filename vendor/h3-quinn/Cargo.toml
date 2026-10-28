@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.70"
 name = "h3-quinn"
-version = "0.0.13"
+version = "0.0.14"
 authors = ["Jean-Christophe BEGUE <jc.begue@pm.me>"]
 build = false
 autolib = false
