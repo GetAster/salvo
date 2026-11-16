@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.70"
 name = "h3-quinn"
-version = "0.0.11003"
+version = "0.0.11004"
 authors = ["Jean-Christophe BEGUE <jc.begue@pm.me>"]
 build = false
 autolib = false
@@ -59,9 +59,9 @@ optional = true
 
 [dependencies.quinn]
 package = "noq"
-version = "=1.4.1003"
+version = "=1.4.1004"
 git = "https://forge.emrul.dev/Aster/noq.git"
-rev = "292f5c1ef036f892f6bd5995b4f75b8a1e9d288f"
+rev = "975b8c8c99010684447a552afb83d194d8532908"
 features = ["futures-io"]
 default-features = false
 
