@@ -127,6 +127,11 @@ where
 /// under the 30s idle timeout so a single dropped keep-alive doesn't tear the
 /// session down) — then the consumer's tuner on top, so it can adjust pacing /
 /// windows / congestion control without losing those defaults.
+///
+/// Segmentation offload (GSO) is on only where the OS is known to segment
+/// (Linux). A host that accepts a GSO send without splitting it emits one
+/// oversized UDP datagram that the peer drops: the MTU-sized handshake passes
+/// and every media packet is lost. The tuner can still turn it on.
 fn build_transport_config(tuner: Option<&std::sync::Arc<TransportTuner>>) -> ::quinn::TransportConfig {
     let mut transport = ::quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
@@ -134,6 +139,7 @@ fn build_transport_config(tuner: Option<&std::sync::Arc<TransportTuner>>) -> ::q
         ::quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30))
             .expect("30s within IdleTimeout range"),
     ));
+    transport.enable_segmentation_offload(cfg!(target_os = "linux"));
     if let Some(tuner) = tuner {
         tuner(&mut transport);
     }
@@ -284,5 +290,33 @@ impl Acceptor for QuinnAcceptor {
                 http_scheme: self.holdings[0].http_scheme.clone(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod gso_default_tests {
+    use super::*;
+
+    fn gso_flag(t: &::quinn::TransportConfig) -> bool {
+        format!("{t:?}").contains("enable_segmentation_offload: true")
+    }
+
+    #[test]
+    fn segmentation_offload_defaults_on_only_where_the_os_segments() {
+        assert_eq!(gso_flag(&build_transport_config(None)), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn tuner_overrides_the_segmentation_default() {
+        let on: std::sync::Arc<TransportTuner> =
+            std::sync::Arc::new(|t: &mut ::quinn::TransportConfig| {
+                t.enable_segmentation_offload(true);
+            });
+        let off: std::sync::Arc<TransportTuner> =
+            std::sync::Arc::new(|t: &mut ::quinn::TransportConfig| {
+                t.enable_segmentation_offload(false);
+            });
+        assert!(gso_flag(&build_transport_config(Some(&on))));
+        assert!(!gso_flag(&build_transport_config(Some(&off))));
     }
 }
