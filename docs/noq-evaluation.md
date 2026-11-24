@@ -1,15 +1,21 @@
 # Noq backend evaluation
 
 This candidate makes Salvo's HTTP/3 and WebTransport server use the same Noq
-fork as Aster's Iroh stack. It is based on Salvo `80c472ac9e19bd6bba01e734fa2bf8503d569dd1`
-(the 1.0.5 assembly on upstream v1.0.1) and pins Noq 1.4.0 at
-`535bd88409193ae577f445a3207351bb83525f4e` from
+fork as Aster's Iroh stack. It was first built on Salvo `80c472ac9e19bd6bba01e734fa2bf8503d569dd1`
+(the 1.0.5 assembly on upstream v1.0.1) and evaluated against Noq 1.4.0 at
+`535bd88409193ae577f445a3207351bb83525f4e`; it was adopted on Noq 1.4.1
+(`13dcb5b7`: the BBRv3 fixes, receive-buffer compaction, the zero pacing-delay
+fix and the BBRv3 default) and followed the Noq releases to 1.4.1004. On
+upstream Salvo v1.2.1 it pins Noq 1.5.1001 at
+`819373fafcd4a21aaf5a81352224218caa462b44` (`upgrade/noq-v1.5.0`) from
 `https://forge.emrul.dev/Aster/noq.git`.
 
-Branch: `feat/noq-backend-v1.0.1`. This is a source evaluation candidate;
-consumer adoption and registry publication are separate steps. Existing crate
-versions are deliberately unchanged during evaluation. Do not publish this
-tree using those already allocated versions.
+Branch: `feat/noq-backend-v1.2.1` (the v1.2.1 re-cut of
+`feat/noq-backend-v1.0.1`), cherry-picked onto `upgrade/salvo-v1.2.1`.
+Consumer adoption and registry publication are separate steps. The changed
+family takes fresh versions under the fork version rule: the Salvo crates
+1.2.2001, `h3-quinn` 0.0.11005 and `salvo-http3` 0.7.1005 (`h3` 0.0.9 and
+`h3-datagram` 0.0.3 are unchanged).
 
 ## Why
 
@@ -153,7 +159,7 @@ These are the defaults of the exact pinned Noq source, before a consumer's
 | MTU discovery | Enabled when the socket permits it; 1200-byte starting/minimum MTU; default search ceiling 1452 bytes, also constrained by the peer. Reprobe interval 600 seconds; black-hole cooldown 60 seconds. Endpoint receive UDP-payload ceiling is 1472 bytes. | Record each peer's advertised maximum UDP payload, actual path MTU, probes and recovery on a constrained-MTU path. |
 | GSO/GRO | Send segmentation offload enabled; actual segment and receive coalescing support comes from the OS/socket. These are local capabilities, not QUIC transport parameters. | Record actual GSO/GRO capabilities and batching on Linux; compare an offload-disabled run. |
 | ECN | New paths initially attempt ECN; validation can disable marking if feedback is absent/invalid. ECN is validated through packet markings and ACK feedback, not a negotiated transport parameter. | Record marking/ACK_ECN validation and fallback on an ECN-disabled path. |
-| Congestion control and pacing | CUBIC; paced sending enabled. BBRv3 remains opt-in and supplies its own pacing rate when selected. | Record the selected controller and pacing behaviour; compare throughput and tail latency. |
+| Congestion control and pacing | BBRv3 (Noq `bbr3-default`, from Noq 1.4.1), which supplies its own pacing rate; paced sending enabled. CUBIC and NewReno remain selectable through `transport_config_tuner` / `congestion_controller_factory`. The evaluation runs above used Noq 1.4.0, whose default was CUBIC. | Record the selected controller and pacing behaviour; compare throughput and tail latency. |
 | ACK frequency | No custom ACK-frequency configuration; the protocol still advertises `min_ack_delay` at its timer granularity. | Record the peers' advertised support and any actual extension use; do not equate `ack_frequency_config = None` with absent negotiation. |
 | Idle/keep-alive | Salvo sets 30-second idle timeout and 5-second keep-alive. | Record the negotiated idle timeout and verify idle-session liveness. |
 
@@ -182,9 +188,10 @@ Run repeated, interleaved trials with warm-up: clean LAN/WAN, constrained
 bandwidth, random loss, shallow/deep queues, and small requests alongside a
 bulk transfer. Record delivered application throughput, small-request
 p50/p95/p99 latency and failures, CPU, loss/retransmissions, and offload
-capabilities. First compare both backends using CUBIC; keep any Noq
-CUBIC-versus-BBRv3 experiment separate so a controller change is not attributed
-to the backend migration. Investigate consistent throughput, tail-latency or
+capabilities. First compare both backends using CUBIC, selected explicitly on
+the Noq side because Noq's default is now BBRv3; keep any Noq CUBIC-versus-BBRv3
+experiment separate so a controller change is not attributed to the backend
+migration. Investigate consistent throughput, tail-latency or
 CPU regressions before adoption. A simulated Noq-only congestion-control
 benchmark cannot satisfy this Quinn-versus-Noq H3/WebTransport gate.
 
