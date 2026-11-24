@@ -92,11 +92,11 @@ use futures_util::sink::{Sink, SinkExt};
 use futures_util::stream::{Stream, StreamExt};
 use futures_util::{FutureExt, TryFutureExt, future};
 use hyper::upgrade::OnUpgrade;
-use salvo_core::http::header::{ORIGIN, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, UPGRADE};
+use salvo_core::http::header::{ORIGIN, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, UPGRADE};
 use salvo_core::http::headers::{
     Connection, HeaderMapExt, SecWebsocketAccept, SecWebsocketKey, Upgrade,
 };
-use salvo_core::http::{StatusCode, StatusError};
+use salvo_core::http::{Method, StatusCode, StatusError};
 use salvo_core::rt::tokio::TokioIo;
 use salvo_core::conn::ConnCtrl;
 use salvo_core::{Error, Request, Response};
@@ -384,6 +384,11 @@ impl WebSocketUpgrade {
         F: FnOnce(WebSocket) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        // RFC 6455 section 4.2.1 requires GET even when the surrounding
+        // router intentionally matches requests of every method.
+        if req.method() != Method::GET {
+            return Err(StatusError::bad_request().brief("websocket handshake requires GET"));
+        }
         let req_headers = req.headers();
         let matched = req_headers
             .typed_get::<Connection>()
@@ -404,19 +409,28 @@ impl WebSocketUpgrade {
             return Err(StatusError::bad_request()
                 .brief("missing upgrade header or it is not websocket"));
         }
-        let matched = !req_headers
+        let matched = req_headers.get_all(SEC_WEBSOCKET_VERSION).iter().count() != 1 || !req_headers
             .get(SEC_WEBSOCKET_VERSION)
             .and_then(|v| v.to_str().ok())
             .map(|v| v == "13")
             .unwrap_or(false);
         if matched {
             tracing::debug!("websocket version is not 13");
+            res.add_header(SEC_WEBSOCKET_VERSION, "13", true).expect("static version is valid");
             return Err(StatusError::bad_request().brief("websocket version is not 13"));
         }
-        let Some(sec_ws_key) = req_headers.typed_get::<SecWebsocketKey>() else {
-            tracing::debug!("missing sec-websocket-key header");
+        use base64::Engine as _;
+        let mut keys = req_headers.get_all(SEC_WEBSOCKET_KEY).iter();
+        let Some(first_key) = keys.next() else {
             return Err(StatusError::bad_request().brief("missing sec-websocket-key header"));
         };
+        let key = first_key.to_str().ok()
+            .and_then(|key| base64::engine::general_purpose::STANDARD.decode(key.trim_matches([' ', '\t'])).ok())
+            .and_then(|key| <[u8; 16]>::try_from(key).ok());
+        let Some(key) = key.filter(|_| keys.next().is_none()) else {
+            return Err(StatusError::bad_request().brief("websocket requires one base64-encoded 16-byte key"));
+        };
+        let sec_ws_key = SecWebsocketKey::from(key);
 
         if let Some(check) = &self.origin_check {
             let origin = req_headers.get(ORIGIN).and_then(|v| v.to_str().ok());
@@ -424,6 +438,10 @@ impl WebSocketUpgrade {
                 tracing::debug!(?origin, "rejecting websocket upgrade: origin not allowed");
                 return Err(StatusError::forbidden().brief("websocket origin not allowed"));
             }
+        }
+
+        if req.extensions().get::<OnUpgrade>().is_none() {
+            return Err(StatusError::bad_request().brief("websocket upgrade state is missing"));
         }
 
         res.status_code(StatusCode::SWITCHING_PROTOCOLS);
@@ -461,11 +479,12 @@ impl WebSocketUpgrade {
             // Doing this only after `OnUpgrade` is taken prevents a handshake that passes the
             // header checks but never upgrades from permanently disarming protection on the
             // shared keep-alive connection. No-op when the server runs without fuse protection.
-            if let Some(conn_ctrl) = req.extensions().get::<ConnCtrl>() {
+            let conn_ctrl = req.extensions().get::<ConnCtrl>().cloned();
+            if let Some(conn_ctrl) = &conn_ctrl {
                 conn_ctrl.relax_timeouts();
             }
             let config = self.config;
-            tokio::spawn(async move {
+            let task = async move {
                 let socket = on_upgrade
                     .and_then(move |upgraded| {
                         tracing::debug!("websocket upgrade complete");
@@ -481,7 +500,12 @@ impl WebSocketUpgrade {
                         tracing::debug!(?error, "websocket connection upgrade failed");
                     }
                 }
-            });
+            };
+            if let Some(conn_ctrl) = conn_ctrl {
+                conn_ctrl.spawn_upgrade(task);
+            } else {
+                tokio::spawn(task);
+            }
             Ok(())
         } else {
             tracing::debug!("websocket cannot be upgraded because no upgrade state was present");
@@ -879,6 +903,49 @@ mod tests {
                 .unwrap()
                 .contains("origin not allowed")
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_requires_get_over_http() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct ServerTask(tokio::task::JoinHandle<()>);
+        impl Drop for ServerTask {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+
+        let acceptor = TcpListener::new("127.0.0.1:0").bind().await;
+        let addr = acceptor.holdings()[0].local_addr.clone().into_std().unwrap();
+        // A goal deliberately matches every method, as in the module example.
+        let _server = ServerTask(tokio::spawn(async move {
+            Server::new(acceptor).serve(Router::new().goal(connect)).await;
+        }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for method in ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "CUSTOM"] {
+                let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let request = format!(
+                    "{method} / HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: 6D69KGBOr4Re+Nj6zx9aQA==\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n"
+                );
+                socket.write_all(request.as_bytes()).await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(socket.read_u8().await.unwrap());
+                    assert!(head.len() < 16_384);
+                }
+                let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+                if method == "GET" {
+                    assert!(head.starts_with("http/1.1 101 "), "{head}");
+                    assert!(head.contains("\r\nsec-websocket-accept:"), "{head}");
+                } else {
+                    assert!(head.starts_with("http/1.1 400 "), "{method}: {head}");
+                    assert!(!head.contains("\r\nsec-websocket-accept:"), "{head}");
+                    assert!(!head.contains("\r\nupgrade:"), "{head}");
+                }
+            }
+        }).await.expect("WebSocket method validation timed out");
     }
 
     #[tokio::test]

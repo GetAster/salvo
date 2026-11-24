@@ -26,6 +26,19 @@ impl Filter for MethodFilter {
     fn info(&self) -> FilterInfo {
         FilterInfo::Method(self.0.clone())
     }
+
+    fn collect_methods(&self, methods: &mut Vec<Method>) {
+        methods.push(self.0.clone());
+    }
+
+    async fn filter_for_method(
+        &self,
+        _req: &mut Request,
+        _state: &mut PathState<'_>,
+        method: &Method,
+    ) -> Option<bool> {
+        Some(method == self.0)
+    }
 }
 impl Debug for MethodFilter {
     #[inline]
@@ -69,6 +82,15 @@ impl SchemeFilter {
 
 #[async_trait]
 impl Filter for SchemeFilter {
+    async fn filter_for_method(
+        &self,
+        req: &mut Request,
+        state: &mut PathState<'_>,
+        _method: &Method,
+    ) -> Option<bool> {
+        Some(self.filter(req, state).await)
+    }
+
     #[inline]
     async fn filter(&self, req: &mut Request, _state: &mut PathState<'_>) -> bool {
         req.uri()
@@ -142,6 +164,15 @@ fn split_host_port(authority: &str) -> (&str, Option<&str>) {
 
 #[async_trait]
 impl Filter for HostFilter {
+    async fn filter_for_method(
+        &self,
+        req: &mut Request,
+        state: &mut PathState<'_>,
+        _method: &Method,
+    ) -> Option<bool> {
+        Some(self.filter(req, state).await)
+    }
+
     #[inline]
     async fn filter(&self, req: &mut Request, _state: &mut PathState<'_>) -> bool {
         // On HTTP/1 without the `fix-http1-request-uri` feature, the URI has no authority,
@@ -154,7 +185,8 @@ impl Filter for HostFilter {
                 .get(crate::http::header::HOST)
                 .and_then(|h| h.to_str().ok())
         });
-        host.map(|h| split_host_port(h).0 == self.host)
+        // Host names are case-insensitive (RFC 9110 section 4.2.3).
+        host.map(|h| split_host_port(h).0.eq_ignore_ascii_case(&self.host))
             .unwrap_or(self.fallback)
     }
     #[inline]
@@ -205,6 +237,15 @@ impl PortFilter {
 
 #[async_trait]
 impl Filter for PortFilter {
+    async fn filter_for_method(
+        &self,
+        req: &mut Request,
+        state: &mut PathState<'_>,
+        _method: &Method,
+    ) -> Option<bool> {
+        Some(self.filter(req, state).await)
+    }
+
     #[inline]
     async fn filter(&self, req: &mut Request, _state: &mut PathState<'_>) -> bool {
         // On HTTP/1 without the `fix-http1-request-uri` feature, the URI has no authority,
@@ -278,6 +319,28 @@ mod tests {
                 .filter(&mut req, &mut state)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn host_filter_ignores_ascii_case() {
+        for (configured, requested, expected) in [
+            ("admin.example.com", "http://admin.example.com/", true),
+            ("admin.example.com", "http://Admin.Example.COM/", true),
+            ("Admin.Example.com", "http://admin.example.com:8080/", true),
+            ("admin.example.com", "http://admin.example.org/", false),
+            ("admin.example.com", "http://xadmin.example.com/", false),
+        ] {
+            let mut req = Request::new();
+            *req.uri_mut() = requested.parse().unwrap();
+            let mut state = PathState::from_owned_path(req.uri().path().to_owned());
+            assert_eq!(
+                HostFilter::new(configured)
+                    .filter(&mut req, &mut state)
+                    .await,
+                expected,
+                "{configured} {requested}"
+            );
+        }
     }
 
     #[tokio::test]

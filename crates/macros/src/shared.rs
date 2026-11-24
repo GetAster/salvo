@@ -14,26 +14,44 @@ pub(crate) enum InputType<'a> {
     NoReference(&'a PatType),
 }
 
-pub(crate) fn salvo_crate() -> syn::Ident {
+// These crates declare an `extern crate self as ...` alias too, so the same
+// absolute path works both inside the defining crate and in downstream tests.
+fn dependency_path(name: &str) -> syn::Path {
+    let ident = Ident::new(name, Span::call_site());
+    syn::parse_quote!(::#ident)
+}
+
+pub(crate) fn salvo_crate() -> syn::Path {
     match crate_name("salvo") {
         Ok(salvo) => match salvo {
-            FoundCrate::Itself => Ident::new("salvo", Span::call_site()),
-            FoundCrate::Name(name) => Ident::new(&name, Span::call_site()),
+            FoundCrate::Itself => dependency_path("salvo"),
+            FoundCrate::Name(name) => dependency_path(&name),
         },
         Err(_) => match crate_name("salvo_core") {
             Ok(salvo) => match salvo {
-                FoundCrate::Itself => Ident::new("salvo_core", Span::call_site()),
-                FoundCrate::Name(name) => Ident::new(&name, Span::call_site()),
+                FoundCrate::Itself => dependency_path("salvo_core"),
+                FoundCrate::Name(name) => dependency_path(&name),
             },
-            Err(_) => Ident::new("salvo", Span::call_site()),
+            Err(_) => dependency_path("salvo"),
         },
+    }
+}
+
+/// Remove syntactic groups introduced by parentheses or macro_rules type fragments.
+pub(crate) fn unwrapped_type(mut ty: &Type) -> &Type {
+    loop {
+        ty = match ty {
+            Type::Group(group) => &group.elem,
+            Type::Paren(paren) => &paren.elem,
+            _ => return ty,
+        };
     }
 }
 
 pub(crate) fn parse_input_type(input: &FnArg) -> InputType<'_> {
     if let FnArg::Typed(p) = input {
-        if let Type::Reference(ty) = &*p.ty {
-            if let syn::Type::Path(nty) = &*ty.elem {
+        if let Type::Reference(ty) = unwrapped_type(&p.ty) {
+            if let syn::Type::Path(nty) = unwrapped_type(&ty.elem) {
                 // the last ident for path type is the real type
                 // such as:
                 // `::std::vec::Vec` is `Vec`
@@ -172,4 +190,115 @@ mod tests {
         assert!(out.contains("'static"), "{out}");
         assert!(!out.contains("'a"), "{out}");
     }
+}
+
+/// Keep only configuration effects when guarding generated sibling items.
+/// Rust, rather than the proc-macro host, evaluates every predicate.
+pub(crate) fn cfg_attributes(attributes: &[syn::Attribute]) -> syn::Result<Vec<syn::Attribute>> {
+    fn filter(meta: &syn::Meta) -> syn::Result<Option<syn::Meta>> {
+        if meta.path().is_ident("cfg") {
+            return Ok(Some(meta.clone()));
+        }
+        if let syn::Meta::List(list) = meta
+            && list.path.is_ident("cfg_attr")
+        {
+            let (predicate, arguments) =
+                list.parse_args_with(|input: syn::parse::ParseStream| {
+                    let mut predicate = proc_macro2::TokenStream::new();
+                    while !input.is_empty() && !input.peek(syn::Token![,]) {
+                        predicate.extend([input.parse::<proc_macro2::TokenTree>()?]);
+                    }
+                    if predicate.is_empty() {
+                        return Err(input.error("cfg_attr requires a predicate"));
+                    }
+                    input.parse::<syn::Token![,]>()?;
+                    let arguments =
+                        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated(
+                            input,
+                        )?;
+                    Ok((predicate, arguments))
+                })?;
+            let conditional = arguments
+                .into_iter()
+                .map(|meta| filter(&meta))
+                .collect::<syn::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            return Ok((!conditional.is_empty())
+                .then(|| syn::parse_quote!(cfg_attr(#predicate, #(#conditional),*))));
+        }
+        Ok(None)
+    }
+    attributes
+        .iter()
+        .filter_map(|attribute| match filter(&attribute.meta) {
+            Ok(Some(meta)) => {
+                let mut attribute = attribute.clone();
+                attribute.meta = meta;
+                Some(Ok(attribute))
+            }
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cfg_attribute_tests {
+    use quote::quote;
+
+    #[test]
+    fn nested_cfg_attr_keeps_conditions_without_unrelated_attributes() {
+        let input = syn::parse_quote!(#[cfg_attr(feature = "outer", inline, cfg_attr(feature = "inner", cfg(any()), allow(dead_code)))]);
+        let actual = super::cfg_attributes(&[input]).unwrap();
+        let expected: syn::Attribute = syn::parse_quote!(#[cfg_attr(feature = "outer", cfg_attr(feature = "inner", cfg(any())))]);
+        assert_eq!(
+            quote!(#(#actual)*).to_string(),
+            quote!(#expected).to_string()
+        );
+        let unrelated = syn::parse_quote!(#[cfg_attr(feature = "outer", inline)]);
+        assert!(super::cfg_attributes(&[unrelated]).unwrap().is_empty());
+        let boolean = syn::parse_quote!(#[cfg_attr(true, cfg(false))]);
+        let actual = super::cfg_attributes(&[boolean]).unwrap();
+        assert_eq!(
+            quote!(#(#actual)*).to_string(),
+            quote!(#[cfg_attr(true, cfg(false))]).to_string()
+        );
+    }
+}
+
+/// Allocate local bindings outside every identifier supplied by the caller.
+/// Mixed-site spans protect lexical bindings; checking the input also avoids
+/// constants and unit constructors, which cannot be shadowed by a pattern.
+pub(crate) fn fresh_binding(
+    base: &str,
+    reserved: &mut ::std::collections::HashSet<String>,
+) -> Ident {
+    let mut name = base.to_owned();
+    let mut suffix = 0;
+    while !reserved.insert(name.clone()) {
+        suffix += 1;
+        name = format!("{base}_{suffix}");
+    }
+    Ident::new(&name, Span::mixed_site())
+}
+
+pub(crate) fn reserved_identifiers(
+    tokens: proc_macro2::TokenStream,
+) -> ::std::collections::HashSet<String> {
+    fn collect(tokens: proc_macro2::TokenStream, names: &mut ::std::collections::HashSet<String>) {
+        for token in tokens {
+            match token {
+                proc_macro2::TokenTree::Ident(ident) => {
+                    names.insert(ident.to_string().trim_start_matches("r#").to_owned());
+                }
+                proc_macro2::TokenTree::Group(group) => collect(group.stream(), names),
+                _ => {}
+            }
+        }
+    }
+    let mut names = ::std::collections::HashSet::new();
+    collect(tokens, &mut names);
+    names
 }

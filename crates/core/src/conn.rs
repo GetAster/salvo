@@ -63,10 +63,14 @@ use crate::fuse::{ArcFusePolicy, FuseConfig};
 use crate::http::Version;
 use crate::service::HyperHandler;
 
+mod admission;
 mod proto;
 pub use proto::HttpBuilder;
 mod ctrl;
 pub use ctrl::ConnCtrl;
+mod tls;
+mod upgrades;
+pub use tls::TlsInfo;
 mod stream;
 pub use stream::*;
 
@@ -196,6 +200,8 @@ where
     ///
     /// Created when the connection is accepted and shared with its stream, protocol driver,
     /// and handlers so any of them can abort, gracefully shut down, or relax the fuse timers.
+    /// Each physical connection must have its own control; unrelated accepted
+    /// connections must not reuse clones of one control.
     pub conn_ctrl: ConnCtrl,
     /// The local address this connection was accepted on.
     ///
@@ -290,6 +296,8 @@ where
 ///     println!("Listening on {}", holding);
 /// }
 /// ```
+/// Each physical connection returned by an acceptor must receive a distinct [`ConnCtrl`].
+/// Its clones are shared only within that connection, including after an upgrade.
 pub trait Acceptor: Send {
     /// The coupler type used for HTTP protocol handling.
     type Coupler: Coupler<Stream = Self::Stream> + Unpin + Send + 'static;
@@ -306,6 +314,10 @@ pub trait Acceptor: Send {
     ///
     /// This method waits for a new connection and returns an [`Accepted`] struct
     /// containing the connection stream and metadata.
+    /// Built-in acceptors retain the transport and any in-progress admission decision if
+    /// this future is cancelled. Resuming `accept` continues the original policy; changing
+    /// `fuse_policy` applies to subsequent connections. Dropping the acceptor releases its
+    /// pending transport and cancels that decision.
     ///
     /// # Parameters
     ///

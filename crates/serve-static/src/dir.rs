@@ -1,11 +1,13 @@
 //! Serve static directories with directory listing support
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::fs::Metadata;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use salvo_core::fs::{NamedFile, extension_content_encoding};
@@ -14,17 +16,15 @@ use salvo_core::http::header::ACCEPT_ENCODING;
 use salvo_core::http::{
     self, HeaderValue, Method, Request, Response, StatusCode, StatusError, append_vary_header, mime,
 };
-use salvo_core::routing::{
-    decode_url_path, encode_url_path, normalize_url_path, redirect_to_dir_url,
-};
+use salvo_core::routing::{decode_url_path, encode_url_path, redirect_to_dir_url};
 use salvo_core::writing::Text;
 use salvo_core::{Depot, FlowCtrl, IntoVecString, async_trait};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use time::OffsetDateTime;
 use time::macros::format_description;
 
-use super::join_path;
+use super::path_policy::{self, Resolution};
+use super::{StaticResource, StaticResourceAuthorizer, SymlinkPolicy};
 
 /// Supported compression algorithms for serving compressed file variants
 #[derive(Eq, PartialEq, Clone, Copy, Debug, Hash)]
@@ -46,7 +46,7 @@ impl FromStr for CompressionAlgo {
         match s {
             "br" | "brotli" => Ok(Self::Brotli),
             "deflate" => Ok(Self::Deflate),
-            "gzip" => Ok(Self::Gzip),
+            "gzip" | "x-gzip" => Ok(Self::Gzip),
             "zstd" => Ok(Self::Zstd),
             _ => Err(format!("unknown compression algorithm: {s}")),
         }
@@ -130,6 +130,8 @@ where
 /// This handler can serve files from one or more directory paths,
 /// with support for directory listing, compressed file variants,
 /// and default files.
+/// Roots are searched in configured order for both ordinary and default files.
+/// The first matching resource wins; later roots are not resolved after a hit.
 ///
 /// # Examples
 ///
@@ -149,6 +151,13 @@ where
 /// `HEAD` requests are supported when the route is configured to match them. This lets clients
 /// and caches check file metadata such as `Content-Length`, `ETag`, and `Last-Modified` without
 /// downloading the response body.
+///
+/// **Filesystem trust boundary**: canonical-path checks reject stable symbolic links and
+/// junctions that escape a configured root. They do not make path resolution and file
+/// opening atomic. Untrusted actors must not be able to replace ancestor directories,
+/// create or swap symlinks/junctions, or rename served paths while requests resolve them.
+/// Store uploads in a separate area with restricted filesystem permissions; allowing file
+/// contents to be uploaded alone does not imply permission to mutate directory topology.
 ///
 /// **Security note**: a `HEAD` request still follows the same file lookup and metadata path as
 /// `GET`. A client can send a very small request that makes the server touch the filesystem.
@@ -181,9 +190,23 @@ pub struct StaticDir {
     pub preload_threshold: Option<u64>,
     /// Whether to include dot files (files/directories starting with .)
     pub include_dot_files: bool,
+    /// Require each requested path component to use its actual filesystem spelling.
+    /// Enabled by default, including on case-insensitive filesystems.
+    pub strict_path_check: bool,
+    /// Policy for symbolic links and junctions beneath a configured root.
+    /// Defaults to [`SymlinkPolicy::Deny`].
+    pub symlink_policy: SymlinkPolicy,
+    authorizer: Option<Arc<dyn StaticResourceAuthorizer>>,
     exclude_filters: Vec<Box<dyn Fn(&str) -> bool + Send + Sync>>,
     /// Whether to automatically list directories when default file isn't found
     pub auto_list: bool,
+    /// Maximum directory entries examined for a listing, including hidden/excluded
+    /// entries and internal enumeration needed to verify link targets.
+    /// Defaults to 10,000. Exceeding it returns 503 without a partial listing.
+    pub listing_max_entries: usize,
+    /// Maximum encoded listing body size in bytes. Defaults to 2 MiB.
+    /// Exceeding it returns 503 without a partial listing, for every supported format.
+    pub listing_max_bytes: usize,
     /// Map of compression algorithms to file extensions for compressed variants
     pub compressed_variations: HashMap<CompressionAlgo, Vec<String>>,
     /// Default file names to look for in directories (e.g., "index.html")
@@ -202,7 +225,12 @@ impl Debug for StaticDir {
             .field("chunk_size", &self.chunk_size)
             .field("preload_threshold", &self.preload_threshold)
             .field("include_dot_files", &self.include_dot_files)
+            .field("strict_path_check", &self.strict_path_check)
+            .field("symlink_policy", &self.symlink_policy)
+            .field("has_authorizer", &self.authorizer.is_some())
             .field("auto_list", &self.auto_list)
+            .field("listing_max_entries", &self.listing_max_entries)
+            .field("listing_max_bytes", &self.listing_max_bytes)
             .field("compressed_variations", &self.compressed_variations)
             .field("defaults", &self.defaults)
             .field("fallback", &self.fallback)
@@ -226,8 +254,13 @@ impl StaticDir {
             chunk_size: None,
             preload_threshold: None,
             include_dot_files: false,
+            strict_path_check: true,
+            symlink_policy: SymlinkPolicy::Deny,
+            authorizer: None,
             exclude_filters: vec![],
             auto_list: false,
+            listing_max_entries: 10_000,
+            listing_max_bytes: 2 * 1024 * 1024,
             compressed_variations,
             defaults: vec![],
             fallback: None,
@@ -272,6 +305,44 @@ impl StaticDir {
         self
     }
 
+    /// Authorize the resolved resource before sending content, metadata, redirects,
+    /// or directory listings. Returning `false` produces a terminal 404; fallback
+    /// files and later roots are not tried after a denial.
+    ///
+    /// Policies also inspect default files, fallback files, compressed sidecars,
+    /// and individual directory-listing entries. A synchronous closure can be used
+    /// directly; implement [`StaticResourceAuthorizer`] for asynchronous checks.
+    #[inline]
+    #[must_use]
+    pub fn authorize<A: StaticResourceAuthorizer + 'static>(mut self, authorizer: A) -> Self {
+        self.authorizer = Some(Arc::new(authorizer));
+        self
+    }
+
+    /// Require exact filesystem component spelling, including case and long names.
+    ///
+    /// Enabled by default. A spelling mismatch returns a terminal 404. Disabling
+    /// this permits operating-system filename aliases; use resource authorization
+    /// whenever the configured root contains non-public files.
+    #[inline]
+    #[must_use]
+    pub fn strict_path_check(mut self, enabled: bool) -> Self {
+        self.strict_path_check = enabled;
+        self
+    }
+
+    /// Choose whether links beneath a configured root may be followed.
+    ///
+    /// The default rejects them. [`SymlinkPolicy::WithinRoot`] permits explicit
+    /// links whose resolved targets remain inside that root. A configured root
+    /// itself is an explicit mount and may be a link.
+    #[inline]
+    #[must_use]
+    pub fn symlink_policy(mut self, policy: SymlinkPolicy) -> Self {
+        self.symlink_policy = policy;
+        self
+    }
+
     /// Exclude files.
     ///
     /// The filter function returns true to exclude the file.
@@ -282,6 +353,22 @@ impl StaticDir {
         F: Fn(&str) -> bool + Send + Sync + 'static,
     {
         self.exclude_filters.push(Box::new(filter));
+        self
+    }
+
+    /// Sets the work and output budgets for automatic directory listings.
+    ///
+    /// At most `max_entries + 1` entries are fetched (the extra detects overflow),
+    /// before metadata lookup or sorting beyond the budget. All entries count, including
+    /// hidden and excluded names, and internal directory entries read to verify
+    /// link targets. The encoded response is buffered up to `max_bytes`.
+    /// A budget overflow returns `503 Service Unavailable`, never a truncated `200`.
+    /// Zero permits only an empty directory / empty output, respectively.
+    #[inline]
+    #[must_use]
+    pub fn listing_limits(mut self, max_entries: usize, max_bytes: usize) -> Self {
+        self.listing_max_entries = max_entries;
+        self.listing_max_bytes = max_bytes;
         self
     }
 
@@ -340,8 +427,8 @@ impl StaticDir {
 
     /// Sets the small-file preload threshold.
     ///
-    /// Files whose size is less than or equal to this threshold are read during `NamedFile`
-    /// construction and sent from memory. Larger files are streamed in chunks. Set this to `0` to
+    /// Full responses at or below this threshold are read after conditional and range
+    /// checks and sent from memory. Larger files are streamed in chunks. Set this to `0` to
     /// disable preloading for non-empty files.
     #[inline]
     #[must_use]
@@ -368,8 +455,11 @@ struct CanonicalRoot {
 
 struct ResolvedPath {
     path: PathBuf,
+    logical_path: PathBuf,
+    configured_root: PathBuf,
     canonical_root: PathBuf,
     metadata: Metadata,
+    file: Option<std::fs::File>,
 }
 
 impl StaticDir {
@@ -392,43 +482,135 @@ impl StaticDir {
         root: &CanonicalRoot,
         path: PathBuf,
         apply_exclude_filters: bool,
-    ) -> Option<ResolvedPath> {
+    ) -> Result<Option<ResolvedPath>, ()> {
         if apply_exclude_filters {
             let raw_path = path_slash::PathBufExt::to_slash_lossy(&path);
             if self.exclude_filters.iter().any(|filter| filter(&raw_path)) {
-                return None;
+                return Ok(None);
             }
         }
 
-        let metadata = tokio::fs::symlink_metadata(&path).await.ok()?;
-        let canonical_path = tokio::fs::canonicalize(&path).await.ok()?;
-        if !canonical_path.starts_with(&root.canonical_path) {
-            return None;
-        }
-        Some(ResolvedPath {
+        let Ok(requested_relative) = path.strip_prefix(&root.path) else {
+            return Err(());
+        };
+        let (canonical_path, metadata) = match path_policy::resolve(
+            &root.canonical_path,
+            requested_relative,
+            self.strict_path_check,
+            self.symlink_policy,
+        )
+        .await
+        {
+            Resolution::Found { path, metadata } => (path, metadata),
+            Resolution::Missing => return Ok(None),
+            Resolution::Rejected => return Err(()),
+        };
+        self.filter_resolved_path(
+            &root.path,
+            &root.canonical_path,
             path,
-            canonical_root: root.canonical_path.clone(),
+            canonical_path,
             metadata,
-        })
+            apply_exclude_filters,
+        )
+    }
+
+    fn filter_resolved_path(
+        &self,
+        configured_root: &Path,
+        root: &Path,
+        logical_path: PathBuf,
+        canonical_path: PathBuf,
+        metadata: Metadata,
+        apply_exclude_filters: bool,
+    ) -> Result<Option<ResolvedPath>, ()> {
+        let relative_path = canonical_path.strip_prefix(root).map_err(|_| ())?;
+        if apply_exclude_filters {
+            let resolved = path_slash::PathBufExt::to_slash_lossy(&canonical_path);
+            if self.exclude_filters.iter().any(|filter| filter(&resolved)) {
+                return Ok(None);
+            }
+        }
+        // Windows 8.3 aliases can resolve to dot files even when the requested
+        // path has no dot segments. Check the resolved path below the root too;
+        // the configured root itself may legitimately have a dot-prefixed name.
+        if !self.include_dot_files
+            && relative_path
+                .components()
+                .any(|component| component.as_os_str().as_encoded_bytes().starts_with(b"."))
+        {
+            return Ok(None);
+        }
+        Ok(Some(ResolvedPath {
+            path: canonical_path,
+            logical_path,
+            configured_root: configured_root.to_owned(),
+            canonical_root: root.to_owned(),
+            metadata,
+            file: None,
+        }))
     }
 
     async fn resolve_relative_path(
         &self,
         root: &CanonicalRoot,
         rel_path: impl AsRef<Path>,
-    ) -> Option<ResolvedPath> {
+    ) -> Result<Option<ResolvedPath>, ()> {
         self.resolve_root_path(root, root.path.join(rel_path), true)
             .await
     }
 
-    async fn resolve_child_path(&self, root: &Path, path: PathBuf) -> Option<ResolvedPath> {
+    async fn resolve_child_path(
+        &self,
+        configured_root: &Path,
+        root: &Path,
+        path: PathBuf,
+    ) -> Result<Option<ResolvedPath>, ()> {
         let synthetic_root = CanonicalRoot {
-            path: root.to_owned(),
+            path: configured_root.to_owned(),
             canonical_path: root.to_owned(),
         };
         // Apply exclude filters here too: default files (e.g. `index.html`) and
         // compressed variants (e.g. `.gz`) must not bypass `exclude_filters`.
         self.resolve_root_path(&synthetic_root, path, true).await
+    }
+
+    async fn authorize_path(&self, req: &Request, depot: &Depot, path: &mut ResolvedPath) -> bool {
+        if !path.metadata.is_file() && !path.metadata.is_dir() {
+            return false;
+        }
+        // Retain the selected handle across asynchronous policy checks and response
+        // construction. NamedFile must not reopen a pathname after authorization.
+        if path.metadata.is_file() {
+            let Ok(file) = tokio::fs::File::open(&path.path).await else {
+                return false;
+            };
+            let Ok(metadata) = file.metadata().await else {
+                return false;
+            };
+            if !metadata.is_file() {
+                return false;
+            }
+            path.metadata = metadata;
+            path.file = Some(file.into_std().await);
+        }
+        self.authorize_resource(req, depot, path).await
+    }
+
+    async fn authorize_resource(&self, req: &Request, depot: &Depot, path: &ResolvedPath) -> bool {
+        if !path.metadata.is_file() && !path.metadata.is_dir() {
+            return false;
+        }
+        if let Some(authorizer) = &self.authorizer {
+            let resource = StaticResource::new(
+                path.canonical_root.clone(),
+                path.path.clone(),
+                path.metadata.clone(),
+            );
+            authorizer.authorize(req, depot, &resource).await
+        } else {
+            true
+        }
     }
 }
 #[derive(Serialize, Deserialize, Debug)]
@@ -486,29 +668,41 @@ impl Handler for StaticDir {
     async fn handle(
         &self,
         req: &mut Request,
-        _depot: &mut Depot,
+        depot: &mut Depot,
         res: &mut Response,
         _ctrl: &mut FlowCtrl,
     ) {
         let req_path = req.uri().path();
-        let decoded_path;
-        let rel_path = if let Some(rest) = req.params().tail() {
-            rest
-        } else {
-            decoded_path = decode_url_path(req_path);
-            decoded_path.as_ref()
+        let Some(rel_path) = crate::resource_path(req, path_policy::valid_fs_component) else {
+            res.render(StatusError::bad_request().brief("invalid static resource path"));
+            return;
         };
-        let rel_path = normalize_url_path(rel_path);
         let mut files: HashMap<String, Metadata> = HashMap::new();
         let mut dirs: HashMap<String, Metadata> = HashMap::new();
         let has_dot_segment = rel_path.split('/').any(|part| part.starts_with('.'));
         let mut abs_path = None;
-        let roots = self.canonical_roots().await;
+        let mut roots = Vec::new();
         if self.include_dot_files || !has_dot_segment {
-            for root in &roots {
-                // Use a single async symlink_metadata call for file type checks, then verify
-                // the canonical target stays under the canonical root before serving it.
-                if let Some(path) = self.resolve_relative_path(root, &rel_path).await {
+            for configured in &self.roots {
+                let Ok(canonical_path) = tokio::fs::canonicalize(configured).await else {
+                    continue;
+                };
+                roots.push(CanonicalRoot {
+                    path: configured.clone(),
+                    canonical_path,
+                });
+                let root = roots.last().expect("root was inserted");
+                // Check each component before following links or handing the
+                // resolved resource to the authorization policy.
+                let Ok(candidate) = self.resolve_relative_path(root, &rel_path).await else {
+                    res.render(StatusError::not_found());
+                    return;
+                };
+                if let Some(mut path) = candidate {
+                    if !self.authorize_path(req, depot, &mut path).await {
+                        res.render(StatusError::not_found());
+                        return;
+                    }
                     if path.metadata.is_dir() {
                         if !req_path.ends_with('/') && !req_path.is_empty() {
                             redirect_to_dir_url(req.uri(), res);
@@ -516,14 +710,26 @@ impl Handler for StaticDir {
                         }
 
                         for default_file in &self.defaults {
-                            let default_path = path.path.join(default_file);
-                            let Some(default_path) = self
-                                .resolve_child_path(&path.canonical_root, default_path)
+                            let default_path = path.logical_path.join(default_file);
+                            let Ok(candidate) = self
+                                .resolve_child_path(
+                                    &path.configured_root,
+                                    &path.canonical_root,
+                                    default_path,
+                                )
                                 .await
                             else {
+                                res.render(StatusError::not_found());
+                                return;
+                            };
+                            let Some(mut default_path) = candidate else {
                                 continue;
                             };
                             if default_path.metadata.is_file() {
+                                if !self.authorize_path(req, depot, &mut default_path).await {
+                                    res.render(StatusError::not_found());
+                                    return;
+                                }
                                 abs_path = Some(default_path);
                                 break;
                             }
@@ -537,16 +743,28 @@ impl Handler for StaticDir {
                         }
                     } else if path.metadata.is_file() {
                         abs_path = Some(path);
+                        break;
                     }
                 }
             }
         }
         let fallback = self.fallback.as_deref().unwrap_or_default();
         if abs_path.is_none() && !fallback.is_empty() && is_safe_relative_path(fallback) {
+            if roots.is_empty() && !self.include_dot_files && has_dot_segment {
+                roots = self.canonical_roots().await;
+            }
             for root in &roots {
-                if let Some(path) = self.resolve_relative_path(root, fallback).await {
+                let Ok(candidate) = self.resolve_relative_path(root, fallback).await else {
+                    res.render(StatusError::not_found());
+                    return;
+                };
+                if let Some(mut path) = candidate {
                     if !path.metadata.is_file() {
                         continue;
+                    }
+                    if !self.authorize_path(req, depot, &mut path).await {
+                        res.render(StatusError::not_found());
+                        return;
                     }
                     abs_path = Some(path);
                     break;
@@ -561,10 +779,13 @@ impl Handler for StaticDir {
 
         let is_file = abs_path.metadata.is_file();
         let canonical_root = abs_path.canonical_root;
+        let configured_root = abs_path.configured_root;
+        let mut opened_file = abs_path.file;
+        let logical_path = abs_path.logical_path;
         let abs_path = abs_path.path;
 
         if is_file {
-            let ext = abs_path
+            let ext = logical_path
                 .extension()
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_lowercase());
@@ -576,72 +797,148 @@ impl Handler for StaticDir {
             // one would stack a second coding on top, and only the outer coding can
             // be reported, so the client would strip that and be left holding gzip
             // bytes labelled `image/svg+xml`. Serve the file itself instead.
-            let is_self_coded_ext = ext
-                .as_deref()
-                .map(|ext| extension_content_encoding(ext).is_some())
-                .unwrap_or(false);
+            let stored_encoding = ext.as_deref().and_then(extension_content_encoding);
+            let is_self_coded_ext = stored_encoding.is_some();
             let mut content_encoding = None;
-            let mut varies_on_accept_encoding = false;
-            let content_type = mime_infer::from_path(&abs_path).first();
+            // The selected representation or a 406 can depend on Accept-Encoding,
+            // including files whose extension implies a stored content coding.
+            let mut varies_on_accept_encoding = true;
+            let content_type = mime_infer::from_path(&logical_path).first();
             // Captured before the compressed-variant lookup may replace the path:
             // a download must be named after the resource that was requested, not
             // after the sidecar the bytes happen to be read from.
-            let requested_name = abs_path
+            let requested_name = logical_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned());
 
+            // Accept-Encoding has list semantics across field lines.
+            // Borrow the common single-field value and only allocate
+            // when there are more preferences to combine.
+            let mut header = Cow::Borrowed("");
+            for value in req
+                .headers()
+                .get_all(ACCEPT_ENCODING)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+            {
+                if header.is_empty() {
+                    header = Cow::Borrowed(value);
+                } else {
+                    let combined = header.to_mut();
+                    combined.push(',');
+                    combined.push_str(value);
+                }
+            }
+            let preferences = http::parse_accept_encoding_with_quality(&header);
+            let quality = |name: &str| {
+                preferences
+                    .iter()
+                    .filter(|(coding, _)| coding == name || name == "gzip" && coding == "x-gzip")
+                    .map(|(_, q)| *q)
+                    .max()
+            };
+            let identity = quality("identity").map_or(quality("*") != Some(0), |q| q > 0);
+            if let Some(coding) = stored_encoding {
+                // An absent field accepts every coding; an empty field accepts none.
+                // Self-coded formats cannot fall back to identity bytes or stack a
+                // sidecar on the stored coding, so reject an unacceptable coding.
+                let acceptable = !req.headers().contains_key(ACCEPT_ENCODING)
+                    || quality(coding)
+                        .or_else(|| quality("*"))
+                        .is_some_and(|q| q > 0);
+                if !acceptable {
+                    res.render(StatusError::not_acceptable());
+                    append_vary_header(res.headers_mut(), "accept-encoding");
+                    return;
+                }
+            }
             let named_path = if !is_compressed_ext && !is_self_coded_ext {
                 if !self.compressed_variations.is_empty() {
+                    // Even an identity response participates in negotiation.
+                    // Its Vary policy must not depend on this request's header.
+                    varies_on_accept_encoding = true;
                     let mut new_abs_path = None;
-                    let header = req
-                        .headers()
-                        .get(ACCEPT_ENCODING)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default();
-                    // Skip compressed variant lookup when client only accepts identity
                     if !header.is_empty() && header != "identity" {
-                        varies_on_accept_encoding = true;
-                        'accepted_encoding: for (algo, level) in http::parse_accept_encoding(header)
-                        {
-                            if level == 0 {
+                        'accepted_encoding: for (name, level) in &preferences {
+                            if *level == 0 {
                                 continue;
                             }
-                            if algo.eq_ignore_ascii_case("identity") {
+                            if name == "identity" {
                                 break;
                             }
-                            let Ok(algo) = algo.parse::<CompressionAlgo>() else {
-                                continue;
+                            let candidates: Vec<_> = if name == "*" {
+                                [
+                                    CompressionAlgo::Brotli,
+                                    CompressionAlgo::Zstd,
+                                    CompressionAlgo::Gzip,
+                                    CompressionAlgo::Deflate,
+                                ]
+                                .into_iter()
+                                .filter(|algo| {
+                                    !preferences.iter().any(|(name, _)| {
+                                        name.parse::<CompressionAlgo>().ok().as_ref() == Some(algo)
+                                    })
+                                })
+                                .collect()
+                            } else {
+                                name.parse::<CompressionAlgo>().ok().into_iter().collect()
                             };
-                            let Some(exts) = self.compressed_variations.get(&algo) else {
-                                continue;
-                            };
-                            for zip_ext in exts {
-                                let mut path = abs_path.clone();
-                                path.as_mut_os_string().push(".");
-                                path.as_mut_os_string().push(zip_ext.as_str());
-                                if self
-                                    .resolve_child_path(&canonical_root, path.clone())
-                                    .await
-                                    .map(|path| path.metadata.is_file())
-                                    .unwrap_or(false)
-                                {
-                                    new_abs_path = Some(path);
-                                    content_encoding = Some(algo.to_string());
-                                    break 'accepted_encoding;
+                            for algo in candidates {
+                                let Some(exts) = self.compressed_variations.get(&algo) else {
+                                    continue;
+                                };
+                                for zip_ext in exts {
+                                    let mut path = logical_path.clone();
+                                    path.as_mut_os_string().push(".");
+                                    path.as_mut_os_string().push(zip_ext.as_str());
+                                    let Ok(candidate) = self
+                                        .resolve_child_path(&configured_root, &canonical_root, path)
+                                        .await
+                                    else {
+                                        res.render(StatusError::not_found());
+                                        return;
+                                    };
+                                    if let Some(mut sidecar) = candidate
+                                        && sidecar.metadata.is_file()
+                                    {
+                                        if !self.authorize_path(req, depot, &mut sidecar).await {
+                                            res.render(StatusError::not_found());
+                                            return;
+                                        }
+                                        opened_file = sidecar.file;
+                                        new_abs_path = Some(sidecar.logical_path);
+                                        content_encoding = Some(algo.to_string());
+                                        break 'accepted_encoding;
+                                    }
                                 }
                             }
                         }
                     }
-                    new_abs_path.unwrap_or(abs_path)
+                    if new_abs_path.is_none() && !identity {
+                        res.render(StatusError::not_acceptable());
+                        append_vary_header(res.headers_mut(), "accept-encoding");
+                        return;
+                    }
+                    new_abs_path.unwrap_or(logical_path)
                 } else {
-                    abs_path
+                    logical_path
                 }
             } else {
-                abs_path
+                logical_path
             };
 
+            if content_encoding.is_none() && !is_self_coded_ext && !identity {
+                res.render(StatusError::not_acceptable());
+                append_vary_header(res.headers_mut(), "accept-encoding");
+                return;
+            }
+
             let (builder, varies_on_accept_encoding) = {
-                let mut builder = NamedFile::builder(named_path);
+                let Some(file) = opened_file else {
+                    res.render(StatusError::not_found());
+                    return;
+                };
+                let mut builder = NamedFile::builder(named_path).file(file);
                 if let Some(content_encoding) = content_encoding {
                     builder = builder.content_encoding(content_encoding);
                 }
@@ -667,12 +964,9 @@ impl Handler for StaticDir {
                 (builder, varies_on_accept_encoding)
             };
             if let Ok(named_file) = builder.build().await {
-                let headers = req.headers();
-                if req.method() == Method::HEAD {
-                    named_file.send_head(headers, res).await;
-                } else {
-                    named_file.send(headers, res).await;
-                }
+                named_file
+                    .send_with_method(req.method(), req.headers(), res)
+                    .await;
                 if varies_on_accept_encoding {
                     append_vary_header(res.headers_mut(), "accept-encoding");
                 }
@@ -682,19 +976,57 @@ impl Handler for StaticDir {
         } else if !is_file {
             // list the dir
             if let Ok(mut entries) = tokio::fs::read_dir(&abs_path).await {
+                let mut budget = path_policy::EntryBudget::new(self.listing_max_entries);
                 while let Ok(Some(entry)) = entries.next_entry().await {
+                    if !budget.visit() {
+                        res.render(
+                            StatusError::service_unavailable()
+                                .brief("Directory listing entry limit exceeded"),
+                        );
+                        return;
+                    }
                     let file_name = entry.file_name().to_string_lossy().into_owned();
                     if self.include_dot_files || !file_name.starts_with('.') {
-                        let raw_path = join_path!(&abs_path, &file_name);
+                        let logical_entry_path = logical_path.join(entry.file_name());
+                        let raw_path = path_slash::PathBufExt::to_slash_lossy(&logical_entry_path);
                         if self.exclude_filters.iter().any(|filter| filter(&raw_path)) {
                             continue;
                         }
-                        if let Ok(metadata) = entry.metadata().await {
-                            if metadata.is_dir() {
-                                dirs.entry(file_name).or_insert(metadata);
-                            } else {
-                                files.entry(file_name).or_insert(metadata);
-                            }
+                        let resolved = path_policy::resolve_entry(
+                            &canonical_root,
+                            &entry,
+                            self.strict_path_check,
+                            self.symlink_policy,
+                            &mut budget,
+                        )
+                        .await;
+                        if budget.exceeded() {
+                            res.render(
+                                StatusError::service_unavailable()
+                                    .brief("Directory listing entry limit exceeded"),
+                            );
+                            return;
+                        }
+                        let Resolution::Found { path, metadata } = resolved else {
+                            continue;
+                        };
+                        let Ok(Some(path)) = self.filter_resolved_path(
+                            &configured_root,
+                            &canonical_root,
+                            logical_entry_path,
+                            path,
+                            metadata,
+                            true,
+                        ) else {
+                            continue;
+                        };
+                        if !self.authorize_resource(req, depot, &path).await {
+                            continue;
+                        }
+                        if path.metadata.is_dir() {
+                            dirs.entry(file_name).or_insert(path.metadata);
+                        } else if path.metadata.is_file() {
+                            files.entry(file_name).or_insert(path.metadata);
                         }
                     }
                 }
@@ -712,28 +1044,99 @@ impl Handler for StaticDir {
                 .collect();
             dirs.sort_by(|a, b| a.name.cmp(&b.name));
             let root = CurrentInfo::new(decode_url_path(req_path).into_owned(), files, dirs);
-            res.status_code(StatusCode::OK);
-            match format.subtype().as_ref() {
-                "plain" => res.render(Text::Plain(list_text(&root))),
-                "json" => res.render(Text::Json(list_json(&root))),
-                "xml" => res.render(Text::Xml(list_xml(&root))),
-                _ => res.render(Text::Html(list_html(&root))),
+            let limit = self.listing_max_bytes;
+            let listing = match format.subtype().as_ref() {
+                "plain" => list_text(&root, limit).map(Text::Plain),
+                "json" => list_json(&root, limit).map(Text::Json),
+                "xml" => list_xml(&root, limit).map(Text::Xml),
+                _ => list_html(&root, limit).map(Text::Html),
             };
+            if let Some(listing) = listing {
+                res.status_code(StatusCode::OK);
+                res.render(listing);
+            } else {
+                res.render(
+                    StatusError::service_unavailable()
+                        .brief("Directory listing byte limit exceeded"),
+                );
+            }
         }
     }
 }
 
-#[inline]
-fn list_json(current: &CurrentInfo) -> String {
-    json!(current).to_string()
+// Formatting and JSON serialization share a bounded sink, so escaping cannot grow
+// an intermediate response beyond the configured output budget.
+struct ListingOutput {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
 }
-fn list_xml(current: &CurrentInfo) -> String {
-    let mut xml = "<list>".to_owned();
+impl ListingOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        if self.exceeded || bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            false
+        } else {
+            self.bytes.extend_from_slice(bytes);
+            true
+        }
+    }
+    fn push_str(&mut self, text: &str) {
+        self.append(text.as_bytes());
+    }
+    fn finish(self) -> Option<String> {
+        if self.exceeded {
+            None
+        } else {
+            String::from_utf8(self.bytes).ok()
+        }
+    }
+}
+impl fmt::Write for ListingOutput {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if self.append(text.as_bytes()) {
+            Ok(())
+        } else {
+            Err(fmt::Error)
+        }
+    }
+}
+impl std::io::Write for ListingOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.append(bytes) {
+            Ok(bytes.len())
+        } else {
+            Err(std::io::Error::other("listing output limit exceeded"))
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn list_json(current: &CurrentInfo, limit: usize) -> Option<String> {
+    let mut out = ListingOutput::new(limit);
+    serde_json::to_writer(&mut out, current).ok()?;
+    out.finish()
+}
+fn list_xml(current: &CurrentInfo, limit: usize) -> Option<String> {
+    let mut xml = ListingOutput::new(limit);
+    xml.push_str("<list>");
     if current.dirs.is_empty() && current.files.is_empty() {
         xml.push_str("No files");
     } else {
         let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
         for dir in &current.dirs {
+            if xml.exceeded {
+                return None;
+            }
             let _ = write!(
                 xml,
                 "<dir><name>{}</name><modified>{}</modified><link>{}</link></dir>",
@@ -743,6 +1146,9 @@ fn list_xml(current: &CurrentInfo) -> String {
             );
         }
         for file in &current.files {
+            if xml.exceeded {
+                return None;
+            }
             let _ = write!(
                 xml,
                 "<file><name>{}</name><modified>{}</modified><size>{}</size><link>{}</link></file>",
@@ -754,7 +1160,7 @@ fn list_xml(current: &CurrentInfo) -> String {
         }
     }
     xml.push_str("</list>");
-    xml
+    xml.finish()
 }
 
 fn is_safe_relative_path(path: &str) -> bool {
@@ -800,8 +1206,8 @@ fn human_size(bytes: u64) -> String {
     }
     format!("{} {}", bytes, units[index])
 }
-fn list_html(current: &CurrentInfo) -> String {
-    fn header_link(out: &mut String, path: &str) {
+fn list_html(current: &CurrentInfo, limit: usize) -> Option<String> {
+    fn header_link(out: &mut ListingOutput, path: &str) {
         let _ = write!(out, r#"<a href="/">{HOME_ICON}</a>"#);
         let mut link = String::new();
         for seg in path
@@ -817,7 +1223,9 @@ fn list_html(current: &CurrentInfo) -> String {
             let _ = write!(out, r#"/<a href="{link}">{}</a>"#, xml_escape(seg));
         }
     }
-    let mut html = format!(
+    let mut html = ListingOutput::new(limit);
+    let _ = write!(
+        html,
         r#"<!DOCTYPE html><html><head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width">
@@ -841,6 +1249,9 @@ fn list_html(current: &CurrentInfo) -> String {
         );
         let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
         for dir in &current.dirs {
+            if html.exceeded {
+                return None;
+            }
             let _ = write!(
                 html,
                 r#"<tr><td>{}</td><td><a href="./{}/">{}</a></td><td>{}</td><td></td></tr>"#,
@@ -851,6 +1262,9 @@ fn list_html(current: &CurrentInfo) -> String {
             );
         }
         for file in &current.files {
+            if html.exceeded {
+                return None;
+            }
             let _ = write!(
                 html,
                 r#"<tr><td>{}</td><td><a href="./{}">{}</a></td><td>{}</td><td>{}</td></tr>"#,
@@ -867,13 +1281,17 @@ fn list_html(current: &CurrentInfo) -> String {
         html,
         r#"<hr/><footer><a href="https://salvo.rs" target="_blank">salvo</a></footer></body>"#
     );
-    html
+    html.finish()
 }
-fn list_text(current: &CurrentInfo) -> String {
+fn list_text(current: &CurrentInfo, limit: usize) -> Option<String> {
     use std::fmt::Write;
     let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-    let mut txt = format!("Directory: {}\n\n", current.path);
+    let mut txt = ListingOutput::new(limit);
+    let _ = write!(txt, "Directory: {}\n\n", current.path);
     for dir in &current.dirs {
+        if txt.exceeded {
+            return None;
+        }
         let _ = writeln!(
             txt,
             "[DIR]  {}  {}",
@@ -882,6 +1300,9 @@ fn list_text(current: &CurrentInfo) -> String {
         );
     }
     for file in &current.files {
+        if txt.exceeded {
+            return None;
+        }
         let _ = writeln!(
             txt,
             "{:>10}  {}  {}",
@@ -890,7 +1311,7 @@ fn list_text(current: &CurrentInfo) -> String {
             file.name,
         );
     }
-    txt
+    txt.finish()
 }
 
 const HTML_STYLE: &str = r#"
@@ -936,6 +1357,103 @@ mod tests {
         CurrentInfo, DirInfo, FileInfo, human_size, is_safe_relative_path, list_html, xml_escape,
     };
 
+    #[tokio::test]
+    async fn listing_budgets_apply_to_every_format_and_hidden_entries() {
+        use salvo_core::http::StatusCode;
+        use salvo_core::test::{ResponseExt, TestClient};
+        use salvo_core::{Router, Service};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("visible"), b"x").unwrap();
+        std::fs::write(root.path().join(".hidden"), b"x").unwrap();
+        for accept in [
+            "text/plain",
+            "application/json",
+            "application/xml",
+            "text/html",
+        ] {
+            for (entries, bytes, expected) in [
+                (1, 100_000, StatusCode::SERVICE_UNAVAILABLE),
+                (2, 1, StatusCode::SERVICE_UNAVAILABLE),
+                (2, 100_000, StatusCode::OK),
+            ] {
+                let handler = super::StaticDir::new(root.path().to_path_buf())
+                    .auto_list(true)
+                    .listing_limits(entries, bytes);
+                let service = Service::new(Router::with_path("{**path}").goal(handler));
+                let mut res = TestClient::get("http://localhost/")
+                    .add_header("accept", accept, true)
+                    .send(&service)
+                    .await;
+                assert_eq!(
+                    res.status_code,
+                    Some(expected),
+                    "{accept}, {entries}, {bytes}"
+                );
+                let body = res.take_string().await.unwrap();
+                if expected == StatusCode::OK {
+                    assert!(body.contains("visible"));
+                    assert!(!body.contains(".hidden"));
+                    if accept == "application/json" {
+                        serde_json::from_str::<serde_json::Value>(&body).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn listing_output_limit_counts_encoded_bytes_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let metadata = std::fs::metadata(root.path()).unwrap();
+        let info = CurrentInfo::new(
+            "雪&<".into(),
+            vec![FileInfo::new("a&雪".into(), &metadata)],
+            vec![],
+        );
+        for render in [
+            super::list_text,
+            super::list_json,
+            super::list_xml,
+            super::list_html,
+        ] {
+            let full = render(&info, usize::MAX).unwrap();
+            assert_eq!(render(&info, full.len()).unwrap(), full);
+            assert!(render(&info, full.len() - 1).is_none());
+            assert!(render(&info, 0).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_redirect_cannot_change_authority_after_path_normalization() {
+        use salvo_core::http::StatusCode;
+        use salvo_core::http::header::LOCATION;
+        use salvo_core::{Depot, FlowCtrl, Handler, Request, Response};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("assets")).unwrap();
+        let handler = super::StaticDir::new(root.path().to_path_buf());
+        for prefix in ["", "http://trusted.example"] {
+            let mut req = Request::new();
+            *req.uri_mut() = format!("{prefix}//evil.example/../assets?download=1")
+                .parse()
+                .unwrap();
+            let mut res = Response::new();
+            handler
+                .handle(
+                    &mut req,
+                    &mut Depot::new(),
+                    &mut res,
+                    &mut FlowCtrl::new(vec![]),
+                )
+                .await;
+            assert_eq!(res.status_code, Some(StatusCode::FOUND));
+            assert_eq!(
+                res.headers()[LOCATION],
+                "/.//evil.example/../assets/?download=1"
+            );
+        }
+    }
+
     #[test]
     fn test_list_html_escapes_visible_names() {
         // Names in the listing are attacker-influenced only when the served
@@ -950,7 +1468,11 @@ mod tests {
 
         let files = vec![FileInfo::new("a&b'<c>.txt".to_owned(), &metadata)];
         let dirs = vec![DirInfo::new(r#"d"ir&"#.to_owned(), &metadata)];
-        let html = list_html(&CurrentInfo::new("pa&th".to_owned(), files, dirs));
+        let html = list_html(
+            &CurrentInfo::new("pa&th".to_owned(), files, dirs),
+            usize::MAX,
+        )
+        .unwrap();
 
         // Visible text is entity-escaped...
         assert!(html.contains("a&amp;b&apos;&lt;c&gt;.txt"));

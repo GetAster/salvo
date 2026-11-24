@@ -23,6 +23,18 @@
 //! }
 //! ```
 //!
+//! Deprecated handlers retain caller-facing deprecation diagnostics:
+//!
+//! ```compile_fail
+//! #![allow(deprecated)]
+//! use salvo_core::handler;
+//! #[handler]
+//! #[deprecated(note = "use the replacement handler")]
+//! fn old() -> &'static str { "old" }
+//! #[deny(deprecated)]
+//! fn caller() { let _handler = old; }
+//! ```
+//!
 //! This is equivalent to:
 //!
 //! ```
@@ -167,6 +179,12 @@ pub trait Handler: Send + Sync + 'static {
     fn type_id(&self) -> std::any::TypeId {
         std::any::TypeId::of::<Self>()
     }
+    /// Optional type-erased metadata supplied by generated handlers.
+    #[doc(hidden)]
+    fn type_data(&self) -> Option<&(dyn ::std::any::Any + Send + Sync)> {
+        None
+    }
+
     #[doc(hidden)]
     fn type_name(&self) -> &'static str {
         std::any::type_name::<Self>()

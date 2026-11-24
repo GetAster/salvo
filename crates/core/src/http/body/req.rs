@@ -293,6 +293,13 @@ cfg_feature! {
         use crate::BoxedError;
         use crate::http::ReqBody;
 
+        #[derive(Clone, Copy)]
+        enum ReceiveState {
+            Data,
+            Trailers,
+            Done,
+        }
+
         /// HTTP/3 request body.
         pub struct H3ReqBody<S, B>
         where
@@ -300,6 +307,9 @@ cfg_feature! {
             B: Buf + Send + Unpin,
         {
             inner: salvo_http3::server::RequestStream<S, B>,
+            state: ReceiveState,
+            // Bytes still expected according to the request's `content-length`.
+            remaining: Option<u64>,
         }
         impl<S, B> Debug for H3ReqBody<S, B>
         where
@@ -317,7 +327,32 @@ cfg_feature! {
         {
             /// Creates a new `H3ReqBody` instance.
             pub fn new(inner: salvo_http3::server::RequestStream<S, B>) -> Self {
-                Self { inner }
+                Self { inner, state: ReceiveState::Data, remaining: None }
+            }
+
+            /// Sets the length announced by the request's `content-length` field.
+            ///
+            /// The body then reports it through [`Body::size_hint`], as an HTTP/1 or
+            /// HTTP/2 request body does, and fails when the content it receives is
+            /// longer or shorter. Without it the length is unknown.
+            #[must_use]
+            pub fn content_length(mut self, length: Option<u64>) -> Self {
+                self.remaining = length;
+                self
+            }
+        }
+
+        impl<S, B> H3ReqBody<S, B>
+        where
+            S: RecvStream + Send + Unpin,
+            B: Buf + Send + Unpin,
+        {
+            /// Ends the body of a request whose content does not match its
+            /// `content-length`; such a message is malformed (RFC 9114 section 4.1.2).
+            fn malformed(&mut self, message: &'static str) -> BoxedError {
+                self.state = ReceiveState::Done;
+                self.inner.stop_sending(Code::H3_MESSAGE_ERROR);
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
             }
         }
 
@@ -334,21 +369,58 @@ cfg_feature! {
                 cx: &mut Context<'_>,
             ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
                 let this = &mut *self;
-                match ready!(this.inner.poll_recv_data(cx)) {
-                    Ok(Some(buf)) => {
-                        Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(buf.chunk())))))
+                if matches!(this.state, ReceiveState::Data) {
+                    match ready!(this.inner.poll_recv_data(cx)) {
+                        Ok(Some(buf)) => {
+                            let data = Bytes::copy_from_slice(buf.chunk());
+                            if let Some(remaining) = this.remaining {
+                                let Some(remaining) = remaining.checked_sub(data.len() as u64)
+                                else {
+                                    return Poll::Ready(Some(Err(this.malformed(
+                                        "request content is longer than its content-length",
+                                    ))));
+                                };
+                                this.remaining = Some(remaining);
+                            }
+                            return Poll::Ready(Some(Ok(Frame::data(data))));
+                        }
+                        Ok(None) if this.remaining.is_some_and(|remaining| remaining > 0) => {
+                            return Poll::Ready(Some(Err(this.malformed(
+                                "request content is shorter than its content-length",
+                            ))));
+                        }
+                        // End of DATA can mean a trailing HEADERS section, not
+                        // the end of the HTTP message. Keep polling trailers
+                        // across Pending so their fields and errors are retained.
+                        Ok(None) => this.state = ReceiveState::Trailers,
+                        Err(error) => {
+                            this.state = ReceiveState::Done;
+                            return Poll::Ready(Some(Err(error.into())));
+                        }
                     }
-                    Ok(None) => Poll::Ready(None),
-                    Err(e) => Poll::Ready(Some(Err(e.into()))),
                 }
+                if matches!(this.state, ReceiveState::Trailers) {
+                    let trailers = ready!(this.inner.poll_recv_trailers(cx));
+                    this.state = ReceiveState::Done;
+                    return Poll::Ready(match trailers {
+                        Ok(Some(trailers)) => Some(Ok(Frame::trailers(trailers))),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error.into())),
+                    });
+                }
+                Poll::Ready(None)
             }
 
             fn is_end_stream(&self) -> bool {
-                false // TODO: check this
+                matches!(self.state, ReceiveState::Done)
             }
 
             fn size_hint(&self) -> SizeHint {
-                SizeHint::default()
+                match self.remaining {
+                    Some(_) if matches!(self.state, ReceiveState::Done) => SizeHint::with_exact(0),
+                    Some(remaining) => SizeHint::with_exact(remaining),
+                    None => SizeHint::default(),
+                }
             }
         }
 

@@ -3,8 +3,8 @@ use std::str::FromStr;
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{ToTokens, quote};
+use syn::LitInt;
 use syn::parse::ParseStream;
-use syn::{LitFloat, LitInt};
 
 mod ext;
 pub(crate) use ext::*;
@@ -31,48 +31,12 @@ where
         let minus = input.parse::<Option<syn::Token![-]>>()?;
         let lit = input.parse::<LitInt>()?;
         if minus.is_some() {
-            let value_str = format!("-{lit}");
+            let value_str = format!("-{}", lit.base10_digits());
             value_str
                 .parse::<T>()
                 .map_err(|e| syn::Error::new(lit.span(), e))
         } else {
             lit.base10_parse()
-        }
-    })
-}
-
-/// Parse any `number`. Tries to parse `LitInt` or `LitFloat` from parse stream,
-/// supporting an optional leading `-` for negative values.
-fn parse_number<T>(input: ParseStream) -> syn::Result<T>
-where
-    T: FromStr,
-    <T as FromStr>::Err: Display,
-{
-    parse_utils::parse_next(input, || {
-        let minus = input.parse::<Option<syn::Token![-]>>()?;
-        let lookup = input.lookahead1();
-        if lookup.peek(LitInt) {
-            let lit = input.parse::<LitInt>()?;
-            if minus.is_some() {
-                let value_str = format!("-{lit}");
-                value_str
-                    .parse::<T>()
-                    .map_err(|e| syn::Error::new(lit.span(), e))
-            } else {
-                lit.base10_parse()
-            }
-        } else if lookup.peek(LitFloat) {
-            let lit = input.parse::<LitFloat>()?;
-            if minus.is_some() {
-                let value_str = format!("-{lit}");
-                value_str
-                    .parse::<T>()
-                    .map_err(|e| syn::Error::new(lit.span(), e))
-            } else {
-                lit.base10_parse()
-            }
-        } else {
-            Err(lookup.error())
         }
     })
 }
@@ -160,7 +124,8 @@ impl Feature {
     ) -> DiagResult<()> {
         match self {
             Self::MultipleOf(multiple_of) => multiple_of.validate(
-                ValidatorChain::new(&IsNumber(schema_type)).next(&AboveZeroF64(multiple_of.0)),
+                ValidatorChain::new(&IsNumber(schema_type))
+                    .next(&AboveZeroF64(multiple_of.0.value)),
             ),
             Self::Maximum(maximum) => maximum.validate(IsNumber(schema_type)),
             Self::Minimum(minimum) => minimum.validate(IsNumber(schema_type)),
@@ -170,19 +135,11 @@ impl Feature {
             Self::ExclusiveMinimum(exclusive_minimum) => {
                 exclusive_minimum.validate(IsNumber(schema_type))
             }
-            Self::MaxLength(max_length) => max_length.validate(
-                ValidatorChain::new(&IsString(schema_type)).next(&AboveZeroUsize(max_length.0)),
-            ),
-            Self::MinLength(min_length) => min_length.validate(
-                ValidatorChain::new(&IsString(schema_type)).next(&AboveZeroUsize(min_length.0)),
-            ),
+            Self::MaxLength(max_length) => max_length.validate(IsString(schema_type)),
+            Self::MinLength(min_length) => min_length.validate(IsString(schema_type)),
             Self::Pattern(pattern) => pattern.validate(IsString(schema_type)),
-            Self::MaxItems(max_items) => max_items.validate(
-                ValidatorChain::new(&AboveZeroUsize(max_items.0)).next(&IsVec(type_tree)),
-            ),
-            Self::MinItems(min_items) => min_items.validate(
-                ValidatorChain::new(&AboveZeroUsize(min_items.0)).next(&IsVec(type_tree)),
-            ),
+            Self::MaxItems(max_items) => max_items.validate(IsVec(type_tree)),
+            Self::MinItems(min_items) => min_items.validate(IsVec(type_tree)),
             _unsupported_variant => {
                 const SUPPORTED_VARIANTS: [&str; 10] = [
                     "multiple_of",
@@ -249,7 +206,7 @@ impl TryToTokens for Feature {
             Self::DefaultParameterIn(parameter_in) => quote! { .location(#parameter_in) },
             Self::MultipleOf(multiple_of) => quote! { .multiple_of(#multiple_of) },
             Self::AllowReserved(allow_reserved) => {
-                quote! { .allow_reserved(Some(#allow_reserved)) }
+                quote! { .allow_reserved(#allow_reserved) }
             }
             Self::Explode(explode) => quote! { .explode(#explode) },
             Self::Maximum(maximum) => quote! { .maximum(#maximum) },
@@ -484,5 +441,38 @@ impl Merge<Self> for Vec<Feature> {
     fn merge(mut self, mut from: Self) -> Self {
         self.append(&mut from);
         self
+    }
+}
+
+#[cfg(test)]
+mod negative_literal_tests {
+    use syn::parse::Parser;
+
+    use super::parse_integer;
+    use super::validation::SchemaNumber;
+
+    #[test]
+    fn negative_numbers_normalize_rust_literal_spelling() {
+        for (source, expected) in [
+            ("-1_000", -1000.0),
+            ("-0x10", -16.0),
+            ("-10i32", -10.0),
+            ("-1_000.25f64", -1000.25),
+        ] {
+            assert_eq!(
+                SchemaNumber::parse
+                    .parse_str(&format!("= {source}"))
+                    .unwrap()
+                    .value,
+                expected
+            );
+        }
+        assert_eq!(
+            parse_integer::<i64>
+                .parse_str("= -9_223_372_036_854_775_808i64")
+                .unwrap(),
+            i64::MIN
+        );
+        assert!(parse_integer::<usize>.parse_str("= -1_000").is_err());
     }
 }

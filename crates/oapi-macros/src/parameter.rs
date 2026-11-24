@@ -79,7 +79,7 @@ impl TryToTokens for Parameter<'_> {
                     tokens.extend(quote!{
                         {
                             let mut new_parameter = #parameter;
-                            if let Some(exist_parameter) = operation.parameters.0.iter_mut().find(|p|p.name == new_parameter.name) {
+                            if let Some(exist_parameter) = operation.parameters.iter_inline_mut().find(|p|p.name == new_parameter.name) {
                                 new_parameter.parameter_in = exist_parameter.parameter_in.clone();
                                 exist_parameter.merge(new_parameter);
                             } else {
@@ -118,28 +118,22 @@ impl TryToTokens for ParameterSchema<'_> {
             ParameterType::Parsed(inline_type) => {
                 let type_tree = inline_type.as_type_tree()?;
                 let required: Required = (!type_tree.is_option()).into();
-                if inline_type.is_inline {
-                    let oapi = crate::oapi_crate();
-                    let inline_call =
-                        crate::component::build_inline_compose_block(&type_tree, &oapi);
-                    tokens.extend(quote! { .schema(#inline_call).required(#required) });
-                } else {
-                    let mut schema_features = Vec::<Feature>::new();
-                    schema_features.clone_from(&self.features);
-                    schema_features.push(Feature::Inline(inline_type.is_inline.into()));
-
-                    to_tokens(
-                        ComponentSchema::for_params(component::ComponentSchemaProps {
+                let mut schema_features = self.features.clone();
+                schema_features.push(Feature::Inline(inline_type.is_inline.into()));
+                to_tokens(
+                    ComponentSchema::for_params(
+                        component::ComponentSchemaProps {
                             type_tree: &type_tree,
                             features: Some(schema_features),
                             description: None,
                             deprecated: None,
                             object_name: "",
                             compose_context: None,
-                        })?,
-                        required,
-                    )
-                }
+                        },
+                        &inline_type.ty,
+                    )?,
+                    required,
+                );
             }
         }
         Ok(())

@@ -18,29 +18,35 @@ on:
       - '**/Cargo.toml'         # or dependency updates
       - '.github/workflows/**'  # or workflow changes
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
   typos:
     name: Typos
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
           components: rustfmt, clippy
       - name: Typos check with custom config file
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@b41eb62e9a8096c9ba6636e2365d3f56018a203c # master
   udeps:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
 
       - name: Install cargo-udeps
-        uses: taiki-e/install-action@cargo-udeps
+        uses: taiki-e/install-action@28bfb437c78d9b7ea8650351357e3eb8c0be2672 # cargo-udeps
 
       - name: Check unused dependencies on default features
         run: cargo udeps
@@ -53,19 +59,26 @@ jobs:
   msrv:
     name: Check MSRV - x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Get MSRV from package metadata
         id: msrv
         run: grep rust-version Cargo.toml | cut -d'"' -f2 | sed 's/^/version=/' >> $GITHUB_OUTPUT
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
           components: rustfmt, clippy
 
       - name: check crates
         run: cargo check --all --bins --examples --tests
+
+      - name: Check all targets and features on MSRV
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: Check Toasty example on MSRV
+        run: cargo check --manifest-path examples/Cargo.toml -p example-db-postgres-toasty --all-targets
   test:
     strategy:
         fail-fast: false
@@ -75,9 +88,10 @@ jobs:
             # - nightly
     name: Cargo check ${{ matrix.version }} - x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.version }}
           components: rustfmt, clippy
@@ -107,10 +121,11 @@ jobs:
             - nightly
     name: Cargo check ${{ matrix.version }} - x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [test]
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.version }}
           components: rustfmt, clippy
@@ -121,9 +136,36 @@ jobs:
       - name: check --feature-powerset
         run: cargo hack check --feature-powerset --depth 1 -Z avoid-dev-deps --exclude-features server --at-least-one-of aws-lc-rs,ring --exclude-no-default-features
 
+  middleware-features:
+    name: Standalone middleware features
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Check each extra middleware independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          for feature in affix-state basic-auth caching-headers catch-panic force-https logging concurrency-limiter size-limiter sse trailing-slash timeout websocket request-id tower-compat; do
+            cargo check -p salvo --no-default-features --features "$feature"
+          done
+      - name: Verify logging does not enable unrelated middleware dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree -p salvo --no-default-features --features logging --edges normal,build --prefix none)
+          if grep -Eq '^(tokio-tungstenite|tungstenite|tower|ulid) v' <<< "$tree"; then
+            echo 'logging unexpectedly enabled unrelated middleware dependencies'
+            exit 1
+          fi
+      - name: Test extra middleware without workspace feature unification
+        run: cargo test -p salvo_extra --lib --no-default-features --features timeout,catch-panic,size-limiter
+
   protocols:
     name: Protocol features (${{ matrix.features }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -133,11 +175,22 @@ jobs:
           - 'server,http2'
           - 'server,http1,http2'
           - 'server,http1,websocket'
+          - 'server,http1,routing-regex'
+          - 'server,http1,catcher-html'
+          - 'server,http1,catcher-json'
+          - 'server,http1,catcher-xml'
+          - 'server,http1,routing-regex,catcher-html,catcher-json,catcher-xml'
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Check selected protocols
         run: cargo check -p salvo --no-default-features --features '${{ matrix.features }}'
+      - name: Test core without matched-path
+        if: ${{ matrix.features == 'server,http1' }}
+        run: cargo test -p salvo_core --lib --no-default-features --features server,http1,test,cookie
+      - name: Test core with matched-path
+        if: ${{ matrix.features == 'server,http1' }}
+        run: cargo test -p salvo_core --lib --no-default-features --features server,http1,test,cookie,matched-path
       - name: Verify HTTP/2 is excluded when disabled
         if: ${{ !contains(matrix.features, 'http2') }}
         shell: bash
@@ -145,5 +198,17 @@ jobs:
           tree=$(cargo tree -p salvo --no-default-features --features '${{ matrix.features }}' --edges normal,build --prefix none)
           if grep -q '^h2 v' <<< "$tree"; then
             echo 'HTTP/2 was enabled unexpectedly'
+            exit 1
+          fi
+      - name: Test optional routing and catcher capabilities
+        if: ${{ contains(matrix.features, 'routing-regex') || contains(matrix.features, 'catcher-') }}
+        run: cargo test -p salvo_core --lib --no-default-features --features 'test,${{ matrix.features }}'
+      - name: Verify regex is excluded when disabled
+        if: ${{ matrix.features == 'server,http1' }}
+        shell: bash
+        run: |
+          tree=$(cargo tree -p salvo --no-default-features --features server,http1 --edges normal,build --prefix none)
+          if grep -Eq '^(regex|regex-automata|regex-syntax) v' <<< "$tree"; then
+            echo 'Regex routing was enabled unexpectedly'
             exit 1
           fi

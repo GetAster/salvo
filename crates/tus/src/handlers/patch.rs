@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use salvo_core::http::{HeaderValue, StatusCode};
+use salvo_core::http::{HeaderValue, Method, StatusCode};
 use salvo_core::{Depot, Request, Response, Router, handler};
 
 use crate::error::{ProtocolError, TusError};
-use crate::handlers::apply_common_headers;
+use crate::handlers::{apply_common_headers, finish_upload, upload_expiration};
+use crate::method_override::TusMethodFilter;
 use crate::stores::Extension;
-use crate::utils::{check_tus_version, parse_u64};
+use crate::utils::{check_tus_version, parse_u64, validate_header};
 use crate::{
     CT_OFFSET_OCTET_STREAM, CancellationContext, H_CONTENT_LENGTH, H_CONTENT_TYPE, H_TUS_RESUMABLE,
     H_TUS_VERSION, H_UPLOAD_EXPIRES, H_UPLOAD_LENGTH, H_UPLOAD_OFFSET, TUS_VERSION, Tus,
@@ -43,11 +44,7 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     }
 
     // 2. Check Content Type. The request MUST include a Content-Type header
-    let content_type = req
-        .headers()
-        .get(H_CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok());
-    if content_type != Some(CT_OFFSET_OCTET_STREAM) {
+    if !validate_header(CT_OFFSET_OCTET_STREAM, req.headers().get(H_CONTENT_TYPE)) {
         res.status_code = Some(TusError::Protocol(ProtocolError::InvalidContentType).status());
         return;
     }
@@ -90,23 +87,11 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         }
     };
 
-    let mut expires_at = None;
-    if store.has_extension(Extension::Expiration)
-        && let Some(expiration) = store.get_expiration()
-        && expiration > std::time::Duration::from_secs(0)
-        && !already_uploaded_info.creation_date.is_empty()
-        && let Ok(created_at) =
-            chrono::DateTime::parse_from_rfc3339(&already_uploaded_info.creation_date)
-        && let Ok(delta) = chrono::Duration::from_std(expiration)
-    {
-        let expires = created_at.with_timezone(&chrono::Utc) + delta;
-        if chrono::Utc::now() > expires {
-            res.status_code = Some(TusError::FileNoLongerExists.status());
-            return;
-        }
-        expires_at = Some(expires);
+    let expires_at = upload_expiration(store.as_ref(), &already_uploaded_info);
+    if expires_at.is_some_and(|expires| chrono::Utc::now() > expires) {
+        res.status_code = Some(TusError::FileNoLongerExists.status());
+        return;
     }
-
     // If a Client does attempt to resume an upload which has since
     // been removed by the Server, the Server SHOULD respond with the
     // with the 404 Not Found or 410 Gone status. The latter one SHOULD
@@ -132,6 +117,9 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         return;
     }
 
+    let was_finished = already_uploaded_info.size == Some(uploaded_info_offset);
+
+    let mut declared_length = None;
     if let Some(raw_length) = req.headers().get(H_UPLOAD_LENGTH) {
         let size = if let Ok(value) = raw_length.to_str() {
             match parse_u64(Some(value), H_UPLOAD_LENGTH) {
@@ -169,10 +157,7 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
             return;
         }
 
-        if let Err(e) = store.declare_upload_length(&id, size).await {
-            res.status_code = Some(e.status());
-            return;
-        }
+        declared_length = Some(size);
         already_uploaded_info.size = Some(size);
     }
 
@@ -223,14 +208,44 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         }
     }
 
-    // let max_body_size = opts.calculate_max_body_size(req, already_uploaded_info,
-    // max_file_size).await; let new_offset = store.write(req.body, already_uploaded_info,
-    // max_body_size, context);
-
     let body = req.take_body();
-    let stream = body.map(|frame| frame.map(|frame| frame.into_data().unwrap_or_default()));
+    let mut stream = Box::pin(
+        body.map(|frame| frame.map(|frame| frame.into_data().unwrap_or_default()))
+            .fuse(),
+    );
+
+    // Declaring the current offset as the final length would complete the
+    // upload before write_limited can reject extra bytes or a broken stream.
+    // Validate EOF first so a rejected request leaves the length deferred and
+    // a retry can still reach the completion hook. No body buffering is needed.
+    if declared_length == Some(offset) {
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) if chunk.is_empty() => {}
+                Ok(_) => {
+                    res.status_code = Some(TusError::PayloadTooLarge.status());
+                    return;
+                }
+                Err(error) => {
+                    res.status_code = Some(TusError::Internal(error.to_string()).status());
+                    return;
+                }
+            }
+        }
+    }
+
+    // Do not persist a deferred length until all headers and size bounds have
+    // been validated. An invalid request must not complete the stored upload
+    // without reaching the completion hook.
+    if let Some(size) = declared_length
+        && let Err(error) = store.declare_upload_length(&id, size).await
+    {
+        res.status_code = Some(error.status());
+        return;
+    }
+
     let written = match store
-        .write_limited(&id, offset, Box::pin(stream), max_write_size)
+        .write_limited(&id, offset, stream, max_write_size)
         .await
     {
         Ok(written) => written,
@@ -266,10 +281,28 @@ async fn patch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     res.status_code = Some(StatusCode::NO_CONTENT);
     res.headers
         .insert(H_UPLOAD_OFFSET, HeaderValue::from(new_offset));
+
+    if !was_finished
+        && already_uploaded_info.size == Some(new_offset)
+        && opts.on_upload_finish.is_some()
+    {
+        let upload = match store.get_upload_file_info(&id).await {
+            Ok(upload) => upload,
+            Err(error) => {
+                res.status_code = Some(error.status());
+                return;
+            }
+        };
+        if let Err(error) = finish_upload(req, res, opts, upload).await {
+            res.status_code = Some(error.status());
+        }
+    }
 }
 
 pub(crate) fn patch_handler() -> Router {
-    Router::with_path("{id}").patch(patch)
+    Router::with_path("{id}")
+        .filter(TusMethodFilter(Method::PATCH))
+        .goal(patch)
 }
 
 #[cfg(test)]

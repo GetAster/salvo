@@ -58,7 +58,7 @@ impl TryFrom<&Field> for FieldInfo {
             flatten,
             ..
         }) =
-            serde_util::parse_value(&field.attrs)?
+            serde_util::parse_value_for_deserialize(&field.attrs)?
         {
             (rename, aliases, flatten)
         } else {
@@ -211,6 +211,11 @@ impl ExtractibleArgs {
         };
         let mut fields = Vec::with_capacity(data.fields.len());
         for field in data.fields.iter() {
+            if serde_util::parse_value_for_deserialize(&field.attrs)?
+                .is_some_and(|value| value.skip)
+            {
+                continue;
+            }
             fields.push(field.try_into()?);
         }
         let mut default_sources = Vec::new();
@@ -234,7 +239,7 @@ impl ExtractibleArgs {
                 }
             }
         }
-        let serde_container = serde_util::parse_container(&attrs)?;
+        let serde_container = serde_util::parse_container_for_deserialize(&attrs)?;
         let serde_rename_all = serde_container.and_then(|c| c.rename_all);
         Ok(Self {
             ident,
@@ -247,7 +252,7 @@ impl ExtractibleArgs {
     }
 }
 
-fn metadata_source(salvo: &Ident, source: &SourceInfo) -> TokenStream {
+fn metadata_source(salvo: &syn::Path, source: &SourceInfo) -> TokenStream {
     let from = Ident::new(
         &RenameRule::PascalCase.apply_to_field(&source.from),
         Span::call_site(),
@@ -274,27 +279,34 @@ fn metadata_source(salvo: &Ident, source: &SourceInfo) -> TokenStream {
 pub(crate) fn generate(args: DeriveInput) -> Result<TokenStream, Error> {
     let mut args: ExtractibleArgs = ExtractibleArgs::from_derive_input(&args)?;
     let salvo = salvo_crate();
-    let (_, ty_generics, _where_clause) = args.generics.split_for_impl();
-
-    let where_predicate = args.generics.type_params().map(|t| {
-        let ty = &t.ident;
-        quote! {
-            #ty: #salvo::extract::Extractible<'__macro_gen_ex> + #salvo::serde::Deserialize<'__macro_gen_ex>,
+    let (_, ty_generics, _) = args.generics.split_for_impl();
+    let mut bounded_generics = args.generics.clone();
+    if !args.generics.params.is_empty() {
+        bounded_generics
+            .make_where_clause()
+            .predicates
+            .push(syn::parse_quote! {
+                Self: #salvo::serde::Deserialize<'__macro_gen_ex>
+            });
+        for field in args.fields.iter().filter(|field| field.flatten) {
+            let ty = &field.ty;
+            bounded_generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote! {
+                    #ty: #salvo::extract::Extractible<'__macro_gen_ex>
+                });
         }
-    }).collect::<Punctuated<_, Token![,]>>();
-
-    let where_clause = if where_predicate.is_empty() {
-        None
-    } else {
-        Some(quote! {
-            where
-                #where_predicate
-        })
-    };
+    }
+    let where_clause = &bounded_generics.where_clause;
 
     let name = &args.ident;
     let mut default_sources = Vec::new();
     let mut fields = Vec::new();
+    let generic_metadata = args.generics.type_params().next().is_some()
+        || args.generics.const_params().next().is_some();
+    let mut nested_bindings = Vec::new();
+    let mut nested_keys = Vec::new();
 
     for source in &args.default_sources {
         let source = metadata_source(&salvo, source);
@@ -302,7 +314,7 @@ pub(crate) fn generate(args: DeriveInput) -> Result<TokenStream, Error> {
             metadata = metadata.add_default_source(#source);
         });
     }
-    fn quote_rename_rule(salvo: &Ident, rename_all: RenameRule) -> TokenStream {
+    fn quote_rename_rule(salvo: &syn::Path, rename_all: RenameRule) -> TokenStream {
         let rename_all = match rename_all {
             RenameRule::LowerCase => "LowerCase",
             RenameRule::UpperCase => "UpperCase",
@@ -347,8 +359,21 @@ pub(crate) fn generate(args: DeriveInput) -> Result<TokenStream, Error> {
         if field.flatten {
             if let Type::Path(ty) = &field.ty {
                 let ty = omit_type_path_lifetimes(ty);
+                let nested = if generic_metadata {
+                    let binding = Ident::new(
+                        &format!("__salvo_nested_metadata_{}", nested_bindings.len()),
+                        Span::call_site(),
+                    );
+                    nested_bindings.push(quote! {
+                        let #binding = <#ty as #salvo::extract::Extractible>::metadata();
+                    });
+                    nested_keys.push(quote! { ::std::ptr::from_ref(#binding).addr() });
+                    quote! { #binding }
+                } else {
+                    quote! { <#ty as #salvo::extract::Extractible>::metadata() }
+                };
                 nested_metadata = Some(quote! {
-                    field = field.metadata(<#ty as #salvo::extract::Extractible>::metadata());
+                    field = field.metadata(#nested);
                     field = field.flatten(true);
                 });
             } else {
@@ -401,57 +426,58 @@ pub(crate) fn generate(args: DeriveInput) -> Result<TokenStream, Error> {
     }
 
     let mt = name.to_string();
-    let metadata = quote! {
-        fn metadata() ->  &'static #salvo::extract::Metadata {
+    let initialize_metadata = quote! {
+        let mut metadata = #salvo::extract::Metadata::new(#mt);
+        #(#default_sources)*
+        #rename_all
+        #serde_rename_all
+        #(#fields)*
+        metadata
+    };
+    let metadata_body = if nested_bindings.is_empty() {
+        quote! {
             static METADATA: ::std::sync::OnceLock<#salvo::extract::Metadata> = ::std::sync::OnceLock::new();
-            METADATA.get_or_init(|| {
-                let mut metadata = #salvo::extract::Metadata::new(#mt);
-                #(
-                    #default_sources
-                )*
-                #rename_all
-                #serde_rename_all
-                #(
-                    #fields
-                )*
-                metadata
+            METADATA.get_or_init(|| { #initialize_metadata })
+        }
+    } else {
+        // A generic function's static is shared by all its instantiations. The only
+        // type-dependent parts of this metadata are its flattened child references,
+        // so key by those references instead of TypeId (which would require 'static
+        // extractors). Equivalent compositions can safely share the parent metadata.
+        // Resolve children before locking: Outer<Outer<T>> re-enters this same cache.
+        let nested_count = nested_keys.len();
+        quote! {
+            #(#nested_bindings)*
+            static METADATA: ::std::sync::OnceLock<::std::sync::Mutex<
+                ::std::collections::HashMap<[usize; #nested_count], &'static #salvo::extract::Metadata>
+            >> = ::std::sync::OnceLock::new();
+            let mut cache = METADATA.get_or_init(::std::default::Default::default)
+                .lock().unwrap_or_else(|error| error.into_inner());
+            *cache.entry([#(#nested_keys),*]).or_insert_with(|| {
+                ::std::boxed::Box::leak(::std::boxed::Box::new({ #initialize_metadata }))
             })
         }
     };
-    let life_param = args.generics.lifetimes().next();
-    let code = if let Some(life_param) = life_param {
-        let ex_life_def = syn::parse_str(&format!("'__macro_gen_ex:{}", life_param.lifetime))
-            .expect("Invalid lifetime.");
-        let mut generics = args.generics.clone();
-        generics.params.insert(0, ex_life_def);
-        let impl_generics_de = generics.split_for_impl().0;
-        quote! {
-            impl #impl_generics_de #salvo::extract::Extractible<'__macro_gen_ex> for #name #ty_generics #where_clause {
-                #metadata
-
-                #[allow(refining_impl_trait)]
-                async fn extract(req: &'__macro_gen_ex mut #salvo::http::Request, depot: &'__macro_gen_ex mut #salvo::Depot) -> ::std::result::Result<Self, #salvo::http::ParseError>
-                where
-                    Self: Sized {
-                    #salvo::serde::from_request(req, depot, Self::metadata()).await
-                }
-            }
+    let metadata = quote! {
+        fn metadata() -> &'static #salvo::extract::Metadata {
+            #metadata_body
         }
-    } else {
-        let ex_life_def = syn::parse_str("'__macro_gen_ex").expect("Invalid lifetime.");
-        let mut generics = args.generics.clone();
-        generics.params.insert(0, ex_life_def);
-        let impl_generics_de = generics.split_for_impl().0;
-        quote! {
-            impl #impl_generics_de #salvo::extract::Extractible<'__macro_gen_ex> for #name #ty_generics #where_clause {
-                #metadata
+    };
+    let ex_lifetime: syn::LifetimeParam = syn::parse_quote!('__macro_gen_ex);
+    let mut generics = args.generics.clone();
+    generics
+        .params
+        .insert(0, syn::GenericParam::Lifetime(ex_lifetime));
+    let impl_generics_de = generics.split_for_impl().0;
+    let code = quote! {
+        impl #impl_generics_de #salvo::extract::Extractible<'__macro_gen_ex> for #name #ty_generics #where_clause {
+            #metadata
 
-                #[allow(refining_impl_trait)]
-                async fn extract(req: &'__macro_gen_ex mut #salvo::http::Request, depot: &'__macro_gen_ex mut #salvo::Depot) -> ::std::result::Result<Self, #salvo::http::ParseError>
-                where
-                    Self: Sized {
-                    #salvo::serde::from_request(req, depot, Self::metadata()).await
-                }
+            #[allow(refining_impl_trait)]
+            async fn extract(req: &'__macro_gen_ex mut #salvo::http::Request, depot: &'__macro_gen_ex mut #salvo::Depot) -> ::std::result::Result<Self, #salvo::http::ParseError>
+            where
+                Self: Sized {
+                #salvo::serde::from_request(req, depot, Self::metadata()).await
             }
         }
     };

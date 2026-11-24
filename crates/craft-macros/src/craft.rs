@@ -8,20 +8,37 @@ use syn::{
     Attribute, FnArg, Generics, Ident, ImplItem, ImplItemFn, Item, Token, Type, parse_quote,
 };
 
-use crate::utils::salvo_crate;
+use crate::utils::{cfg_attributes, oapi_crate, salvo_crate};
 
 pub(crate) fn generate(input: Item) -> syn::Result<TokenStream> {
     match input {
         Item::Impl(mut item_impl) => {
-            for item in &mut item_impl.items {
+            let mut helpers = Vec::new();
+            for (index, item) in item_impl.items.iter_mut().enumerate() {
                 if let ImplItem::Fn(method) = item {
-                    rewrite_method(
+                    let cfg = cfg_attributes(&method.attrs)?;
+                    match rewrite_method(
                         item_impl.generics.clone(),
                         item_impl.self_ty.as_ref(),
                         method,
-                    )?;
+                    ) {
+                        Ok(Some(helper)) => helpers.push(ImplItem::Fn(helper)),
+                        Ok(None) => {}
+                        Err(error) if !cfg.is_empty() => {
+                            let name = Ident::new(
+                                &format!("__SALVO_CRAFT_ERROR_{index}"),
+                                Span::call_site(),
+                            );
+                            let error = error.into_compile_error();
+                            *item = ImplItem::Verbatim(
+                                quote! { #(#cfg)* const #name: () = { #error }; },
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
+            item_impl.items.extend(helpers);
             Ok(item_impl.into_token_stream())
         }
         Item::Fn(_) => Ok(input.into_token_stream()),
@@ -60,8 +77,14 @@ fn take_method_macro(item_fn: &mut ImplItemFn) -> syn::Result<Option<Attribute>>
                 .map(|c| c.as_str().to_owned())
                 .unwrap_or_default();
             let ts: TokenStream = match name {
-                "handler" => format!("#[{}::{name}{content}]", salvo_crate()).parse()?,
-                "endpoint" => format!("#[{}::oapi::{name}{content}]", salvo_crate()).parse()?,
+                "handler" => {
+                    format!("#[{}::{name}{content}]", salvo_crate().to_token_stream()).parse()?
+                }
+                "endpoint" => format!(
+                    "#[{}::oapi::{name}{content}]",
+                    oapi_crate().to_token_stream()
+                )
+                .parse()?,
                 _ => {
                     unreachable!()
                 }
@@ -101,10 +124,20 @@ impl FnReceiver {
         match &recv.kind {
             syn::ReceiverKind::Reference(_, _, None) if recv.mutability.is_none() => Ok(Self::Ref),
             syn::ReceiverKind::Typed(_, ty) => {
-                let ty = ty.to_token_stream().to_string().replace(' ', "");
-                if ty == "&Self" {
+                let is_self = |ty: &Type| matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.is_ident("Self"));
+                let is_arc = |ty: &Type| {
+                    matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.segments.last().is_some_and(|segment| {
+                        segment.ident == "Arc"
+                            && matches!(&segment.arguments, syn::PathArguments::AngleBracketed(args)
+                                if args.args.len() == 1 && matches!(args.args.first(), Some(syn::GenericArgument::Type(ty)) if is_self(ty)))
+                    }))
+                };
+                if matches!(ty.as_ref(), Type::Reference(reference) if reference.mutability.is_none() && is_self(&reference.elem))
+                {
                     Ok(Self::Ref)
-                } else if ty == "Arc<Self>" || ty == "&Arc<Self>" || ty.ends_with("::Arc<Self>") {
+                } else if is_arc(ty)
+                    || matches!(ty.as_ref(), Type::Reference(reference) if reference.mutability.is_none() && is_arc(&reference.elem))
+                {
                     Ok(Self::Arc)
                 } else {
                     Err(syn::Error::new_spanned(
@@ -125,21 +158,196 @@ fn rewrite_method(
     impl_generics: Generics,
     self_ty: &Type,
     method: &mut ImplItemFn,
-) -> syn::Result<()> {
+) -> syn::Result<Option<ImplItemFn>> {
     let Some(macro_attr) = take_method_macro(method)? else {
-        return Ok(());
+        return Ok(None);
     };
     method.sig.asyncness = Some(Token![async](Span::call_site()));
     let salvo = salvo_crate();
     let handler = quote!(#salvo::Handler);
     let method_name = method.sig.ident.clone();
     let vis = method.vis.clone();
+    let factory_where = method.sig.generics.where_clause.clone();
     let mut attrs = method.attrs.clone();
-    let mut new_method: ImplItemFn = match FnReceiver::from_method(method)? {
+    let style = FnReceiver::from_method(method)?;
+    let stateless_generic = style == FnReceiver::None && !impl_generics.params.is_empty();
+    let borrowed_arc = method.sig.receiver().is_some_and(|recv| {
+        matches!(&recv.kind, syn::ReceiverKind::Typed(_, ty) if matches!(ty.as_ref(), Type::Reference(_)))
+    });
+    let helper_name = Ident::new(
+        &format!(
+            "__salvo_craft_{}",
+            method_name.to_string().trim_start_matches("r#")
+        ),
+        method_name.span(),
+    );
+    let mut helper = method.clone();
+    helper.sig.ident = helper_name.clone();
+    helper.vis = syn::Visibility::Inherited;
+    helper
+        .attrs
+        .retain(|attr| !attr.path().is_ident("deprecated"));
+    if stateless_generic {
+        let dispatch = Ident::new(
+            &format!(
+                "__salvo_dispatch_{}",
+                helper_name.to_string().trim_start_matches('_')
+            ),
+            method_name.span(),
+        );
+        let creator = Ident::new(
+            &format!(
+                "__salvo_metadata_{}",
+                helper_name.to_string().trim_start_matches('_')
+            ),
+            method_name.span(),
+        );
+        let mut lifetime_name = "__salvo_craft_request".to_owned();
+        while impl_generics
+            .lifetimes()
+            .chain(method.sig.generics.lifetimes())
+            .any(|parameter| parameter.lifetime.ident == lifetime_name)
+        {
+            lifetime_name.push('_');
+        }
+        let lifetime = syn::Lifetime::new(&format!("'{lifetime_name}"), Span::mixed_site());
+        let is_endpoint = macro_attr
+            .path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "endpoint");
+        let oapi = oapi_crate();
+        let endpoint_args = match &macro_attr.meta {
+            syn::Meta::List(list) => list.tokens.clone(),
+            _ => TokenStream::new(),
+        };
+        // Expand extraction and metadata helpers as associated functions, where
+        // the original service's type, const and lifetime parameters remain in scope.
+        helper.attrs = attrs.clone();
+        helper.attrs.push(if is_endpoint {
+            parse_quote!(#[#oapi::oapi::__private::__craft_endpoint(#dispatch, #creator, #lifetime, #method_name, (#impl_generics); #endpoint_args)])
+        } else {
+            parse_quote!(#[#salvo::macros::__craft_handler(#dispatch, #lifetime, (#impl_generics))])
+        });
+        let metadata_field = is_endpoint.then(|| quote!(creator: fn() -> #oapi::oapi::Endpoint,));
+        let metadata_init = is_endpoint.then(|| {
+            quote! {
+                creator: || Self::#creator(::std::any::TypeId::of::<handle>()),
+            }
+        });
+        let metadata_hook = is_endpoint.then(|| {
+            quote! {
+                fn type_data(&self) -> Option<&(dyn ::std::any::Any + Send + Sync)> {
+                    Some(&self.creator)
+                }
+            }
+        });
+        let mut factory: ImplItemFn = parse_quote! {
+            #vis fn #method_name() -> impl #handler #factory_where {
+                // Function pointers erase the service parameters: even borrowed
+                // or non-Send service types can produce an independent handler.
+                type Dispatch = for<#lifetime> fn(
+                    &#lifetime mut #salvo::Request,
+                    &#lifetime mut #salvo::Depot,
+                    &#lifetime mut #salvo::Response,
+                    &#lifetime mut #salvo::FlowCtrl,
+                ) -> ::std::pin::Pin<::std::boxed::Box<
+                    dyn ::std::future::Future<Output = ()> + ::std::marker::Send + #lifetime
+                >>;
+                #[derive(Debug)]
+                struct handle { dispatch: Dispatch, #metadata_field }
+                #[#salvo::async_trait]
+                impl #handler for handle {
+                    #metadata_hook
+                    async fn handle(&self, req: &mut #salvo::Request, depot: &mut #salvo::Depot,
+                        res: &mut #salvo::Response, ctrl: &mut #salvo::FlowCtrl) {
+                        (self.dispatch)(req, depot, res, ctrl).await;
+                    }
+                }
+                handle { dispatch: Self::#dispatch, #metadata_init }
+            }
+        };
+        factory.attrs.append(&mut attrs);
+        *method = factory;
+        return Ok(Some(helper));
+    }
+    let mut arguments = Vec::new();
+    for (index, input) in method.sig.inputs.iter_mut().enumerate() {
+        if let FnArg::Typed(input) = input {
+            let ident = match input.pat.as_ref() {
+                syn::Pat::Ident(pat) if pat.subpat.is_none() => pat.ident.clone(),
+                _ => Ident::new(&format!("__salvo_craft_arg_{index}"), Span::call_site()),
+            };
+            input.pat = Box::new(parse_quote!(#ident));
+            arguments.push(ident);
+        }
+    }
+    // The body stays in the service impl. Only the forwarding signature belongs to
+    // the generated handler, where `Self` must still denote the service type.
+    struct ServiceSelf<'a>(&'a Type);
+    impl syn::visit_mut::VisitMut for ServiceSelf<'_> {
+        // Nested items introduce their own scope and cannot capture the service's
+        // Self or impl parameters. Keep their types and expressions untouched.
+        fn visit_item_mut(&mut self, _item: &mut syn::Item) {}
+
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            syn::visit_mut::visit_type_mut(self, ty);
+            if let Type::Path(path) = ty
+                && path.qself.is_none()
+                && path
+                    .path
+                    .segments
+                    .first()
+                    .is_some_and(|segment| segment.ident == "Self")
+            {
+                let service = self.0;
+                let rest: syn::punctuated::Punctuated<syn::PathSegment, Token![::]> =
+                    path.path.segments.iter().skip(1).cloned().collect();
+                *ty = if rest.is_empty() {
+                    parse_quote!(#service)
+                } else {
+                    parse_quote!(<#service>::#rest)
+                };
+            }
+        }
+
+        fn visit_expr_path_mut(&mut self, expression: &mut syn::ExprPath) {
+            syn::visit_mut::visit_expr_path_mut(self, expression);
+            if expression.qself.is_none()
+                && expression.path.segments.len() > 1
+                && expression
+                    .path
+                    .segments
+                    .first()
+                    .is_some_and(|segment| segment.ident == "Self")
+            {
+                let service = self.0;
+                let suffix: syn::punctuated::Punctuated<syn::PathSegment, Token![::]> =
+                    expression.path.segments.iter().skip(1).cloned().collect();
+                let mut replacement: syn::ExprPath = parse_quote!(<#service>::#suffix);
+                replacement.attrs = ::std::mem::take(&mut expression.attrs);
+                *expression = replacement;
+            }
+        }
+    }
+    use syn::visit_mut::VisitMut;
+    ServiceSelf(self_ty).visit_signature_mut(&mut method.sig);
+    let call = match style {
+        FnReceiver::None => quote!(<#self_ty>::#helper_name(#(#arguments),*).await),
+        FnReceiver::Ref => {
+            quote!(self.__salvo_service.as_ref().#helper_name(#(#arguments),*).await)
+        }
+        FnReceiver::Arc if borrowed_arc => {
+            quote!(self.__salvo_service.#helper_name(#(#arguments),*).await)
+        }
+        FnReceiver::Arc => quote!(self.__salvo_service.clone().#helper_name(#(#arguments),*).await),
+    };
+    method.block = parse_quote!({ #call });
+    let mut new_method: ImplItemFn = match style {
         FnReceiver::None => {
             method.attrs.push(macro_attr);
             parse_quote! {
-                #vis fn #method_name() -> impl #handler {
+                #vis fn #method_name() -> impl #handler #factory_where {
 
                     #method
 
@@ -180,27 +388,31 @@ fn rewrite_method(
             // The previous code derived the type arguments from `self_ty`, which is
             // wrong whenever they differ from the impl's parameters (e.g.
             // `impl<T> Foo<Wrapper<T>>` would emit `handle<Wrapper<T>>`).
-            let (impl_g, ty_g, where_c) = impl_generics.split_for_impl();
+            // In the local wrapper, `Self` names the wrapper rather than the service.
+            // Keep predicates from the service impl attached to the service type.
+            let mut handler_generics = impl_generics.clone();
+            if let Some(predicates) = &method.sig.generics.where_clause {
+                handler_generics
+                    .make_where_clause()
+                    .predicates
+                    .extend(predicates.predicates.clone());
+            }
+            ServiceSelf(self_ty).visit_generics_mut(&mut handler_generics);
+            let (impl_g, ty_g, where_c) = handler_generics.split_for_impl();
             parse_quote! {
-                #vis fn #method_name(#receiver) -> impl #handler {
+                #vis fn #method_name(#receiver) -> impl #handler #factory_where {
                     #[allow(non_camel_case_types)]
-                    pub struct handle #impl_g(::std::sync::Arc<#self_ty>) #where_c;
-                    use ::std::ops::Deref;
-                    impl #impl_g Deref for handle #ty_g #where_c {
-                        type Target = #self_ty;
-
-                        fn deref(&self) -> &Self::Target {
-                            &self.0
-                        }
+                    // Named fields avoid introducing a tuple constructor into
+                    // the value namespace of the user's parameter bindings.
+                    struct handle #impl_g #where_c {
+                        __salvo_service: ::std::sync::Arc<#self_ty>,
                     }
-                    #[allow(unused_imports)]
-                    use ::std::ops::Deref as _;
                     #(#forwarded_attrs)*
                     #macro_attr
                     impl #impl_g handle #ty_g #where_c {
                         #method
                     }
-                    handle(#output)
+                    handle { __salvo_service: #output }
                 }
             }
         }
@@ -208,7 +420,7 @@ fn rewrite_method(
     new_method.attrs.append(&mut attrs);
     *method = new_method;
     // println!("{}", method.to_token_stream());
-    Ok(())
+    Ok(Some(helper))
 }
 
 #[cfg(test)]
@@ -270,5 +482,23 @@ mod tests {
             fn my_method(self: Box<Self>) {}
         };
         assert!(FnReceiver::from_method(&method).is_err());
+    }
+}
+
+#[cfg(test)]
+mod conditional_diagnostic_tests {
+    #[test]
+    fn enabled_conditional_receiver_errors_keep_the_original_message() {
+        let input = syn::parse_quote! {
+            impl Service {
+                #[cfg(all())]
+                #[craft(handler)]
+                fn invalid(&mut self) {}
+            }
+        };
+        let generated = super::generate(input).unwrap().to_string();
+        assert!(generated.contains("compile_error"));
+        assert!(generated.contains("method receiver must be"));
+        assert!(generated.contains("cfg (all ())"));
     }
 }

@@ -6,6 +6,439 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-17
+
+### Added
+
+- Expose `PathParams::tail_segments()` and `tail_raw_segments()` so custom
+  wildcard consumers can retain segment boundaries and original encoded spelling.
+
+### Fixed
+
+- Preserve encoded separators inside individual route parameters, including Matrix
+  user IDs, and allow URL colons on Windows. Routing leaves the original request
+  URI unchanged and rejects NUL, literal backslashes, and invalid UTF-8.
+- Preserve wildcard segment boundaries for static resources and proxy forwarding.
+  Static handlers reject embedded separators before resource lookup, and proxies
+  re-encode each segment while retaining their default strict escape checks.
+  Windows filesystem-name restrictions apply to static resources, not API routes.
+- Publish versioned development dependencies before dependent crates so release
+  packaging can resolve the synchronized workspace versions.
+
+## [1.2.0] - 2026-11-17
+
+### Added
+
+- Make regex routing and built-in HTML, JSON, and XML error responses optional
+  through `routing-regex`, `catcher-html`, `catcher-json`, and `catcher-xml`.
+  All remain enabled by default and by `full`; minimal builds retain basic path
+  routing and plain-text errors.
+- Add router-owned extensions, one-shot `Response::after_response_hook` callbacks,
+  and connection-control injection for OpenAPI endpoints.
+- Expose complete TUS configuration through `Tus::with_options`, `options`, and
+  `options_mut`, and complete ACME configuration through `AcmeListener::config`.
+- Allow Unix socket proxy clients to configure the socket independently of the
+  upstream HTTP path and query with `UnixSockClient::with_socket_path`.
+
+### Changed
+
+- Upgrade JWT support to jsonwebtoken 12 and patched RustCrypto dependencies.
+  `ConstDecoder::from_secret`, the re-exported `DecodingKey::from_secret`, and
+  jsonwebtoken's `EncodingKey::from_secret` now return `Result` and reject empty
+  secrets. Handle these results when upgrading, and use jsonwebtoken 12 for
+  direct dependencies so key and crypto-provider types match.
+- Remove the unused `TusOptions::post_receive_interval` field.
+  `lock_drain_timeout` now bounds upload lock acquisition and returns 503 on
+  timeout; it does not shorten an acquired streaming download's lock lifetime.
+- Bound automatic directory listings by scanned entries and encoded output
+  bytes, returning 503 on overflow. Configure budgets with `listing_limits`.
+- Extend runtime comparisons, multipart and streaming compression benchmarks,
+  and downstream macro and schema contract validation.
+- Patch example database dependencies for SQLite, RBatis caching, and PostgreSQL
+  PEM parsing, and update dependency audit evidence and CI actions.
+
+### Fixed
+
+- Allow handler and endpoint names to coexist with parameter and local binding
+  names, including zero-argument functions, raw identifiers, and extractor error
+  bindings. Resolve generated dependency paths for renamed and direct crate use.
+- Preserve conditional compilation, lint and deprecation attributes, borrowed
+  lifetimes, and effective generic bounds in handler and extractor macros.
+- Preserve service `Self`, `Arc<Self>`, explicit receiver lifetimes, method-level
+  where clauses, and associated types and constants in crafted handlers and
+  endpoint metadata, including stateless methods in generic impls.
+- Match request extraction to directional serde renames, aliases, tuple field
+  order, defaults, field sources, and optional flattened values. Try later
+  sources when a body field is absent and propagate invalid header text.
+- Decode documented delimited query and header arrays, including the default
+  comma-separated `HeaderParam` encoding, honor explicit JSON parsers, and
+  diagnose unsupported derived parameter encodings.
+- Keep serialization-skipped request parameters available and conditionally
+  serialized non-optional inputs required; preserve parameter options with
+  `schema_with` and features on explicitly inline parameters.
+- Match generated schemas to serde enum tags, adjacent unit variants,
+  `rename_all_fields`, directional skips, transparent structs, container defaults,
+  and conditional tuple positions. Honor nested public schema attributes on
+  variants and fields, and avoid bounds on skipped or unused generic arguments.
+- Compose actual generic schema types, including aliases and recursive types,
+  without losing field annotations or requiring unrelated `ToSchema` bounds.
+  Preserve object closure, property-count bounds, map key/value constraints,
+  references, and parent properties across flattened and internally tagged schemas.
+- Use `anyOf` for overlapping untagged and nullable alternatives; preserve fixed
+  sequence lengths and heterogeneous tuple positions, serialized JSON map keys,
+  arbitrary JSON values, zero bounds, and negative numeric constraints.
+- Allocate valid, collision-resistant OpenAPI schema and response component names
+  atomically, retain document model values, and disambiguate automatic operation IDs.
+- Fix facade `request_body`, response `links`, and parameter `allow_reserved`
+  expansions; accept URI string schema references and preserve inferred body
+  schemas under description-only overrides. Require only `ToResponse` for
+  reusable responses and reject unsupported multi-field response tuple derives.
+- Resolve endpoint `Self` types and standard HTTP status constants, document
+  wildcard path names and the catcher's `StatusError` body correctly, support
+  unit output metadata, and retain every configured Swagger UI document.
+- Honor explicit deprecation flags, array-level examples, empty example lists,
+  named example precedence, and serialized schema titles.
+- Anchor every regex route alternative while retaining verbose-mode comments,
+  enforce exact character-class widths, and compare `HostFilter` names without
+  case sensitivity.
+- Close connections without a request during graceful shutdown while serving
+  already-arrived HTTP/1 requests. Honor transport protocol selection and QUIC
+  listener addresses, and record ACME TLS negotiation before protocol detection.
+- Report and validate HTTP/3 request body lengths; preserve cached body bytes and
+  framing when proxying inspected payloads and URL-encoded forms. Retain failures
+  after failed or cancelled body reads instead of forwarding an empty body.
+- Preserve raw request cookie names and serialize cookie changes once without
+  overwriting unrelated response metadata. Apply HEAD and bodyless-status rules
+  consistently, including HTTP/3, and negotiate supported catcher formats using
+  Accept quality and exclusion rules.
+- Preserve proxied percent-encoded paths, replace stale upstream representation
+  metadata, validate WebSocket handshakes and Unix socket upgrade selections,
+  and retain upgraded tunnels in the server connection lifecycle.
+- Drop untrusted forwarded client IPs for non-IP peers, recognize IPv4-mapped
+  trusted proxies, and isolate cache key components and conflicting authorities.
+  Keep the default cache skipper limited to GET, including extension methods.
+- Make CORS policies own their response grants, honor compression and static
+  encoding exclusions, remove transformed representation digests, and stop static
+  lookup at the first matching root. Preserve deferred compression errors.
+- Honor JWKS revalidation and zero freshness, expose typed authentication errors,
+  return 401 for failed JWT authentication, and skip blank tokens in finders.
+- Omit query strings from OpenTelemetry spans by default; opt in to selected
+  non-sensitive fields with `Tracing::query_fields`.
+- Run middleware bcrypt CSRF operations on bounded blocking workers while
+  retaining capacity until cancelled work finishes. Defer small-file preloading
+  until conditional and range handling completes and buffer fragmented multipart
+  file writes within a fixed budget.
+- Serve only the committed TUS upload prefix and hold read locks through streamed
+  downloads. Apply configured policies and normalized paths consistently, enforce
+  upload ownership, and generate usable upload locations from trusted connection
+  information.
+- Apply ACME account, solver, storage, on-demand and renewal configuration, and
+  tie certificate maintenance tasks to the listener lifecycle.
+
+## [1.1.2] - 2026-11-10
+
+### Added
+
+- Add validated `__Host-` prefixed CSRF cookie storage.
+- Expose response body production observations and optionally retain concurrency
+  capacity until the response body finishes.
+- Support references in OpenAPI operation request bodies.
+
+### Fixed
+
+- Reject ambiguous request paths before route authorization, including encoded
+  separators and traversal forms.
+- Keep upgraded connections within server lifecycle and capacity limits, and
+  preserve admission progress when accepting connections is cancelled.
+- Isolate generic extractor metadata by flattened child types and preserve user
+  predicates when deriving `Extractible`.
+- Keep OpenAPI header schema and content representations mutually exclusive.
+- Serialize OpenAPI Link fields with standard names while accepting legacy aliases.
+- Isolate origin-form response cache keys by validated Host authority, validate
+  the outer response context before reusing cached headers, and honor request
+  cache bypass directives.
+- Honor an explicit preference for the identity encoding during compression
+  negotiation.
+- Enforce bounded OIDC JWKS freshness and cache validation directives.
+
+### Changed
+
+- Expand cancellation, fuzz, downstream macro, and OpenAPI contract regression
+  coverage, and add Clippy correctness checks.
+- Extend performance benchmarks for caching, static directory roots, streaming
+  compression, rate guards, and runtime and feature costs.
+- Keep performance comparisons working across local crate version bumps while
+  preserving the external dependency lock.
+- Pin CI actions and coverage tooling, retain failure diagnostics and dependency
+  audit evidence, and bound cancellable workflow runs.
+- Require matching package versions and successful quality checks at the exact
+  tagged commit before publishing, and distinguish registry lookup errors from
+  unpublished versions.
+
+## [1.1.1] - 2026-11-06
+
+### Fixed
+
+- Upgrade session storage to saysion 0.4 so session regeneration revokes the
+  previous server-side session ID. MemoryStore isolates stored data from request
+  mutations and rejects stale saves after rotation or logout.
+- Add HTTP regression coverage for login rotation, logout, metadata-only
+  rotation, and concurrent requests attempting to restore revoked sessions.
+
+### Changed
+
+- Update certon to 0.4 and saysion to 0.4. Applications using saysion stores
+  directly must use the same saysion version as salvo-session.
+
+## [1.1.0] - 2026-11-02
+
+### Added
+
+- Run core routing and dispatch Criterion benchmarks in a dedicated workflow,
+  retaining measurements, logs, and environment metadata for review.
+
+- Expose client certificate chains, SNI and ALPN through `Request::tls_info` for
+  Rustls and Rustls-backed HTTP/3 connections, with an mTLS authorization example.
+
+### Changed
+
+- **Breaking:** OpenAPI `Parameters.0` and its owned iterator now contain
+  `RefOr<Parameter>` so path and operation parameter lists can retain references.
+  Existing inline builders still accept `Parameter`; use `Parameters::from(vec)`
+  instead of `Parameters(vec)` for a `Vec<Parameter>`, and match `RefOr` when
+  reading the public list or use `iter_inline` to inspect inline entries.
+
+- **Breaking:** JWT finders now use `Option<Vec<Method>>` for their public
+  `allowed_methods` field: `None` accepts every method, including extensions;
+  `Some(methods)` restricts extraction to that list. Wrap direct field assignments
+  in `Some(...)`. The existing `allowed_methods(Vec<Method>)` builder still works,
+  and an explicit empty list still disables token extraction. Mutable list access
+  turns an unrestricted finder into an explicit list of standard methods.
+
+- **Breaking:** tus `Metadata` values are now `Option<Vec<u8>>` instead of
+  `Option<String>`. Use `Metadata::get_text` for strict UTF-8 access and convert
+  text with `into_bytes` in custom stores and hooks. DiskStore reads previous
+  string records but writes byte arrays, which older versions cannot read.
+
+- Raise the minimum supported Rust version to 1.95 for Salvo and its examples.
+- Check every root workspace target and feature in the Rust 1.95 MSRV CI job.
+
+- Report dependency audit findings as CI warnings without blocking releases,
+  while retaining audit output and the isolated default AWS-LC JWT consumer check.
+
+- Import OpenAPI documents that omit the optional `paths` field, including
+  documents containing only reusable components or incoming webhooks.
+
+### Fixed
+
+- Read and write OpenAPI references in path and operation parameter lists,
+  preserving local and external references and their sibling metadata.
+
+- Keep OpenAPI parameter `schema` and `content` mutually exclusive when merging
+  documents or using parameter builders. Incoming content replaces the complete
+  media-type map instead of accumulating multiple representations.
+
+- Combine every OIDC JWKS Cache-Control field before parsing, so later cache
+  directives such as `stale-if-error=0` also constrain cached key use.
+
+- Stop sending HTTP/3 responses at the first header, data, trailer, or body
+  error, reset the affected stream, and promptly release its response body.
+  Preserve the connection when a rejected WebTransport CONNECT response fails.
+
+- Generate buffered response ETags from the ordered response bytes, regardless of
+  chunk boundaries, preventing incorrect `304 Not Modified` responses for distinct
+  bodies. Single-buffer ETags and explicitly supplied response ETags are preserved.
+
+- Parse `i128` and `u128` request parameters, including full-width values,
+  lists and optional values, rather than returning an unsupported-type error.
+
+- Group repeated request headers when deserializing a complete header struct,
+  preserving ordered sequence values and first-value scalar behavior.
+
+- Base HTTPS redirects and server request schemes on the listener's transport,
+  preventing absolute-form URI spoofing and TLS redirect loops without URI fixing.
+
+- Preserve response bytes and representation headers when a request or response
+  carries `Cache-Control: no-transform`, including through compression-wrapped proxies.
+
+- Audit dependencies before publishing any crate and document the unresolved
+  RustCrypto JWT advisory in the dependency security policy.
+
+- Cancel HTTP/3 request tasks when their connection closes or the server stops
+  forcefully, while allowing accepted requests to finish on graceful shutdown.
+- Cancel accepted connection tasks when the server's serving future is dropped,
+  including pending handlers and idle keep-alive connections, while preserving
+  graceful draining through `ServerHandle`.
+- Resolve HTTP/3 request headers independently for peers that do not negotiate
+  WebTransport, so incomplete headers do not block sibling HTTP requests.
+  Preserve sequential acceptance for WebTransport's early stream handoff.
+
+- Preserve outer request extensions across direct Tower service calls, including
+  failures and cancellation.
+- Keep static directory slash redirects on the same origin for paths beginning
+  with multiple separators, including after filesystem path normalization.
+- Require OIDC discovery metadata to contain the exact configured issuer, and
+  exclude JWKs whose declared use or key operations do not permit verification.
+- Parse OIDC JWKS cache directives with quoted-value boundaries and
+  case-insensitive names, so extension arguments cannot extend key lifetimes.
+- Make the default JWT header finder use the same methods and Authorization
+  header as `HeaderFinder::new`, instead of silently rejecting every token.
+- Use only `Authorization` for Basic authentication by default, keeping proxy
+  credentials out of origin authentication. Applications that intentionally
+  accept `Proxy-Authorization` can opt in with `BasicAuth::set_header_names`.
+- Apply flash message minimum levels when reading incoming messages as well as
+  saving outgoing messages, including when routes use different level policies.
+
+- Exclude request query strings and client error URL contents from proxy failure
+  logs while retaining the request method, path, and error type.
+- Accept upstream protocol selections from multi-value `Upgrade` offers,
+  including repeated header fields, while rejecting unoffered protocols or versions.
+- Reject non-GET WebSocket handshakes before switching protocols, including when
+  the upgrade handler is installed on a route that matches every method.
+
+- Report RustSec `unsound` advisories as well as vulnerability advisories,
+  with an offline regression for the advisory-only audit policy.
+
+- Use the same explicit crypto provider for Rustls client certificate verification
+  and server configuration, avoiding ambiguous provider selection with mTLS.
+- Restore built-in ACME HTTP-01 and TLS-ALPN-01 challenge presentation, serve
+  initial TLS validation on the bound listener, and cache newly issued certificates.
+  Remove temporary challenges after issuance errors or cancellation. HTTP-01
+  examples now start the challenge route before awaiting initial TLS binding.
+- Reject `QueryString` in `ToParameters` derives instead of producing an invalid
+  schema and extracting a named query parameter. Use `Query` for named values
+  or construct a whole-query parameter with `content` manually.
+- Preserve large floating-point OpenAPI constraints when their values fall
+  outside the integer serialization range.
+- Read back typeless OpenAPI schemas and preserve typed composition variants
+  instead of rejecting generated documents or treating compositions as objects.
+- Preserve JSON Schema constraints and other fields alongside `$ref` when
+  reading OpenAPI schemas, instead of silently dropping reference siblings.
+- Apply method-aware preconditions to ReadSeeker responses: ignore Range outside
+  GET, ignore If-Modified-Since outside GET/HEAD, and return 412 for a matching
+  If-None-Match on other methods.
+- Bypass response caching and concurrent fill coalescing for conditional requests
+  so origin handlers retain their precondition and conditional download behavior.
+- Read all repeated `X-Forwarded-For` fields as one right-to-left chain in
+  `TrustedProxyIssuer`, and stop at malformed hops so client-supplied prefixes
+  cannot create fresh rate-limit identities behind a trusted proxy.
+- Validate CSRF tokens for every unsafe HTTP method by default, including CONNECT
+  and extension methods, while preserving explicit skipper overrides.
+- Return HTTP 500 when saving a new or rotated CSRF token fails, instead of
+  exposing an unsaved token and executing the application handler.
+- Clean up interrupted multipart uploads and keep temporary files alive until
+  the last `FilePart` clone is released.
+- Retain temporary uploads in owned `FormFile` and `FormFiles` extractors until
+  their last owner is dropped, so files remain readable after the request ends.
+- Bound multipart parsing to 128 parts and 32 files by default, rejecting count
+  overflows with HTTP 413 before creating additional temporary files. Configure
+  larger or smaller route-specific limits with `FormLimits` middleware or
+  `Request::set_form_limits`; byte limits continue to apply independently.
+- Preserve multipart parsing failures in `FormFile` and `FormFiles` extractors,
+  returning HTTP 413 for upload byte or count limits instead of HTTP 400.
+- Roll back failed tus writes and discard uncommitted file tails before retrying.
+- Accept case-insensitive tus upload media types and surrounding HTTP whitespace
+  in creation-with-upload and PATCH requests.
+- Preserve binary tus upload metadata and explicit empty values through parsing,
+  storage reopening, and HEAD responses; ignore non-UTF-8 filename/filetype hints.
+- Preserve byte ranges by skipping dynamic compression for partial responses.
+- Inherit ancestor HTTP method constraints when generating OpenAPI operations,
+  excluding routes whose method constraints conflict.
+- Exclude pending cookie jar changes and partial responses from response caching,
+  and bypass cached representations for range requests.
+- Parse response cache directives as raw bytes with quoted-value boundaries,
+  so opaque extensions cannot hide private/no-store/no-cache and quoted text
+  cannot manufacture directives.
+- Forward parameter names through optional extractors and reject missing required
+  header, query and cookie values before constructing their wrappers.
+- Decode escaped JSON object member names in derived request extractors while
+  retaining borrowed values and support for field renames and aliases.
+
+- Refresh query, payload, form and cookie caches after Tower request rewrites,
+  while preserving consumed-body caches and application cookie edits during pass-through.
+- Preserve bracketed query-list tokens around whitespace and opposite quote
+  characters instead of rejecting numbers or silently corrupting string values.
+- Read explicit empty bracketed query and header lists as empty typed collections, while
+  preserving scalar strings and repeated-parameter values containing `[]`.
+- Honor ETag precedence, lists and wildcards in conditional responses, while
+  preserving write responses and non-200 statuses.
+- Preserve response trailers during compression and offload compression flushing
+  and finalization together with expensive writes.
+- Compress boxed and channel response bodies with the same streaming negotiation,
+  trailer forwarding, error handling and cancellation as other supported bodies.
+- Cancel queued compression tasks when their response body is dropped instead of
+  continuing work for disconnected clients.
+- Compare wildcard and explicitly listed Accept-Encoding quality values when
+  selecting compression with client preference enabled.
+- Validate tus creation requests before allocating storage, remove uploads after
+  creation-time stream failures, and pass final storage metadata to completion hooks.
+- Omit unsupported TUS concatenation from advertised capabilities and reject
+  partial or final creation requests even when a custom store declares it.
+- Merge multipart form and file schemas instead of overwriting earlier endpoint
+  parameters, preserving required fields and form constraints.
+- Generate `Allow` for automatic 405 responses from complete built-in route matches,
+  without replaying custom callbacks or overriding middleware response policies.
+  When opaque filters prevent safely inferring any supported method, routing defaults
+  to 404; service middleware can provide its own 405 status and `Allow` header.
+- Honor TUS method overrides during endpoint selection, before access-control
+  hoops and lifecycle hooks run, and reject malformed override headers.
+- Reject malformed CSRF bcrypt proofs and costs that differ from the configured cost before
+  verification, require bcrypt 0.19.2 or newer, and omit CSRF cipher keys from debug output.
+- Reissue invalid session-backed CSRF proofs on safe requests after cipher key
+  or token-size changes, instead of indefinitely reusing unusable tokens.
+- Replace all depot JWT authentication results on each attempt so missing or
+  rejected credentials cannot retain another middleware instance's claims/token,
+  and successful authentication cannot retain an earlier error.
+
+- Honor explicit OIDC JWT algorithm allowlists and share a one-second JWKS refresh cooldown
+  across decoder clones, including failed refreshes and unknown key identifiers.
+- Preserve consecutive path filters on the same router when generating OpenAPI paths.
+- Honor `If-Range` validators in file responses, returning the full representation
+  when a resumable download refers to a different version.
+- Accept case-insensitive byte range units and ignore unknown range units in
+  file, reader and embedded responses, while retaining byte-range error handling.
+- Advertise the stored gzip coding of embedded `.svgz` and compressed X3D
+  assets, including assets selected as directory defaults or fallbacks.
+- Keep file content codings off generated precondition and range error pages,
+  while preserving them for successful and not-modified file responses.
+
+- Enforce strong `If-Match` preconditions for embedded assets before cache and range handling.
+- Restore path cursors, captured parameters and matched path templates after failed
+  composite filters, so alternative routes start from the original matching state.
+  Routing tests also compile when `matched-path` is disabled.
+- Omit query strings from core warnings about empty successful responses.
+- Enable only the requested `salvo_extra` middleware features through `salvo`,
+  avoiding unrelated WebSocket, Tower and request-ID dependencies for logging-only builds.
+- Declare the Hyper dependency directly for standalone `tower-compat` builds.
+- Recover request, depot and flow state when Tower layers short-circuit, fail or
+  cancel their inner future, preserving HEAD handling and prepared response policy headers.
+- Invoke tus upload completion hooks when PATCH finishes an upload, sharing
+  response customization and error handling with creation-time completion.
+- Preserve repeated response fields from tus completion hooks, including all
+  `Set-Cookie` values, without overriding fields already set on the response.
+- Apply TUS upload expiration only to unfinished resources, preserving completed
+  uploads when their original upload timeout passes.
+- Keep completed tus upload IDs reserved after payload renaming, preventing
+  duplicate custom IDs from replacing existing upload metadata and download URLs.
+
+- Preserve existing tus metadata if replacing its temporary file fails on Windows.
+- Keep graceful server shutdown responsive to force-stop commands and release active
+  connection accounting when a connection task panics or is cancelled.
+- Enforce armed transport write-stall deadlines before accepting late scalar
+  or vectored writes, while preserving relaxed upgraded connections.
+- Complete the Tokio and futures `AsyncWrite` shutdown operations on channel-backed
+  response bodies without requiring the sender to be dropped.
+- Retain in-memory rate-limit guards until their reset time when idle expiration
+  would otherwise discard an active quota. Capacity eviction and restarts remain
+  best-effort limits of the in-memory store.
+- Honor `Logger::log_status_error(false)` when recording response error details,
+  and align `Logger::default()` with `Logger::new()`.
+- Log finalized response statuses after Service media checks and catchers while retaining error diagnostics.
+- Match `Accept-Encoding` content codings and the `q` parameter case-insensitively, so
+  `gzip;Q=0` and `GZIP;q=0` reject gzip in compression and precompressed static file selection.
+- Preserve leading spaces in Server-Sent Event data, event names, and IDs after
+  standard EventSource parsing.
+
 ## [1.0.1] - 2026-10-05
 
 ### Fixed

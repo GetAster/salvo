@@ -6,23 +6,50 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Operation, Operations, Parameter, Parameters, PathMap, PropMap, Server, Servers};
+use super::{
+    Operation, Operations, Parameter, Parameters, PathMap, PropMap, RefOr, Server, Servers,
+};
 
 /// Implements [OpenAPI Path Object][paths] types.
 ///
 /// [paths]: https://spec.openapis.org/oas/latest.html#paths-object
-#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
-pub struct Paths(PathMap<String, PathItem>);
+#[derive(Serialize, Default, Clone, PartialEq, Debug)]
+pub struct Paths {
+    #[serde(flatten)]
+    paths: PathMap<String, PathItem>,
+    /// Optional specification extensions (`x-something`).
+    #[serde(default, skip_serializing_if = "PropMap::is_empty", flatten)]
+    pub extensions: PropMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for Paths {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = PathMap::<String, serde_json::Value>::deserialize(deserializer)?;
+        let mut result = Self::new();
+        for (name, value) in raw {
+            if name.starts_with("x-") {
+                result.extensions.insert(name, value);
+            } else {
+                let item = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                result.paths.insert(name, item);
+            }
+        }
+        Ok(result)
+    }
+}
 impl Deref for Paths {
     type Target = PathMap<String, PathItem>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.paths
     }
 }
 impl DerefMut for Paths {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.paths
     }
 }
 impl Paths {
@@ -38,27 +65,14 @@ impl Paths {
         self
     }
     /// Inserts a key-value pair into the instance.
+    ///
+    /// Existing paths are merged using [`PathItem::append`], including extensions.
     pub fn insert<K: Into<String>, V: Into<PathItem>>(&mut self, key: K, value: V) {
         let key = key.into();
         let mut value = value.into();
-        self.0
+        self.paths
             .entry(key)
-            .and_modify(|item| {
-                if value.ref_location.is_some() {
-                    item.ref_location = value.ref_location.take();
-                }
-                if value.summary.is_some() {
-                    item.summary = value.summary.take();
-                }
-                if value.description.is_some() {
-                    item.description = value.description.take();
-                }
-                item.servers.append(&mut value.servers);
-                item.parameters.append(&mut value.parameters);
-                item.operations.append(&mut value.operations);
-                item.additional_operations
-                    .append(&mut value.additional_operations);
-            })
+            .and_modify(|item| item.append(&mut value))
             .or_insert(value);
     }
     /// Moves all elements from `other` into `self`, leaving `other` empty.
@@ -68,9 +82,12 @@ impl Paths {
     /// and `operations` are appended, while the scalar fields (`ref_location`,
     /// `summary`, `description`) are overwritten by `other`'s non-empty values.
     pub fn append(&mut self, other: &mut Self) {
-        let items = std::mem::take(&mut other.0);
+        let items = std::mem::take(&mut other.paths);
         for item in items {
             self.insert(item.0, item.1);
+        }
+        for (name, value) in std::mem::take(&mut other.extensions) {
+            self.extensions.entry(name).or_insert(value);
         }
     }
     /// Extends a collection with the contents of an iterator.
@@ -232,6 +249,7 @@ impl PathItem {
     ///
     /// If a key from `other` is already present in `self`, the respective
     /// value from `self` will be overwritten with the respective value from `other`.
+    /// Extensions keep the existing value on a name collision.
     pub fn append(&mut self, other: &mut Self) {
         self.operations.append(&mut other.operations);
         self.additional_operations
@@ -309,10 +327,15 @@ impl PathItem {
         self
     }
 
-    /// Append list of [`Parameter`]s common to all [`Operation`]s to this [`PathItem`].
+    /// Set the inline parameters or references common to all operations in this path.
     #[must_use]
-    pub fn parameters<I: IntoIterator<Item = Parameter>>(mut self, parameters: I) -> Self {
-        self.parameters = Parameters(parameters.into_iter().collect());
+    pub fn parameters<I, P>(mut self, parameters: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<RefOr<Parameter>>,
+    {
+        self.parameters = Parameters::new();
+        self.parameters.extend(parameters);
         self
     }
 

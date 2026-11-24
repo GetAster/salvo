@@ -12,6 +12,22 @@
 //! [`Handler`] will be skipped. You can also manually adjust `ctrl.skip_rest()` to skip subsequent
 //! middleware and [`Handler`].
 //!
+//! # Request path normalization
+//!
+//! Dot segments (`.` and `..`), including percent-encoded forms, are normalized
+//! before route matching, without rewriting the request URI. Only literal `/`
+//! characters separate segments. Parameters are decoded once, so `%2F` remains
+//! data inside one parameter. This supports identifiers such as Matrix user IDs.
+//! Routing has the same semantics on all operating systems; filesystem filename
+//! restrictions belong to resource handlers. Literal backslashes, NUL bytes and
+//! invalid UTF-8 are rejected with `400 Bad Request`.
+//!
+//! Wildcard consumers must retain these boundaries: use [`PathParams::tail_segments`]
+//! rather than splitting its decoded [`PathParams::tail`] string again. Static
+//! resources reject separators inside a decoded segment. Proxies re-encode each
+//! segment separately and reject ambiguous escapes by default. Use the original
+//! request path and query, not reconstructed parameters, for signature verification.
+//!
 //! # Write in flat way
 //!
 //! We can write routers in flat way, like this:
@@ -169,7 +185,8 @@
 //! semantics more clear, for example: `{**file_path}`.
 //!
 //! It is allowed to combine multiple expressions to match the same path segment,
-//! such as `/articles/article_{id:num}/`, `/images/{name}.{ext}`.
+//! such as `/articles/article_{id|\d+}/`, `/images/{name}.{ext}`. A character class such as
+//! `{id:num}` has to be a whole segment; use a regular expression inside a combined one.
 //!
 //! # Add middlewares
 //!
@@ -368,6 +385,8 @@
 //!
 //! ## Custom Wisp
 //!
+//! Regex examples in this section require the `routing-regex` feature.
+//!
 //! For some frequently-occurring matching expressions, we can name a short name by
 //! `PathFilter::register_wisp_regex` or `PathFilter::register_wisp_builder`. For example, GUID
 //! format is often used in paths appears, normally written like this every time a match is
@@ -392,11 +411,14 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
+//! #   #[cfg(feature = "routing-regex")]
+//! #   {
 //!     let guid = regex::Regex::new("[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}").unwrap();
 //!     PathFilter::register_wisp_regex("guid", guid);
 //!     Router::new()
 //!         .push(Router::with_path("/articles/{id:guid}").get(show_article))
 //!         .push(Router::with_path("/users/{id:guid}").get(show_user));
+//! #   }
 //! }
 //! ```
 //!
@@ -486,23 +508,18 @@ pub fn encode_url_path(path: &str) -> String {
 
 #[doc(hidden)]
 #[must_use]
+/// Normalizes literal URL separators and dot segments without filesystem rules.
+/// This is not a filesystem path sanitizer; validate decoded segments before joining them.
 pub fn normalize_url_path(path: &str) -> String {
     let final_slash = if path.ends_with('/') { "/" } else { "" };
     let mut used_parts = Vec::with_capacity(8);
-    for part in path.split(['/', '\\']) {
-        // Skip empty parts, current directory references, and parts with drive letters
-        if part.is_empty() || part == "." || (cfg!(windows) && part.contains(':')) {
-            continue;
-        }
-        // Skip parts containing null bytes (security risk)
-        if part.contains('\0') {
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
             continue;
         }
         // Handle parent directory references
         if part == ".." {
             used_parts.pop();
-        } else if cfg!(windows) && is_windows_reserved_name(part) {
-            // Skip Windows reserved device names
         } else {
             used_parts.push(part);
         }
@@ -523,6 +540,12 @@ pub fn redirect_to_dir_url(req_uri: &Uri, res: &mut Response) {
     } else {
         format!("{path}/")
     };
+    // Browsers treat // and /\ as authority prefixes in a relative Location.
+    // A dot segment preserves the path after URL resolution while keeping the
+    // redirect on the current origin, even when URI fixing supplied an authority.
+    if redirect_uri.starts_with("//") || redirect_uri.starts_with("/\\") {
+        redirect_uri.insert_str(0, "/.");
+    }
     if let Some(query) = path_and_query.query() {
         redirect_uri.push('?');
         redirect_uri.push_str(query);
@@ -530,36 +553,12 @@ pub fn redirect_to_dir_url(req_uri: &Uri, res: &mut Response) {
     res.render(crate::writing::Redirect::found(redirect_uri));
 }
 
-/// Check if a path component is a Windows reserved device name.
-/// These names are reserved regardless of extension (e.g., "CON.txt" is also reserved).
-fn is_windows_reserved_name(name: &str) -> bool {
-    // Get the base name without extension
-    let base = name.split('.').next().unwrap_or(name);
-    let is_numbered_device = match base.as_bytes() {
-        [first, second, third, digit] => {
-            let prefix = [
-                first.to_ascii_uppercase(),
-                second.to_ascii_uppercase(),
-                third.to_ascii_uppercase(),
-            ];
-            (prefix == *b"COM" || prefix == *b"LPT") && digit.is_ascii_digit() && *digit != b'0'
-        }
-        _ => false,
-    };
-
-    base.eq_ignore_ascii_case("CON")
-        || base.eq_ignore_ascii_case("PRN")
-        || base.eq_ignore_ascii_case("AUX")
-        || base.eq_ignore_ascii_case("NUL")
-        || is_numbered_device
-}
-
 #[cfg(test)]
 mod tests {
     use crate::http::header::LOCATION;
     use crate::http::uri::Uri;
     use crate::prelude::*;
-    use crate::routing::{decode_url_path, is_windows_reserved_name, normalize_url_path};
+    use crate::routing::{decode_url_path, normalize_url_path};
     use crate::test::{ResponseExt, TestClient};
 
     #[tokio::test]
@@ -586,14 +585,13 @@ mod tests {
                 .unwrap()
         }
 
-        assert!(
-            access(&service, "127.0.0.1")
-                .await
-                .contains("404: Not Found")
-        );
+        let mut response = TestClient::get("http://127.0.0.1/").send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+        assert!(response.take_string().await.unwrap().contains("Not Found"));
         assert_eq!(access(&service, "localhost").await, "Hello World");
     }
 
+    #[cfg(feature = "matched-path")]
     #[tokio::test]
     async fn test_matched_path() {
         #[handler]
@@ -688,8 +686,8 @@ mod tests {
         assert_eq!(normalize_url_path("a/./b"), "a/b");
 
         // Backslash handling
-        assert_eq!(normalize_url_path("a\\b\\c"), "a/b/c");
-        assert_eq!(normalize_url_path("a\\..\\b"), "b");
+        assert_eq!(normalize_url_path("a\\b\\c"), "a\\b\\c");
+        assert_eq!(normalize_url_path("a\\..\\b"), "a\\..\\b");
 
         // Empty parts
         assert_eq!(normalize_url_path("a//b"), "a/b");
@@ -707,52 +705,45 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
-    fn test_normalize_url_path_windows() {
-        // Windows drive letters
-        assert_eq!(normalize_url_path("C:/Windows"), "Windows");
-        assert_eq!(normalize_url_path("a/C:/b"), "a/b");
-
-        // Windows reserved device names
-        assert_eq!(normalize_url_path("CON"), "");
-        assert_eq!(normalize_url_path("a/CON/b"), "a/b");
-        assert_eq!(normalize_url_path("a/con.txt/b"), "a/b");
-        assert_eq!(normalize_url_path("PRN"), "");
-        assert_eq!(normalize_url_path("AUX"), "");
-        assert_eq!(normalize_url_path("NUL"), "");
-        assert_eq!(normalize_url_path("COM1"), "");
-        assert_eq!(normalize_url_path("LPT1"), "");
-
-        let cyrillic = "\u{0413}\u{0413}";
-        assert_eq!(normalize_url_path(cyrillic), cyrillic);
-        assert_eq!(
-            normalize_url_path("a/\u{0413}\u{0413}/b"),
-            "a/\u{0413}\u{0413}/b"
-        );
+    fn directory_redirect_keeps_ambiguous_paths_on_the_same_origin() {
+        for (path, expected) in [
+            (
+                "//evil.example/assets",
+                "/.//evil.example/assets/?token=example",
+            ),
+            (
+                "///evil.example/assets",
+                "/.///evil.example/assets/?token=example",
+            ),
+            (
+                "/\\evil.example/assets",
+                "/./%5Cevil.example/assets/?token=example",
+            ),
+        ] {
+            for prefix in ["", "http://trusted.example"] {
+                let uri: Uri = format!("{prefix}{path}?token=example").parse().unwrap();
+                let mut res = Response::new();
+                super::redirect_to_dir_url(&uri, &mut res);
+                assert_eq!(res.headers()[LOCATION], expected);
+            }
+        }
     }
 
     #[test]
-    fn test_is_windows_reserved_name() {
-        // Test reserved names
-        assert!(is_windows_reserved_name("CON"));
-        assert!(is_windows_reserved_name("con"));
-        assert!(is_windows_reserved_name("Con"));
-        assert!(is_windows_reserved_name("CON.txt"));
-        assert!(is_windows_reserved_name("PRN"));
-        assert!(is_windows_reserved_name("AUX"));
-        assert!(is_windows_reserved_name("NUL"));
-        assert!(is_windows_reserved_name("COM1"));
-        assert!(is_windows_reserved_name("COM9"));
-        assert!(is_windows_reserved_name("LPT1"));
-        assert!(is_windows_reserved_name("LPT9"));
-
-        // Test non-reserved names
-        assert!(!is_windows_reserved_name("file.txt"));
-        assert!(!is_windows_reserved_name("CONSOLE"));
-        assert!(!is_windows_reserved_name("COM10"));
-        assert!(!is_windows_reserved_name("LPT10"));
-        assert!(!is_windows_reserved_name("\u{0413}\u{0413}"));
-        assert!(!is_windows_reserved_name("\u{1F600}"));
-        assert!(!is_windows_reserved_name(""));
+    fn url_normalization_is_independent_of_filesystem_names() {
+        for path in [
+            "C:/Windows",
+            "a/C:/b",
+            "CON",
+            "a/CON/b",
+            "a/con.txt/b",
+            "PRN",
+            "AUX",
+            "NUL",
+            "COM1",
+            "LPT1",
+        ] {
+            assert_eq!(normalize_url_path(path), path);
+        }
     }
 }

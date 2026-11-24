@@ -1,43 +1,67 @@
 name: Release
 
 permissions:
-  contents: write
+  contents: read
 
 on:
   push:
     tags:
       - "v*.*.*"
 
-env:
-  CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   publish:
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Verify tag versions and quality at the exact commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/release_preflight.py
+          --tag '${{ github.ref_name }}' --sha '${{ github.sha }}' --repo '${{ github.repository }}'
+
+      - uses: taiki-e/install-action@28bfb437c78d9b7ea8650351357e3eb8c0be2672 # cargo-audit
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies before publishing (warnings only)
+        run: |
+          cargo generate-lockfile
+          python3 .github/scripts/audit_lockfile.py --file Cargo.lock
 
       - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
 
+          # Packaging also resolves versioned development dependencies.
           crates=(
             "salvo-serde-util:crates/serde-util"
             "salvo_macros:crates/macros"
             "salvo_core:crates/core"
             "salvo_extra:crates/extra"
-            "salvo-proxy:crates/proxy"
             "salvo-compression:crates/compression"
             "salvo-jwt-auth:crates/jwt-auth"
             "salvo-session:crates/session"
             "salvo-flash:crates/flash"
             "salvo-cors:crates/cors"
             "salvo-csrf:crates/csrf"
+            "salvo-proxy:crates/proxy"
             "salvo-cache:crates/cache"
             "salvo-rate-limiter:crates/rate-limiter"
             "salvo-serve-static:crates/serve-static"
@@ -51,36 +75,8 @@ jobs:
             "salvo:crates/salvo"
           )
 
-          crate_index_path() {
-            local crate="${1,,}"
-
-            case "${#crate}" in
-              1)
-                printf '1/%s\n' "$crate"
-                ;;
-              2)
-                printf '2/%s\n' "$crate"
-                ;;
-              3)
-                printf '3/%s/%s\n' "${crate:0:1}" "$crate"
-                ;;
-              *)
-                printf '%s/%s/%s\n' "${crate:0:2}" "${crate:2:2}" "$crate"
-                ;;
-            esac
-          }
-
           crate_is_published() {
-            local crate="$1"
-            local version="$2"
-            local index_path
-
-            index_path="$(crate_index_path "$crate")"
-            curl --silent --show-error --fail --location \
-              --header "Accept: text/plain" \
-              --header "User-Agent: salvo-release-ci" \
-              "https://index.crates.io/${index_path}" \
-              | grep --fixed-strings --quiet "\"vers\":\"${version}\""
+            python3 .github/scripts/check_published.py "$1" "$2"
           }
 
           wait_for_crate() {
@@ -91,6 +87,11 @@ jobs:
               if crate_is_published "$crate" "$version"; then
                 echo "${crate} ${version} is visible in the crates.io index"
                 return 0
+              else
+                status=$?
+                if [[ "$status" -ne 1 ]]; then
+                  echo "Index check failed; retrying without treating it as absence" >&2
+                fi
               fi
 
               echo "Waiting for ${crate} ${version} to become visible in the crates.io index (attempt ${attempt}/30)"
@@ -140,6 +141,12 @@ jobs:
             if crate_is_published "$crate" "$version"; then
               echo "${crate} ${version} already published, skipping"
               return 0
+            else
+              status=$?
+              if [[ "$status" -ne 1 ]]; then
+                echo "Cannot determine whether ${crate} ${version} is published" >&2
+                return "$status"
+              fi
             fi
 
             cargo publish --locked --dry-run --manifest-path "${path}/Cargo.toml"
@@ -154,13 +161,16 @@ jobs:
           done
 
   release:
+    permissions:
+      contents: write
     needs: publish
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           generate_release_notes: true

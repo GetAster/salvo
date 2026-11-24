@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::filters::{self, FnFilter, PathFilter};
 use super::{DetectMatched, Filter, FilterInfo, PathState};
 use crate::handler::{Handler, WhenHoop};
+use crate::http::Method;
 use crate::http::uri::Scheme;
 use crate::{Depot, Request};
 
@@ -23,6 +24,7 @@ pub struct Router {
     pub hoops: Vec<Arc<dyn Handler>>,
     /// The final handler to handle request of current router.
     pub goal: Option<Arc<dyn Handler>>,
+    extensions: http::Extensions,
 }
 
 struct DetectFrame<'a> {
@@ -74,7 +76,23 @@ impl Router {
             filters: Vec::new(),
             hoops: Vec::new(),
             goal: None,
+            extensions: http::Extensions::new(),
         }
+    }
+
+    /// Metadata owned by this router, released when the router is dropped.
+    ///
+    /// Router extensions are for construction and introspection. They are not
+    /// copied into request extensions or consulted while routing requests.
+    #[inline]
+    pub fn extensions(&self) -> &http::Extensions {
+        &self.extensions
+    }
+
+    /// Mutable construction and introspection metadata owned by this router.
+    #[inline]
+    pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+        &mut self.extensions
     }
 
     /// Get current router's children reference.
@@ -119,7 +137,146 @@ impl Router {
         req: &mut Request,
         path_state: &mut PathState<'_>,
     ) -> Option<DetectMatched> {
-        if !self.filters_match(req, path_state).await {
+        if !path_state.is_valid_path() {
+            return None;
+        }
+        self.detect_with_method(req, path_state, None).await
+    }
+
+    /// Discover only methods whose complete route can be checked without
+    /// executing application-defined filters or changing the request method.
+    pub(crate) async fn allowed_methods(&self, req: &mut Request, path: &str) -> Vec<Method> {
+        if let Some(methods) = self.allowed_methods_single_pass(req, path).await {
+            return methods;
+        }
+        self.allowed_methods_by_probe(req, path).await
+    }
+
+    // Independent built-in filters can share one path traversal. Composite and
+    // application-defined filters retain the original per-method probe semantics.
+    async fn allowed_methods_single_pass(
+        &self,
+        req: &mut Request,
+        path: &str,
+    ) -> Option<Vec<Method>> {
+        let mut path_state = PathState::from_borrowed_path(path);
+        let mut method = None;
+        if !self
+            .probe_independent_filters(req, &mut path_state, &mut method)
+            .await?
+        {
+            return Some(Vec::new());
+        }
+        let mut stack = vec![(DetectFrame::new(self, &path_state), method)];
+        let mut allowed = Vec::new();
+        loop {
+            let (frame, method) = stack.last_mut()?;
+            if frame.next_child < frame.router.routers.len() {
+                let child = &frame.router.routers[frame.next_child];
+                frame.next_child += 1;
+                let mut child_method = method.clone();
+                if child
+                    .probe_independent_filters(req, &mut path_state, &mut child_method)
+                    .await?
+                {
+                    stack.push((DetectFrame::new(child, &path_state), child_method));
+                } else {
+                    stack.last()?.0.rollback(&mut path_state);
+                }
+                continue;
+            }
+            if path_state.is_ended() && frame.router.goal.is_some() {
+                // An unconstrained goal historically accepts every method found
+                // elsewhere in the tree. Let the general probe preserve this.
+                allowed.push(method.clone()?);
+            }
+            stack.pop();
+            if let Some((parent, _)) = stack.last() {
+                parent.rollback(&mut path_state);
+            } else {
+                allowed.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                allowed.dedup();
+                return Some(allowed);
+            }
+        }
+    }
+
+    async fn probe_independent_filters(
+        &self,
+        req: &mut Request,
+        path_state: &mut PathState<'_>,
+        method: &mut Option<Method>,
+    ) -> Option<bool> {
+        use std::any::TypeId;
+
+        use super::filters::{HostFilter, MethodFilter, PortFilter, SchemeFilter};
+
+        for filter in &self.filters {
+            let kind = filter.type_id();
+            if kind == TypeId::of::<MethodFilter>() {
+                let FilterInfo::Method(candidate) = filter.info() else {
+                    return None;
+                };
+                if method.as_ref().is_some_and(|method| method != candidate) {
+                    return Some(false);
+                }
+                *method = Some(candidate);
+            } else if kind == TypeId::of::<PathFilter>()
+                || kind == TypeId::of::<HostFilter>()
+                || kind == TypeId::of::<PortFilter>()
+                || kind == TypeId::of::<SchemeFilter>()
+            {
+                // These built-ins ignore the hypothetical method. A path with
+                // an opaque character checker returns None without invoking it.
+                if filter
+                    .filter_for_method(req, path_state, &Method::GET)
+                    .await
+                    != Some(true)
+                {
+                    return Some(false);
+                }
+            } else {
+                return None;
+            }
+        }
+        Some(true)
+    }
+
+    async fn allowed_methods_by_probe(&self, req: &mut Request, path: &str) -> Vec<Method> {
+        let mut methods = Vec::new();
+        let mut routers = vec![self];
+        while let Some(router) = routers.pop() {
+            for filter in &router.filters {
+                filter.collect_methods(&mut methods);
+            }
+            routers.extend(&router.routers);
+        }
+        methods.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        methods.dedup();
+
+        // Normal detection keeps its original path even if a failed application
+        // filter rewrites the request URI. Method probes must use that same path.
+        let mut allowed = Vec::new();
+        for method in methods {
+            let mut state = PathState::from_borrowed_path(path);
+            if self
+                .detect_with_method(req, &mut state, Some(&method))
+                .await
+                .is_some()
+            {
+                allowed.push(method);
+            }
+        }
+        allowed
+    }
+
+    async fn detect_with_method(
+        &self,
+        req: &mut Request,
+        path_state: &mut PathState<'_>,
+        method: Option<&Method>,
+    ) -> Option<DetectMatched> {
+        if !self.filters_match(req, path_state, method).await {
             return None;
         }
 
@@ -139,7 +296,7 @@ impl Router {
             };
 
             if let Some(child) = child {
-                if child.filters_match(req, path_state).await {
+                if child.filters_match(req, path_state, method).await {
                     stack.push(DetectFrame::new(child, path_state));
                 } else {
                     stack
@@ -169,9 +326,19 @@ impl Router {
         }
     }
 
-    async fn filters_match(&self, req: &mut Request, path_state: &mut PathState<'_>) -> bool {
+    async fn filters_match(
+        &self,
+        req: &mut Request,
+        path_state: &mut PathState<'_>,
+        method: Option<&Method>,
+    ) -> bool {
         for filter in &self.filters {
-            if !filter.filter(req, path_state).await {
+            let matched = if let Some(method) = method {
+                filter.filter_for_method(req, path_state, method).await == Some(true)
+            } else {
+                filter.filter(req, path_state).await
+            };
+            if !matched {
                 return false;
             }
         }
@@ -575,6 +742,106 @@ mod tests {
 
     #[handler]
     async fn fake_handler(_res: &mut Response) {}
+
+    #[tokio::test]
+    async fn single_pass_methods_match_general_probes() {
+        use crate::routing::filters;
+        let router = Router::new()
+            .push(Router::with_path("users/{id}/profile").get(fake_handler))
+            .push(
+                Router::with_path("users/{name}")
+                    .get(fake_handler)
+                    .post(fake_handler),
+            )
+            .push(
+                Router::with_filter(filters::get())
+                    .path("nested")
+                    .push(Router::with_filter(filters::post()).goal(fake_handler))
+                    .push(Router::with_filter(filters::get()).goal(fake_handler)),
+            )
+            .push(Router::with_path("assets/{**rest}").get(fake_handler))
+            .push(
+                Router::with_path("hosted")
+                    .host("example.com")
+                    .put(fake_handler),
+            );
+        for path in [
+            "/users/12",
+            "/users/12/profile",
+            "/nested",
+            "/assets/css/a.css",
+            "/hosted",
+            "/missing",
+        ] {
+            let mut req = TestClient::delete(format!("http://example.com{path}")).build();
+            let fast = router
+                .allowed_methods_single_pass(&mut req, path)
+                .await
+                .unwrap();
+            assert_eq!(
+                fast,
+                router.allowed_methods_by_probe(&mut req, path).await,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn method_discovery_preserves_general_filter_fallbacks() {
+        use crate::routing::{Filter, filters};
+        for router in [
+            Router::new()
+                .push(Router::with_path("a").goal(fake_handler))
+                .push(Router::with_path("b").get(fake_handler)),
+            Router::with_filter(filters::get().or(filters::post()))
+                .path("a")
+                .goal(fake_handler),
+        ] {
+            let mut req = TestClient::delete("http://localhost/a").build();
+            assert!(
+                router
+                    .allowed_methods_single_pass(&mut req, "/a")
+                    .await
+                    .is_none()
+            );
+            assert_eq!(
+                router.allowed_methods(&mut req, "/a").await,
+                router.allowed_methods_by_probe(&mut req, "/a").await
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "manual timing benchmark"]
+    async fn method_discovery_growth_benchmark() {
+        for count in [100, 1_000, 10_000] {
+            let mut router = Router::new();
+            for i in 0..count {
+                router = router.push(
+                    Router::with_path(format!("route-{i}"))
+                        .get(fake_handler)
+                        .post(fake_handler)
+                        .put(fake_handler),
+                );
+            }
+            for path in ["/missing".to_owned(), format!("/route-{}", count - 1)] {
+                let mut req = TestClient::delete(format!("http://localhost{path}")).build();
+                let start = std::time::Instant::now();
+                for _ in 0..10 {
+                    std::hint::black_box(router.allowed_methods_by_probe(&mut req, &path).await);
+                }
+                let legacy = start.elapsed();
+                let start = std::time::Instant::now();
+                for _ in 0..10 {
+                    std::hint::black_box(router.allowed_methods(&mut req, &path).await);
+                }
+                eprintln!(
+                    "routes={count}, path={path}: legacy={legacy:?}, single_pass={:?} (10 requests)",
+                    start.elapsed()
+                );
+            }
+        }
+    }
     #[test]
     fn test_router_debug() {
         let router = Router::default()
@@ -673,6 +940,7 @@ mod tests {
         assert!(path_state.is_ended());
     }
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect3() {
         let router = Router::new().push(
             Router::with_path("users").push(
@@ -694,6 +962,7 @@ mod tests {
         assert!(matched.is_some());
     }
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect4() {
         let router = Router::new().push(
             Router::with_path("users").push(
@@ -715,6 +984,7 @@ mod tests {
         assert!(matched.is_some());
     }
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect5() {
         let router = Router::new().push(
             Router::with_path("users").push(
@@ -738,6 +1008,7 @@ mod tests {
         assert_eq!(path_state.params["id"], "12");
     }
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect6() {
         let router = Router::new().push(
             Router::with_path("users").push(
@@ -760,6 +1031,7 @@ mod tests {
         assert!(matched.is_some());
     }
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect_utf8() {
         let router = Router::new().push(
             Router::with_path("用户").push(
@@ -784,6 +1056,7 @@ mod tests {
         assert!(matched.is_some());
     }
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect9() {
         let router = Router::new()
             .push(Router::with_path("users/{sub|(images|css)}/{filename}").goal(fake_handler));
@@ -798,6 +1071,7 @@ mod tests {
         assert!(matched.is_some());
     }
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect10() {
         let router = Router::new()
             .push(Router::with_path(r"users/{*sub|(images|css)/.+}").goal(fake_handler));
@@ -812,6 +1086,7 @@ mod tests {
         assert!(matched.is_some());
     }
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect11() {
         let router = Router::new()
             .push(Router::with_path(r"avatars/{width|\d+}x{height|\d+}.{ext}").goal(fake_handler));
@@ -839,6 +1114,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect13() {
         let router = Router::new()
             .path("user/{id|[0-9a-z]{8}(-[0-9a-z]{4}){3}-[0-9a-z]{12}}")
@@ -856,6 +1132,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "routing-regex")]
     async fn test_router_detect_method_mismatch_wildcard_sibling() {
         // Regression test for https://github.com/salvo-rs/salvo/issues/1612
         //
@@ -884,7 +1161,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_router_detect_path_encoded() {
+    async fn test_router_keeps_encoded_separator_inside_one_parameter() {
         let router = Router::new().path("api/{p}").get(fake_handler);
         let mut req = TestClient::get("http://127.0.0.1:6060/api/a%2fb%2fc").build();
         let mut path_state = PathState::from_owned_path(req.uri().path().to_owned());

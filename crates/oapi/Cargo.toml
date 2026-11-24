@@ -13,7 +13,7 @@ keywords = ["http", "async", "salvo", "openapi", "swagger-ui"]
 categories = ["network-programming", "asynchronous"]
 authors = [
     "Juha Kukkonen <juha7kukkonen@gmail.com>",
-    "chrislearn <chris@acroidea.com>",
+    "Chris Young <chris@veco.id>",
 ]
 
 [features]
@@ -107,6 +107,7 @@ assert-json-diff = { workspace = true }
 salvo_core = { workspace = true, default-features = false, features = [
     "cookie",
     "test",
+    "catcher-json",
 ] }
 serde_json = { workspace = true }
 serde = { workspace = true }

@@ -24,9 +24,10 @@ mod xml;
 
 use std::collections::BTreeSet;
 use std::fmt::{self, Debug, Formatter};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use regex::Regex;
+use salvo_core::hyper::body::Bytes;
 use salvo_core::{Depot, FlowCtrl, Handler, Router, async_trait, writing};
 use serde::de::{Error, Expected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -73,6 +74,14 @@ pub type PropMap<K, V> = std::collections::BTreeMap<K, V>;
 #[cfg(feature = "preserve-prop-order")]
 pub type PropMap<K, V> = indexmap::IndexMap<K, V>;
 
+// A present JSON null is a value, distinct from an omitted annotation.
+fn deserialize_json_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 /// Root object of the OpenAPI document.
 ///
 /// You can use [`OpenApi::new`] function to construct a new [`OpenApi`] instance and then
@@ -112,7 +121,11 @@ pub struct OpenApi {
 
     /// Available paths and operations for the API.
     ///
+    /// Documents that only describe components or webhooks can omit this field;
+    /// it is deserialized as an empty collection.
+    ///
     /// See more details at <https://spec.openapis.org/oas/latest.html#paths-object>.
+    #[serde(default)]
     pub paths: Paths,
 
     /// Incoming webhooks that may be received as part of this API.
@@ -218,7 +231,7 @@ impl OpenApi {
     /// # Documentation UI support
     ///
     /// All four bundled UIs load a 3.2 document, but their support for the new `query`
-    /// operation differs. As of Swagger UI v5.32.11 (vendored in this crate) `query` operations
+    /// operation differs. As of Swagger UI v5.34.0 (vendored in this crate) `query` operations
     /// render correctly; Scalar, RapiDoc and ReDoc — which load from a CDN at runtime — display
     /// the rest of the document but omit `query` operations.
     ///
@@ -300,6 +313,7 @@ impl OpenApi {
         self.components.append(&mut other.components);
         self.security.append(&mut other.security);
         self.tags.append(&mut other.tags);
+        self.deduplicate_auto_operation_ids();
         self
     }
 
@@ -344,11 +358,12 @@ impl OpenApi {
         let path: String = path.into();
 
         // Take paths out of other, prefix them, and insert into self
-        let other_paths = std::mem::take(&mut other.paths);
+        let mut other_paths = std::mem::take(&mut other.paths);
         for (item_path, item) in other_paths.iter() {
             let composed = composer(&path, item_path);
             self.paths.insert(composed, item.clone());
         }
+        other.paths.extensions = std::mem::take(&mut other_paths.extensions);
 
         // Merge the remaining parts (servers, components, security, tags)
         // Paths in other are already empty so merge won't duplicate them
@@ -439,15 +454,15 @@ impl OpenApi {
         self
     }
 
-    /// Add [`SecurityScheme`] to [`Components`] and returns `Self`.
+    /// Add a [`SecurityScheme`] or [`Ref`] to [`Components`] and return `Self`.
     ///
     /// Accepts two arguments where first is the name of the [`SecurityScheme`]. This is later when
     /// referenced by [`SecurityRequirement`][requirement]s. Second parameter is the
-    /// [`SecurityScheme`].
+    /// scheme or reference.
     ///
     /// [requirement]: crate::SecurityRequirement
     #[must_use]
-    pub fn add_security_scheme<N: Into<String>, S: Into<SecurityScheme>>(
+    pub fn add_security_scheme<N: Into<String>, S: Into<RefOr<SecurityScheme>>>(
         mut self,
         name: N,
         security_scheme: S,
@@ -459,7 +474,7 @@ impl OpenApi {
         self
     }
 
-    /// Add iterator of [`SecurityScheme`]s to [`Components`].
+    /// Add an iterator of [`SecurityScheme`]s or references to [`Components`].
     ///
     /// Accepts two arguments where first is the name of the [`SecurityScheme`]. This is later when
     /// referenced by [`SecurityRequirement`][requirement]s. Second parameter is the
@@ -470,7 +485,7 @@ impl OpenApi {
     pub fn extend_security_schemes<
         I: IntoIterator<Item = (N, S)>,
         N: Into<String>,
-        S: Into<SecurityScheme>,
+        S: Into<RefOr<SecurityScheme>>,
     >(
         mut self,
         schemas: I,
@@ -602,9 +617,22 @@ impl OpenApi {
         self
     }
 
-    /// Consumes the [`OpenApi`] and returns [`Router`] with the [`OpenApi`] as handler.
+    /// Freeze the document into a handler that serializes each JSON format once.
+    ///
+    /// Compact and pretty representations are initialized on demand, then shared
+    /// by subsequent responses. Use this after finishing document construction.
+    #[must_use]
+    pub fn into_handler(self) -> OpenApiHandler {
+        OpenApiHandler {
+            document: self,
+            compact: OnceLock::new(),
+            pretty: OnceLock::new(),
+        }
+    }
+
+    /// Freeze the document and serve cached compact/pretty JSON at `path`.
     pub fn into_router(self, path: impl Into<String>) -> Router {
-        Router::with_path(path.into()).goal(self)
+        Router::with_path(path.into()).goal(self.into_handler())
     }
 
     /// Consumes the [`OpenApi`] and information from a [`Router`].
@@ -618,7 +646,60 @@ impl OpenApi {
     pub fn merge_router_with_base(mut self, router: &Router, base: impl AsRef<str>) -> Self {
         let mut node = NormNode::new(router, Default::default());
         self.merge_norm_node(&mut node, base.as_ref());
+        self.deduplicate_auto_operation_ids();
         self
+    }
+
+    fn deduplicate_auto_operation_ids(&mut self) {
+        fn collect<'a>(
+            item: &'a mut PathItem,
+            path: &str,
+            operations: &mut Vec<(String, &'a mut Operation)>,
+        ) {
+            for (method, operation) in &mut item.operations.0 {
+                operations.push((format!("{method:?}:{path}"), operation));
+            }
+            for (method, operation) in &mut item.additional_operations {
+                operations.push((format!("{method}:{path}"), operation));
+            }
+        }
+        let mut operations = Vec::new();
+        for (path, item) in self.paths.iter_mut() {
+            collect(item, path, &mut operations);
+        }
+        for (name, item) in &mut self.webhooks {
+            if let RefOr::Type(item) = item {
+                collect(item, &format!("webhook:{name}"), &mut operations);
+            }
+        }
+        // Explicit IDs are reserved first, regardless of route ordering.
+        let mut used: BTreeSet<String> = operations
+            .iter()
+            .filter_map(|(_, operation)| {
+                operation
+                    .auto_operation_id_base()
+                    .is_none()
+                    .then(|| operation.operation_id.clone())
+                    .flatten()
+            })
+            .collect();
+        for (context, operation) in operations {
+            let Some(base) = operation.auto_operation_id_base().map(str::to_owned) else {
+                continue;
+            };
+            let mut candidate = base.clone();
+            if used.contains(&candidate) {
+                let suffix: String = context.bytes().map(|byte| format!("{byte:02x}")).collect();
+                candidate = format!("{base}__{suffix}");
+                let mut count = 2;
+                while used.contains(&candidate) {
+                    candidate = format!("{base}__{suffix}_{count}");
+                    count += 1;
+                }
+            }
+            used.insert(candidate.clone());
+            operation.update_auto_operation_id(candidate);
+        }
     }
 
     fn merge_norm_node(&mut self, node: &mut NormNode, base_path: &str) {
@@ -649,9 +730,11 @@ impl OpenApi {
             })
             .collect::<Vec<_>>();
 
-        if let Some(handler_type_id) = &node.handler_type_id
-            && let Some(creator) = crate::EndpointRegistry::find(handler_type_id)
-        {
+        if let Some(creator) = node.handler_creator.or_else(|| {
+            node.handler_type_id
+                .as_ref()
+                .and_then(crate::EndpointRegistry::find)
+        }) {
             // `query` operations and `additionalOperations` were both added in OpenAPI 3.2.
             // Emitting either into a document that still declares 3.1 would make it invalid,
             // so drop the slot and tell the user how to opt in.
@@ -683,13 +766,15 @@ impl OpenApi {
                     mut components,
                 } = creator();
                 operation.tags.extend(node.metadata.tags.iter().cloned());
-                operation
-                    .securities
-                    .extend(node.metadata.securities.iter().cloned());
+                if !node.metadata.securities.is_empty() {
+                    operation
+                        .securities
+                        .get_or_insert_default()
+                        .extend(node.metadata.securities.iter().cloned());
+                }
                 let not_exist_parameters = operation
                     .parameters
-                    .0
-                    .iter()
+                    .iter_inline()
                     .filter(|p| {
                         p.parameter_in == ParameterIn::Path
                             && !path_parameter_names.contains(&p.name)
@@ -705,7 +790,7 @@ impl OpenApi {
                         .iter()
                         .filter(|name| {
                             !name.starts_with('*')
-                                && !operation.parameters.0.iter().any(|parameter| {
+                                && !operation.parameters.iter_inline().any(|parameter| {
                                     parameter.name == **name
                                         && parameter.parameter_in == ParameterIn::Path
                                 })
@@ -757,6 +842,42 @@ impl OpenApi {
         for child in &mut node.children {
             self.merge_norm_node(child, &path);
         }
+    }
+}
+
+/// An immutable OpenAPI document served using shared, lazily serialized bytes.
+#[derive(Debug)]
+pub struct OpenApiHandler {
+    document: OpenApi,
+    compact: OnceLock<Bytes>,
+    pretty: OnceLock<Bytes>,
+}
+
+#[async_trait]
+impl Handler for OpenApiHandler {
+    async fn handle(
+        &self,
+        req: &mut salvo_core::Request,
+        _depot: &mut Depot,
+        res: &mut salvo_core::Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        let pretty = req
+            .queries()
+            .get("pretty")
+            .is_some_and(|value| &**value != "false");
+        let bytes = if pretty {
+            self.pretty
+                .get_or_init(|| self.document.to_pretty_json().unwrap_or_default().into())
+        } else {
+            self.compact
+                .get_or_init(|| self.document.to_json().unwrap_or_default().into())
+        };
+        res.headers_mut().insert(
+            salvo_core::http::header::CONTENT_TYPE,
+            salvo_core::http::HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        res.body(salvo_core::http::ResBody::Once(bytes.clone()));
     }
 }
 
@@ -1313,7 +1434,7 @@ mod tests {
         );
         doc.components.security_schemes.insert(
             "token_jwt".into(),
-            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer).bearer_format("JWT")),
+            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer).bearer_format("JWT")).into(),
         );
 
         let router = Router::with_path("/pets/{id}").get(get_pet_by_id);
@@ -1428,6 +1549,8 @@ mod tests {
                        }
                     }
                  }"#
+                 .replace("uint64", if cfg!(feature = "non-strict-integers") { "uint64" } else { "int64" })
+                 .as_str()
             )
             .unwrap(),
             Value::from_str(&doc.to_json().unwrap()).unwrap()
@@ -1447,6 +1570,25 @@ mod tests {
 
         assert!(doc.paths.contains_key("/posts/{id}"));
         assert!(!doc.paths.contains_key("/posts/{id:num}"));
+    }
+
+    #[tokio::test]
+    async fn repeated_path_filters_match_the_documented_path() {
+        use salvo_core::test::TestClient;
+
+        #[salvo_oapi::endpoint]
+        async fn get_version() -> &'static str {
+            "ok"
+        }
+
+        let router = Router::new().path("api").path("v1").get(get_version);
+        let doc = OpenApi::new("test api", "0.0.1").merge_router(&router);
+        let response = TestClient::get("http://localhost/api/v1")
+            .send(router)
+            .await;
+        assert_eq!(response.status_code, Some(salvo_core::http::StatusCode::OK));
+        assert!(doc.paths.contains_key("/api/v1"));
+        assert!(!doc.paths.contains_key("/v1"));
     }
 
     #[test]
@@ -1485,8 +1627,7 @@ mod tests {
         let by_name = |name: &str| {
             operation
                 .parameters
-                .0
-                .iter()
+                .iter_inline()
                 .find(|p| p.name == name)
                 .unwrap_or_else(|| panic!("parameter `{name}` should exist"))
         };
@@ -1536,13 +1677,12 @@ mod tests {
             .expect("get operation should exist");
         let names: Vec<&str> = operation
             .parameters
-            .0
-            .iter()
+            .iter_inline()
             .map(|p| p.name.as_str())
             .collect();
 
         // container singular alias honored: every parameter is in `header`.
-        for param in &operation.parameters.0 {
+        for param in operation.parameters.iter_inline() {
             assert_eq!(
                 param.parameter_in,
                 ParameterIn::Header,
@@ -1577,6 +1717,111 @@ mod tests {
              got: {:?}",
             doc.paths.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn merge_router_inherits_ancestor_method_through_path_nodes() {
+        use salvo_core::routing::filters;
+        use salvo_core::test::TestClient;
+
+        #[salvo_oapi::endpoint]
+        async fn inherited() -> &'static str {
+            "ok"
+        }
+
+        let router = Router::with_path("/api")
+            .filter(filters::get())
+            .push(Router::with_path("v1").push(Router::with_path("items").goal(inherited)));
+        let doc = OpenApi::new("test api", "0.0.1").merge_router(&router);
+        let item = &doc.paths["/api/v1/items"];
+        assert_eq!(item.operations.len(), 1);
+        assert!(item.operations.contains_key(&PathItemType::Get));
+        assert!(item.additional_operations.is_empty());
+        let response = TestClient::get("http://localhost/api/v1/items")
+            .send(router)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+    }
+
+    #[test]
+    fn merge_router_intersects_method_constraints_instead_of_overriding_them() {
+        use salvo_core::http::Method;
+        use salvo_core::routing::filters::MethodFilter;
+
+        #[salvo_oapi::endpoint]
+        async fn endpoint() -> &'static str {
+            "ok"
+        }
+
+        let purge = Method::from_bytes(b"PURGE").unwrap();
+        for (first, second) in [
+            (Method::GET, Method::POST),
+            (Method::POST, Method::GET),
+            (Method::GET, purge.clone()),
+            (purge.clone(), Method::GET),
+        ] {
+            let same_node = Router::with_path("/conflict")
+                .filter(MethodFilter(first.clone()))
+                .filter(MethodFilter(second.clone()))
+                .goal(endpoint)
+                .push(Router::with_path("child").get(endpoint));
+            let parent_and_child = Router::with_path("/conflict")
+                .filter(MethodFilter(first))
+                .push(
+                    Router::new()
+                        .filter(MethodFilter(second))
+                        .goal(endpoint)
+                        .push(Router::with_path("child").get(endpoint)),
+                );
+            for conflict in [same_node, parent_and_child] {
+                let router = Router::new()
+                    .push(conflict)
+                    .push(Router::with_path("/valid").get(endpoint));
+                let doc = OpenApi::new("test api", "0.0.1")
+                    .openapi_version(OpenApiVersion::Version3_2)
+                    .merge_router(&router);
+                assert_eq!(doc.paths.len(), 1);
+                assert!(doc.paths.contains_key("/valid"));
+            }
+        }
+
+        let repeated = Router::with_path("/repeated")
+            .filter(MethodFilter(Method::GET))
+            .filter(MethodFilter(Method::GET))
+            .push(Router::new().get(endpoint));
+        let doc = OpenApi::new("test api", "0.0.1").merge_router(&repeated);
+        assert!(
+            doc.paths["/repeated"]
+                .operations
+                .contains_key(&PathItemType::Get)
+        );
+    }
+
+    #[test]
+    fn merge_router_inherited_extension_methods_keep_version_gating() {
+        use salvo_core::http::Method;
+        use salvo_core::routing::filters::MethodFilter;
+
+        #[salvo_oapi::endpoint]
+        async fn endpoint() -> &'static str {
+            "ok"
+        }
+
+        for method in [Method::QUERY, Method::from_bytes(b"PURGE").unwrap()] {
+            let router = Router::with_filter(MethodFilter(method.clone()))
+                .push(Router::with_path("/resource").goal(endpoint));
+            let doc = OpenApi::new("test api", "0.0.1").merge_router(&router);
+            assert!(doc.paths.is_empty());
+            let doc = OpenApi::new("test api", "0.0.1")
+                .openapi_version(OpenApiVersion::Version3_2)
+                .merge_router(&router);
+            let item = &doc.paths["/resource"];
+            if method == Method::QUERY {
+                assert!(item.operations.contains_key(&PathItemType::Query));
+            } else {
+                assert!(item.additional_operations.contains_key("PURGE"));
+            }
+        }
     }
 
     #[test]
@@ -1981,7 +2226,7 @@ mod tests {
                                     "content": {
                                         "application/json": {
                                             "schema": {
-                                                "$ref": "#/components/schemas/Response<alloc.vec.Vec<City>>"
+                                                "$ref": "#/components/schemas/Response_3Calloc.vec.Vec_3CCity_3E_3E"
                                             }
                                         }
                                     }
@@ -2047,7 +2292,7 @@ mod tests {
                                 }
                             }
                         },
-                        "Response<alloc.vec.Vec<City>>": {
+                        "Response_3Calloc.vec.Vec_3CCity_3E_3E": {
                             "type": "object",
                             "required": [
                                 "status",
@@ -2081,28 +2326,35 @@ mod tests {
                         "salvo_core.http.errors.status_error.StatusError": {
                             "type": "object",
                             "required": [
-                                "code",
-                                "name",
-                                "brief",
-                                "detail"
+                                "error"
                             ],
                             "properties": {
-                                "brief": {
-                                    "type": "string"
-                                },
-                                "cause": {
-                                    "type": "string"
-                                },
-                                "code": {
-                                    "type": "integer",
-                                    "format": "uint16",
-                                    "minimum": 0
-                                },
-                                "detail": {
-                                    "type": "string"
-                                },
-                                "name": {
-                                    "type": "string"
+                                "error": {
+                                    "type": "object",
+                                    "required": [
+                                        "code",
+                                        "name",
+                                        "brief"
+                                    ],
+                                    "properties": {
+                                        "brief": {
+                                            "type": "string"
+                                        },
+                                        "cause": {
+                                            "type": "string"
+                                        },
+                                        "code": {
+                                            "type": "integer",
+                                            "format": if cfg!(feature = "non-strict-integers") { "uint16" } else { "int32" },
+                                            "minimum": 0
+                                        },
+                                        "detail": {
+                                            "type": "string"
+                                        },
+                                        "name": {
+                                            "type": "string"
+                                        }
+                                    }
                                 }
                             }
                         }

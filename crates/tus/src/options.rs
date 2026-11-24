@@ -99,8 +99,14 @@ pub struct UploadFinishPatch {
     /// HTTP status code to return.
     pub status_code: Option<StatusCode>,
     /// Additional response headers to return.
+    ///
+    /// All values of a field are added when the response does not already
+    /// contain that field. Existing response fields are left intact.
     pub headers: Option<HeaderMap>,
     /// Response body bytes to return.
+    ///
+    /// A completing PATCH defaults to `200 OK` when a body is supplied without
+    /// an explicit status, so the body is not suppressed by `204 No Content`.
     pub body: Option<Vec<u8>>,
 }
 
@@ -156,13 +162,11 @@ pub struct TusOptions {
     /// Trusted origins for `Access-Control-Allow-Origin`.
     pub allowed_origins: Vec<String>,
 
-    /// Interval in milliseconds for sending receive progress notifications.
-    pub post_receive_interval: Option<u64>,
-
     /// Lock provider used to serialize access to the same upload.
     pub locker: Arc<dyn Locker>,
 
-    /// Lock cleanup timeout in milliseconds.
+    /// Maximum wait for an upload lock, in milliseconds. None disables the deadline.
+    /// A timeout returns 503; acquired streaming download locks keep their documented lifetime.
     pub lock_drain_timeout: Option<u64>,
 
     /// Disallow termination for finished uploads
@@ -179,6 +183,11 @@ pub struct TusOptions {
     /// Optional hook invoked when a new upload is created.
     pub on_upload_create: Option<OnUploadCreate>,
     /// Optional hook invoked when an upload is completed.
+    ///
+    /// Stored bytes are not rolled back if the hook fails. Cancellation or
+    /// failure after commit does not guarantee a retry. See
+    /// [`Tus::on_upload_finish`](crate::Tus::on_upload_finish) for the delivery contract and
+    /// durable processing guidance.
     pub on_upload_finish: Option<OnUploadFinish>,
 }
 
@@ -194,7 +203,6 @@ impl fmt::Debug for TusOptions {
             .field("exposed_headers", &self.exposed_headers)
             .field("allowed_credentials", &self.allowed_credentials)
             .field("allowed_origins", &self.allowed_origins)
-            .field("post_receive_interval", &self.post_receive_interval)
             .field("locker", &"<locker>")
             .field("lock_drain_timeout", &self.lock_drain_timeout)
             .field(
@@ -242,7 +250,7 @@ impl TusOptions {
     ) -> TusResult<LockGuard> {
         let mut signal = context.signal.clone();
         tokio::select! {
-            lock = self.locker.read_lock(upload_id) => lock,
+            lock = self.wait_for_lock(self.locker.read_lock(upload_id)) => lock,
             reason = signal.cancelled() => Err(TusError::Internal(format!("request {reason:?}"))),
         }
     }
@@ -256,8 +264,21 @@ impl TusOptions {
     ) -> TusResult<LockGuard> {
         let mut signal = context.signal.clone();
         tokio::select! {
-            lock = self.locker.write_lock(upload_id) => lock,
+            lock = self.wait_for_lock(self.locker.write_lock(upload_id)) => lock,
             reason = signal.cancelled() => Err(TusError::Internal(format!("request {reason:?}"))),
+        }
+    }
+
+    async fn wait_for_lock(
+        &self,
+        future: impl Future<Output = TusResult<LockGuard>> + Send,
+    ) -> TusResult<LockGuard> {
+        if let Some(millis) = self.lock_drain_timeout {
+            tokio::time::timeout(std::time::Duration::from_millis(millis), future)
+                .await
+                .map_err(|_| TusError::LockTimeout)?
+        } else {
+            future.await
         }
     }
 
@@ -299,14 +320,32 @@ impl TusOptions {
         req: &mut Request,
         upload_id: &str,
     ) -> Result<String, TusError> {
-        let path = if self.path == "/" {
+        let normalized_path = crate::utils::normalize_path(&self.path);
+        let path = if normalized_path == "/" {
             ""
         } else {
-            self.path.as_str()
+            normalized_path.as_str()
         };
 
-        let HostProto { proto, host } =
-            Self::extract_host_and_proto(req.headers(), self.respect_forwarded_headers);
+        let HostProto { proto, host } = Self::extract_host_and_proto(
+            req.headers(),
+            self.respect_forwarded_headers,
+            HostProto {
+                proto: req.scheme().as_str(),
+                // HTTP/1 absolute-form and HTTP/2-3 :authority both override
+                // Host. The URI scheme remains untrusted on a server request.
+                host: req
+                    .uri()
+                    .authority()
+                    .map(|authority| authority.as_str())
+                    .or_else(|| {
+                        req.headers()
+                            .get(header::HOST)
+                            .and_then(|value| value.to_str().ok())
+                    })
+                    .unwrap_or("localhost"),
+            },
+        );
 
         if let Some(callback) = &self.generate_url_function {
             return match callback(
@@ -340,64 +379,38 @@ impl TusOptions {
         Ok(format!("{proto}://{host}{path}/{upload_id}"))
     }
 
-    /// Rust version of BaseHandler.extractHostAndProto(...)
     fn extract_host_and_proto<'a>(
         headers: &'a HeaderMap,
         respect_forwarded_headers: bool,
+        defaults: HostProto<'a>,
     ) -> HostProto<'a> {
-        // defaults
-        let mut proto: &'a str = "http";
-        let mut host: &'a str = "localhost";
-
-        // 1) determine host
-        if respect_forwarded_headers {
-            // Prefer Forwarded: proto=...;host=...
-            if let Some(v) = headers.get("forwarded").and_then(|v| v.to_str().ok()) {
-                if let Some(h) = parse_forwarded_param(v, "host") {
-                    host = h;
-                }
-                if let Some(p) = parse_forwarded_param(v, "proto") {
-                    proto = p;
-                }
-            }
-
-            // Fallback: X-Forwarded-Host
-            if host == "localhost"
-                && let Some(v) = headers
-                    .get("x-forwarded-host")
-                    .and_then(|v| v.to_str().ok())
-            {
-                // x-forwarded-host may contain comma-separated list; use the first one
-                host = v.split(',').next().unwrap_or(v).trim();
-            }
-
-            // 2) determine proto (X-Forwarded-Proto)
-            if proto == "http"
-                && let Some(v) = headers
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-            {
-                proto = v.split(',').next().unwrap_or(v).trim();
-            }
+        let first = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(',').next().unwrap_or(v).trim())
+        };
+        let direct_host = defaults.host;
+        if !respect_forwarded_headers {
+            return HostProto {
+                host: direct_host,
+                proto: defaults.proto,
+            };
         }
-
-        // If we still haven't got a host, use Host header
-        if host == "localhost"
-            && let Some(v) = headers.get(header::HOST).and_then(|v| v.to_str().ok())
-        {
-            host = v.trim();
-        }
-
-        // If forwarded headers are trusted and we still haven't got proto, infer from
-        // scheme-ish headers.
-        if respect_forwarded_headers
-            && proto == "http"
-            && let Some(v) = headers.get("x-forwarded-ssl").and_then(|v| v.to_str().ok())
-            && v.eq_ignore_ascii_case("on")
-        {
-            proto = "https";
-        }
-
+        let forwarded = headers.get("forwarded").and_then(|v| v.to_str().ok());
+        let host = forwarded
+            .and_then(|v| parse_forwarded_param(v, "host"))
+            .or_else(|| first("x-forwarded-host"))
+            .unwrap_or(direct_host);
+        let proto = forwarded
+            .and_then(|v| parse_forwarded_param(v, "proto"))
+            .or_else(|| first("x-forwarded-proto"))
+            .or_else(|| {
+                first("x-forwarded-ssl")
+                    .filter(|v| v.eq_ignore_ascii_case("on"))
+                    .map(|_| "https")
+            })
+            .unwrap_or(defaults.proto);
         HostProto { proto, host }
     }
 
@@ -418,7 +431,6 @@ impl Default for TusOptions {
             exposed_headers: vec![],
             allowed_credentials: false,
             allowed_origins: vec![],
-            post_receive_interval: Some(1000),
             locker: Arc::new(memory_locker::MemoryLocker::new()), // Default use memory locker.
             lock_drain_timeout: Some(3000),
             disable_termination_for_finished_uploads: false,
@@ -598,7 +610,6 @@ mod tests {
         assert!(options.exposed_headers.is_empty());
         assert!(!options.allowed_credentials);
         assert!(options.allowed_origins.is_empty());
-        assert_eq!(options.post_receive_interval, Some(1000));
         assert_eq!(options.lock_drain_timeout, Some(3000));
         assert!(!options.disable_termination_for_finished_uploads);
         assert!(options.generate_url_function.is_none());
@@ -704,7 +715,17 @@ mod tests {
     #[test]
     fn test_extract_host_and_proto_defaults() {
         let headers = HeaderMap::new();
-        let result = TusOptions::extract_host_and_proto(&headers, false);
+        let result = TusOptions::extract_host_and_proto(
+            &headers,
+            false,
+            HostProto {
+                proto: "http",
+                host: headers
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+            },
+        );
         assert_eq!(result.proto, "http");
         assert_eq!(result.host, "localhost");
     }
@@ -714,7 +735,17 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "example.com".parse().unwrap());
 
-        let result = TusOptions::extract_host_and_proto(&headers, false);
+        let result = TusOptions::extract_host_and_proto(
+            &headers,
+            false,
+            HostProto {
+                proto: "http",
+                host: headers
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+            },
+        );
         assert_eq!(result.host, "example.com");
         assert_eq!(result.proto, "http");
     }
@@ -724,7 +755,17 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("forwarded", "proto=https;host=proxy.com".parse().unwrap());
 
-        let result = TusOptions::extract_host_and_proto(&headers, true);
+        let result = TusOptions::extract_host_and_proto(
+            &headers,
+            true,
+            HostProto {
+                proto: "http",
+                host: headers
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+            },
+        );
         assert_eq!(result.host, "proxy.com");
         assert_eq!(result.proto, "https");
     }
@@ -735,7 +776,17 @@ mod tests {
         headers.insert("x-forwarded-host", "proxy.com".parse().unwrap());
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
 
-        let result = TusOptions::extract_host_and_proto(&headers, true);
+        let result = TusOptions::extract_host_and_proto(
+            &headers,
+            true,
+            HostProto {
+                proto: "http",
+                host: headers
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+            },
+        );
         assert_eq!(result.host, "proxy.com");
         assert_eq!(result.proto, "https");
     }
@@ -746,7 +797,17 @@ mod tests {
         headers.insert(header::HOST, "example.com".parse().unwrap());
         headers.insert("x-forwarded-ssl", "on".parse().unwrap());
 
-        let result = TusOptions::extract_host_and_proto(&headers, true);
+        let result = TusOptions::extract_host_and_proto(
+            &headers,
+            true,
+            HostProto {
+                proto: "http",
+                host: headers
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+            },
+        );
         assert_eq!(result.proto, "https");
     }
 
@@ -758,7 +819,17 @@ mod tests {
             "first.com, second.com, third.com".parse().unwrap(),
         );
 
-        let result = TusOptions::extract_host_and_proto(&headers, true);
+        let result = TusOptions::extract_host_and_proto(
+            &headers,
+            true,
+            HostProto {
+                proto: "http",
+                host: headers
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+            },
+        );
         assert_eq!(result.host, "first.com");
     }
 
@@ -767,7 +838,17 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", "https, http".parse().unwrap());
 
-        let result = TusOptions::extract_host_and_proto(&headers, true);
+        let result = TusOptions::extract_host_and_proto(
+            &headers,
+            true,
+            HostProto {
+                proto: "http",
+                host: headers
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+            },
+        );
         assert_eq!(result.proto, "https");
     }
 
@@ -780,7 +861,17 @@ mod tests {
         headers.insert("x-forwarded-ssl", "on".parse().unwrap());
 
         // When respect_forwarded_headers is false, should use Host and ignore forwarded hints.
-        let result = TusOptions::extract_host_and_proto(&headers, false);
+        let result = TusOptions::extract_host_and_proto(
+            &headers,
+            false,
+            HostProto {
+                proto: "http",
+                host: headers
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+            },
+        );
         assert_eq!(result.host, "real.com");
         assert_eq!(result.proto, "http");
     }
@@ -793,7 +884,17 @@ mod tests {
         headers.insert("x-forwarded-host", "x-forwarded.com".parse().unwrap());
 
         // Forwarded header should take priority over X-Forwarded-Host
-        let result = TusOptions::extract_host_and_proto(&headers, true);
+        let result = TusOptions::extract_host_and_proto(
+            &headers,
+            true,
+            HostProto {
+                proto: "http",
+                host: headers
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+            },
+        );
         assert_eq!(result.host, "forwarded.com");
     }
 

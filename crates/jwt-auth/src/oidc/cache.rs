@@ -1,31 +1,27 @@
 // port from https://github.com/fergus-hou/oidc_jwt_validator/blob/master/src/cache.rs
 
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant},
-};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::Validation;
+use jsonwebtoken::jwk::JwkSet;
 use salvo_core::http::header::HeaderValue;
 
-use super::{current_time, decode_jwk, DecodingInfo, JwkSetFetch};
+use super::{DecodingInfo, JwkSetFetch, current_time, decode_jwk};
 
 /// Determines settings about updating the cached JWKS data.
 /// The JWKS will be lazily revalidated every time validator validates a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachePolicy {
     /// Time in Seconds to refresh the JWKS from the OIDC Provider
-    /// Default/Minimum value: 1 Second
+    /// Default: 1 second. An explicit zero has no fresh lifetime.
     pub max_age: Duration,
     /// The amount of time the stale JWKS data can be used while it is being revalidated.
     pub stale_while_revalidate: Option<Duration>,
-    /// The amount of time the stale JWKS data should be valid for if we are unable to re-validate it from the URL.
-    /// Minimum Value: 60 Seconds
+    /// The amount of time the stale JWKS data should be valid for if we are unable to re-validate
+    /// it from the URL. Defaults to 60 seconds. An explicit zero disables stale-on-error use.
     pub stale_if_error: Option<Duration>,
 }
 
@@ -33,55 +29,152 @@ impl CachePolicy {
     /// Create a new cache policy from the header value of the Cache-Control header
     #[must_use]
     pub fn from_header_val(value: Option<&HeaderValue>) -> Self {
-        // Initialize the default config of polling every second
-        let mut config = Self::default();
-
-        if let Some(value) = value
-            && let Ok(value) = value.to_str() {
-                config.parse_str(value);
-            }
-        config
+        Self::from_header_values(value)
     }
 
-    fn parse_str(&mut self, value: &str) {
+    /// Creates a policy from all Cache-Control field values in their received order.
+    ///
+    /// Repeated field lines are combined with commas before parsing, preserving
+    /// quoted extension arguments and opaque bytes. No values yields the default policy.
+    #[must_use]
+    pub fn from_header_values<'a>(values: impl IntoIterator<Item = &'a HeaderValue>) -> Self {
+        Self::from_response_values(values).0
+    }
+
+    pub(super) fn from_response_values<'a>(
+        values: impl IntoIterator<Item = &'a HeaderValue>,
+    ) -> (Self, CacheRestrictions) {
+        let mut config = Self::default();
+        let mut restrictions = CacheRestrictions::default();
+        let mut values = values.into_iter();
+        if let Some(first) = values.next() {
+            if let Some(second) = values.next() {
+                let mut combined = first.as_bytes().to_vec();
+                for value in std::iter::once(second).chain(values) {
+                    combined.push(b',');
+                    combined.extend_from_slice(value.as_bytes());
+                }
+                restrictions = config.parse_bytes(&combined);
+            } else {
+                restrictions = config.parse_bytes(first.as_bytes());
+            }
+        }
+        (config, restrictions)
+    }
+
+    fn parse_bytes(&mut self, value: &[u8]) -> CacheRestrictions {
+        let mut restrictions = CacheRestrictions::default();
         // Upper bound for any cache directive (30 days). Without it, a malicious or
         // misconfigured IdP returning a huge `max-age` could overflow the downstream
         // `fetched + max_age` arithmetic (debug panic / release wrap) and pin a stale
         // JWKS indefinitely.
         const MAX_CACHE_AGE_SECS: u64 = 30 * 24 * 60 * 60;
-        // Iterate over every token in the header value
-        for token in value.split(',') {
-            // split them into whitespace trimmed pairs
-            let (key, directive_value) = {
-                let mut split = token.split('=').map(str::trim);
-                (split.next(), split.next())
+        // RFC 9111 section 5.2: commas in quoted extension arguments are not
+        // directive boundaries, and directive names are case insensitive. Work
+        // on bytes so a legal opaque extension does not discard the whole field.
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut max_age_seen = false;
+        for token in value.split(|byte| {
+            if escaped {
+                escaped = false;
+                return false;
+            }
+            if quoted && *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                quoted = !quoted;
+            }
+            *byte == b',' && !quoted
+        }) {
+            let equal = token.iter().position(|byte| *byte == b'=');
+            let key = token[..equal.unwrap_or(token.len())].trim_ascii();
+            if key.eq_ignore_ascii_case(b"no-cache") {
+                restrictions.revalidate = true;
+            }
+            if key.eq_ignore_ascii_case(b"no-store") {
+                restrictions.no_store = true;
+            }
+            if key.eq_ignore_ascii_case(b"must-revalidate") {
+                restrictions.must_revalidate = true;
+            }
+            let Some(equal) = equal else {
+                continue;
+            };
+            let Some(secs) = delta_seconds(token[equal + 1..].trim_ascii()) else {
+                continue;
             };
             // Modify the default config based on the values that matter.
             // Any values here would be more permissive than the default behavior.
-            match (key, directive_value) {
-                (Some("max-age"), Some(directive_value)) => {
-                    if let Ok(secs) = directive_value.parse::<u64>() {
-                        // Keep at least 1s so `max-age=0` cannot make every request
-                        // revalidate and amplify load back onto the IdP.
-                        self.max_age = Duration::from_secs(secs.clamp(1, MAX_CACHE_AGE_SECS));
-                    }
+            if key.eq_ignore_ascii_case(b"max-age") {
+                if max_age_seen {
+                    continue;
                 }
-                (Some("stale-while-revalidate"), Some(directive_value)) => {
-                    if let Ok(secs) = directive_value.parse::<u64>() {
-                        self.stale_while_revalidate =
-                            Some(Duration::from_secs(secs.min(MAX_CACHE_AGE_SECS)));
-                    }
-                }
-                (Some("stale-if-error"), Some(directive_value)) => {
-                    if let Ok(secs) = directive_value.parse::<u64>() {
-                        self.stale_if_error =
-                            Some(Duration::from_secs(secs.min(MAX_CACHE_AGE_SECS)));
-                    }
-                }
-                _ => {},
-            };
+                max_age_seen = true;
+                // Freshness and refresh rate limiting are separate policies.
+                self.max_age = Duration::from_secs(secs.min(MAX_CACHE_AGE_SECS));
+            } else if key.eq_ignore_ascii_case(b"stale-while-revalidate") {
+                self.stale_while_revalidate =
+                    Some(Duration::from_secs(secs.min(MAX_CACHE_AGE_SECS)));
+            } else if key.eq_ignore_ascii_case(b"stale-if-error") {
+                self.stale_if_error = Some(Duration::from_secs(secs.min(MAX_CACHE_AGE_SECS)));
+            }
         }
+        if restrictions.revalidate || restrictions.no_store {
+            self.max_age = Duration::ZERO;
+        }
+        if restrictions.revalidate || restrictions.no_store || restrictions.must_revalidate {
+            self.stale_while_revalidate = None;
+            self.stale_if_error = None;
+        }
+        restrictions
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CacheRestrictions {
+    pub(super) revalidate: bool,
+    pub(super) no_store: bool,
+    pub(super) must_revalidate: bool,
+}
+
+#[derive(Debug)]
+struct ResidentAge {
+    initial: Duration,
+    received: Instant,
+}
+impl ResidentAge {
+    fn at(&self, now: Instant) -> Duration {
+        self.initial
+            .saturating_add(now.saturating_duration_since(self.received))
+    }
+}
+
+fn delta_seconds(value: &[u8]) -> Option<u64> {
+    let quoted = value.first() == Some(&b'"');
+    let value = if quoted {
+        value.strip_prefix(b"\"")?.strip_suffix(b"\"")?
+    } else {
+        value
+    };
+    let mut bytes = value.iter().copied();
+    let mut result = 0u64;
+    let mut digits = 0;
+    while let Some(byte) = bytes.next() {
+        let byte = if quoted && byte == b'\\' {
+            bytes.next()?
+        } else {
+            byte
+        };
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        result = result
+            .checked_mul(10)?
+            .checked_add(u64::from(byte - b'0'))?;
+        digits += 1;
+    }
+    (digits != 0).then_some(result)
 }
 
 impl Default for CachePolicy {
@@ -97,7 +190,8 @@ impl Default for CachePolicy {
 /// The update action of cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
-    /// We checked the JWKS uri and it was the same as the last time we refreshed it so no action was taken
+    /// We checked the JWKS uri and it was the same as the last time we refreshed it so no action
+    /// was taken
     NoUpdate,
     /// We checked the JWKS uri and it was different so we updated our local cache
     JwksUpdate,
@@ -112,8 +206,10 @@ pub enum UpdateAction {
 #[derive(Debug)]
 pub struct CacheState {
     last_update: AtomicU64,
+    resident_age: Mutex<ResidentAge>,
     is_revalidating: AtomicBool,
     is_error: AtomicBool,
+    last_revalidation: Mutex<Option<Instant>>,
 }
 
 impl CacheState {
@@ -122,8 +218,13 @@ impl CacheState {
     pub fn new() -> Self {
         Self {
             last_update: AtomicU64::new(current_time()),
+            resident_age: Mutex::new(ResidentAge {
+                initial: Duration::ZERO,
+                received: Instant::now(),
+            }),
             is_revalidating: AtomicBool::new(false),
             is_error: AtomicBool::new(false),
+            last_revalidation: Mutex::new(None),
         }
     }
     /// Check is the cache is error
@@ -142,6 +243,28 @@ impl CacheState {
     /// Set the cache last updated timestamp
     pub fn set_last_update(&self, timestamp: u64) {
         self.last_update.store(timestamp, Ordering::SeqCst);
+        *self.resident_age.lock().unwrap_or_else(|p| p.into_inner()) = ResidentAge {
+            initial: Duration::from_secs(current_time().saturating_sub(timestamp)),
+            received: Instant::now(),
+        };
+    }
+
+    pub(super) fn set_response_age(&self, initial: Duration) {
+        self.last_update.store(
+            current_time().saturating_sub(initial.as_secs()),
+            Ordering::SeqCst,
+        );
+        *self.resident_age.lock().unwrap_or_else(|p| p.into_inner()) = ResidentAge {
+            initial,
+            received: Instant::now(),
+        };
+    }
+
+    pub(super) fn age(&self) -> Duration {
+        self.resident_age
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .at(Instant::now())
     }
 
     /// Check if the cache is revalidating
@@ -154,8 +277,30 @@ impl CacheState {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+
+    pub(super) fn begin_revalidation_after(&self, interval: Duration) -> bool {
+        let mut last = self
+            .last_revalidation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.is_some_and(|last| last.elapsed() < interval) || !self.begin_revalidation() {
+            return false;
+        }
+        *last = Some(Instant::now());
+        true
+    }
+
     /// Mark the cache as no longer revalidating.
     pub fn finish_revalidation(&self) {
+        let mut last = self
+            .last_revalidation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.is_some() {
+            // Start the cooldown after the attempt, including failed attempts,
+            // so a slow or failing provider cannot be polled without a break.
+            *last = Some(Instant::now());
+        }
         self.is_revalidating.store(false, Ordering::Release);
     }
 }
@@ -169,11 +314,12 @@ impl Default for CacheState {
 /// Helper Struct for storing
 #[derive(Debug)]
 pub struct JwkSetStore {
-    /// The current JWKS
-    pub jwks: JwkSet,
+    // Mutating this independently of decoding_map could retain revoked keys.
+    pub(super) jwks: JwkSet,
     decoding_map: HashMap<String, Arc<DecodingInfo>>,
     /// The cache policy for this store
     pub cache_policy: CachePolicy,
+    pub(super) restrictions: CacheRestrictions,
     validation: Validation,
     allow_symmetric_jwks: bool,
 }
@@ -182,13 +328,16 @@ impl JwkSetStore {
     /// Create a new `JwkSetStore`
     #[must_use]
     pub fn new(jwks: JwkSet, cache_policy: CachePolicy, validation: Validation) -> Self {
-        Self {
-            jwks,
+        let mut store = Self {
+            jwks: JwkSet { keys: Vec::new() },
             decoding_map: HashMap::new(),
             cache_policy,
+            restrictions: CacheRestrictions::default(),
             validation,
             allow_symmetric_jwks: false,
-        }
+        };
+        store.update_jwks(jwks);
+        store
     }
 
     /// Allow symmetric (`kty: "oct"` / HS*) JWKs from this JWKS endpoint.
@@ -202,10 +351,18 @@ impl JwkSetStore {
     #[must_use]
     pub fn with_allow_symmetric_jwks(mut self, allow: bool) -> Self {
         self.allow_symmetric_jwks = allow;
+        self.update_jwks(self.jwks.clone());
         self
     }
 
-    fn update_jwks(&mut self, new_jwks: JwkSet) {
+    /// Returns the currently indexed JWKS. Use [`Self::update_jwks`] to replace it.
+    #[must_use]
+    pub fn jwks(&self) -> &JwkSet {
+        &self.jwks
+    }
+
+    /// Replaces the JWKS and rebuilds its decoding index using this store's policy.
+    pub fn update_jwks(&mut self, new_jwks: JwkSet) {
         self.jwks = new_jwks;
         let allow_symmetric = self.allow_symmetric_jwks;
         let keys = self
@@ -227,10 +384,23 @@ impl JwkSetStore {
         self.decoding_map.get(kid).cloned()
     }
 
+    pub(super) fn transient_key(&self, jwks: &JwkSet, kid: &str) -> Option<Arc<DecodingInfo>> {
+        jwks.keys
+            .iter()
+            .filter_map(|jwk| decode_jwk(jwk, &self.validation, self.allow_symmetric_jwks).ok())
+            .rfind(|(id, _)| id == kid)
+            .map(|(_, info)| Arc::new(info))
+    }
+
     pub(crate) fn update_fetch(&mut self, fetch: JwkSetFetch) -> UpdateAction {
         tracing::debug!("Decoding JWKS");
         let time = Instant::now();
-        let new_jwks = fetch.jwks;
+        self.restrictions = fetch.restrictions;
+        let new_jwks = if fetch.restrictions.no_store {
+            JwkSet { keys: Vec::new() }
+        } else {
+            fetch.jwks
+        };
         // If we didn't parse out a cache policy from the last request
         // Assume that it is the same as the last
         let cache_policy = fetch.cache_policy.unwrap_or(self.cache_policy);
@@ -253,7 +423,9 @@ impl JwkSetStore {
             }
             // Both the cache and the JWKS have changed
             (false, false) => {
-                tracing::info!("cache-control header and JWKS content has changed since last update");
+                tracing::info!(
+                    "cache-control header and JWKS content has changed since last update"
+                );
                 self.update_jwks(new_jwks);
                 self.cache_policy = cache_policy;
                 UpdateAction::JwksAndCacheUpdate(cache_policy)
@@ -268,6 +440,54 @@ impl JwkSetStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monotonic_residence_adds_to_the_corrected_initial_age() {
+        let start = Instant::now();
+        let age = ResidentAge {
+            initial: Duration::from_secs(7),
+            received: start,
+        };
+        assert_eq!(
+            age.at(start + Duration::from_secs(20)),
+            Duration::from_secs(27)
+        );
+        // A wall-clock adjustment is not an input to residency accounting.
+        assert_eq!(age.at(start), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn restrictive_directives_win_regardless_of_order_and_field_splitting() {
+        for directive in ["no-cache", "no-store", "must-revalidate"] {
+            for fields in [
+                vec![
+                    HeaderValue::from_static(
+                        "max-age=10, stale-while-revalidate=40, stale-if-error=50",
+                    ),
+                    HeaderValue::from_str(directive).unwrap(),
+                ],
+                vec![
+                    HeaderValue::from_str(directive).unwrap(),
+                    HeaderValue::from_static(
+                        "max-age=10, stale-while-revalidate=40, stale-if-error=50",
+                    ),
+                ],
+            ] {
+                let (policy, restrictions) = CachePolicy::from_response_values(&fields);
+                assert_eq!(policy.stale_while_revalidate, None, "{directive}");
+                assert_eq!(policy.stale_if_error, None, "{directive}");
+                assert_eq!(
+                    policy.max_age,
+                    if directive == "must-revalidate" {
+                        Duration::from_secs(10)
+                    } else {
+                        Duration::ZERO
+                    }
+                );
+                assert_eq!(restrictions.no_store, directive == "no-store");
+            }
+        }
+    }
 
     #[test]
     fn test_cache_policy_default() {
@@ -306,7 +526,8 @@ mod tests {
 
     #[test]
     fn test_cache_policy_from_header_val_all() {
-        let header_value = HeaderValue::from_static("max-age=3600, stale-while-revalidate=60, stale-if-error=120");
+        let header_value =
+            HeaderValue::from_static("max-age=3600, stale-while-revalidate=60, stale-if-error=120");
         let policy = CachePolicy::from_header_val(Some(&header_value));
         assert_eq!(policy.max_age, Duration::from_secs(3600));
         assert_eq!(policy.stale_while_revalidate, Some(Duration::from_secs(60)));
@@ -337,5 +558,19 @@ mod tests {
         state.finish_revalidation();
         assert!(!state.is_revalidating());
         assert!(state.begin_revalidation());
+    }
+
+    #[test]
+    fn revalidation_cooldown_is_shared_and_expires() {
+        let state = Arc::new(CacheState::new());
+        let clone = Arc::clone(&state);
+        let interval = Duration::from_secs(1);
+        assert!(state.begin_revalidation_after(interval));
+        assert!(!clone.begin_revalidation_after(interval));
+        state.finish_revalidation();
+        assert!(!clone.begin_revalidation_after(interval));
+
+        *state.last_revalidation.lock().unwrap() = Some(Instant::now() - interval);
+        assert!(clone.begin_revalidation_after(interval));
     }
 }

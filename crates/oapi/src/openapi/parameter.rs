@@ -1,28 +1,47 @@
 //! Implements [OpenAPI Parameter Object][parameter] types.
 //!
 //! [parameter]: https://spec.openapis.org/oas/latest.html#parameter-object
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 use super::content::Content;
 use super::example::Example;
-use super::{Deprecated, RefOr, Required, Schema};
+use super::{Deprecated, Ref, RefOr, Required, Schema};
 use crate::PropMap;
 
 fn is_required_unset(value: &Required) -> bool {
     matches!(value, Required::Unset)
 }
 
-/// Collection for OpenAPI Parameter Objects.
+/// Collection of inline OpenAPI Parameter Objects and references to reusable parameters.
+///
+/// Inline entries are identified by name and location. References are identified by their
+/// reference location; they are retained without resolving their target, including external
+/// references. Consequently an inline entry and a reference remain distinct entries.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default, Clone)]
-pub struct Parameters(pub Vec<Parameter>);
+pub struct Parameters(pub Vec<RefOr<Parameter>>);
 
 impl IntoIterator for Parameters {
-    type Item = Parameter;
-    type IntoIter = <Vec<Parameter> as IntoIterator>::IntoIter;
+    type Item = RefOr<Parameter>;
+    type IntoIter = <Vec<RefOr<Parameter>> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
+    }
+}
+
+impl<P: Into<RefOr<Parameter>>> From<Vec<P>> for Parameters {
+    fn from(parameters: Vec<P>) -> Self {
+        let mut result = Self::new();
+        result.extend(parameters);
+        result
+    }
+}
+
+impl From<Ref> for RefOr<Parameter> {
+    fn from(reference: Ref) -> Self {
+        Self::Ref(reference)
     }
 }
 
@@ -40,32 +59,63 @@ impl Parameters {
     }
     /// Add a new parameter and returns `self`.
     #[must_use]
-    pub fn parameter<P: Into<Parameter>>(mut self, parameter: P) -> Self {
+    pub fn parameter<P: Into<RefOr<Parameter>>>(mut self, parameter: P) -> Self {
         self.insert(parameter);
         self
     }
-    /// Returns `true` if instance contains a parameter with the given name and location.
+    /// Iterate over inline parameters, skipping references without resolving their targets.
+    pub fn iter_inline(&self) -> impl Iterator<Item = &Parameter> {
+        self.0.iter().filter_map(|parameter| match parameter {
+            RefOr::Type(parameter) => Some(parameter),
+            RefOr::Ref(_) => None,
+        })
+    }
+
+    /// Mutably iterate over inline parameters, skipping references.
+    pub fn iter_inline_mut(&mut self) -> impl Iterator<Item = &mut Parameter> {
+        self.0.iter_mut().filter_map(|parameter| match parameter {
+            RefOr::Type(parameter) => Some(parameter),
+            RefOr::Ref(_) => None,
+        })
+    }
+
+    /// Returns `true` if an inline parameter has the given name and location.
+    /// References are not resolved by this method.
     #[must_use]
     pub fn contains(&self, name: &str, parameter_in: ParameterIn) -> bool {
-        self.0
-            .iter()
+        self.iter_inline()
             .any(|item| item.name == name && item.parameter_in == parameter_in)
     }
-    /// Inserts a parameter into the instance.
-    pub fn insert<P: Into<Parameter>>(&mut self, parameter: P) {
-        let mut parameter = parameter.into();
-        // Per the OpenAPI 3.1 spec, path parameters MUST have `required: true`.
-        if parameter.parameter_in == ParameterIn::Path {
-            parameter.required = Required::True;
-        }
-        let exist_item = self.0.iter_mut().find(|item| {
-            item.name == parameter.name && item.parameter_in == parameter.parameter_in
-        });
-
-        if let Some(exist_item) = exist_item {
-            exist_item.merge(parameter);
-        } else {
-            self.0.push(parameter);
+    /// Insert an inline parameter or reference.
+    ///
+    /// Matching inline entries are merged by name and location. A reference replaces an
+    /// existing reference with the same location, including its sibling metadata.
+    pub fn insert<P: Into<RefOr<Parameter>>>(&mut self, parameter: P) {
+        match parameter.into() {
+            RefOr::Type(mut parameter) => {
+                // Per the OpenAPI 3.1 spec, path parameters MUST have `required: true`.
+                if parameter.parameter_in == ParameterIn::Path {
+                    parameter.required = Required::True;
+                }
+                let existing = self.iter_inline_mut().find(|item| {
+                    item.name == parameter.name && item.parameter_in == parameter.parameter_in
+                });
+                if let Some(existing) = existing {
+                    existing.merge(parameter);
+                    return;
+                }
+                self.0.push(RefOr::Type(parameter));
+            }
+            RefOr::Ref(reference) => {
+                let existing = self.0.iter_mut().find(|item| {
+                    matches!(item, RefOr::Ref(existing) if existing.ref_location == reference.ref_location)
+                });
+                if let Some(existing) = existing {
+                    *existing = RefOr::Ref(reference);
+                } else {
+                    self.0.push(RefOr::Ref(reference));
+                }
+            }
         }
     }
     /// Moves all elements from `other` into `self`, leaving `other` empty.
@@ -78,9 +128,10 @@ impl Parameters {
         }
     }
     /// Extends a collection with the contents of an iterator.
-    pub fn extend<I>(&mut self, iter: I)
+    pub fn extend<I, P>(&mut self, iter: I)
     where
-        I: IntoIterator<Item = Parameter>,
+        I: IntoIterator<Item = P>,
+        P: Into<RefOr<Parameter>>,
     {
         for item in iter {
             self.insert(item);
@@ -92,7 +143,7 @@ impl Parameters {
 ///
 /// [parameter]: https://spec.openapis.org/oas/latest.html#parameter-object
 #[non_exhaustive]
-#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Parameter {
     /// Name of the parameter.
@@ -168,7 +219,11 @@ pub struct Parameter {
 
     /// Example of the [`Parameter`]'s potential value. This example will override any
     /// example defined within [`Parameter::schema`].
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::openapi::deserialize_json_value",
+        skip_serializing_if = "Option::is_none"
+    )]
     example: Option<Value>,
 
     /// Examples of the parameter's potential value, indexed by name. When both
@@ -186,6 +241,52 @@ pub struct Parameter {
     /// Optional extensions "x-something"
     #[serde(skip_serializing_if = "PropMap::is_empty", flatten)]
     pub extensions: PropMap<String, serde_json::Value>,
+}
+
+impl Serialize for Parameter {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("in", &self.parameter_in)?;
+        if !is_required_unset(&self.required) {
+            map.serialize_entry("required", &self.required)?;
+        }
+        if let Some(value) = &self.description {
+            map.serialize_entry("description", value)?;
+        }
+        if let Some(value) = &self.deprecated {
+            map.serialize_entry("deprecated", value)?;
+        }
+        if let Some(value) = &self.allow_empty_value {
+            map.serialize_entry("allowEmptyValue", value)?;
+        }
+        if let Some(value) = &self.schema {
+            map.serialize_entry("schema", value)?;
+        }
+        if let Some(value) = &self.style {
+            map.serialize_entry("style", value)?;
+        }
+        if let Some(value) = &self.explode {
+            map.serialize_entry("explode", value)?;
+        }
+        if let Some(value) = &self.allow_reserved {
+            map.serialize_entry("allowReserved", value)?;
+        }
+        if self.examples.is_empty() {
+            if let Some(example) = &self.example {
+                map.serialize_entry("example", example)?;
+            }
+        } else {
+            map.serialize_entry("examples", &self.examples)?;
+        }
+        if !self.content.is_empty() {
+            map.serialize_entry("content", &self.content)?;
+        }
+        for (key, value) in &self.extensions {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
 }
 
 impl Parameter {
@@ -224,8 +325,13 @@ impl Parameter {
         self.location(parameter_in)
     }
 
-    /// Fill [`Parameter`] with values from another [`Parameter`]. Fields will replaced if it is not
-    /// set.
+    /// Merge values from another [`Parameter`] with the same name and location.
+    ///
+    /// Fields supplied by `other` overwrite the corresponding fields in `self`.
+    /// A supplied schema or nonempty content map replaces the complete value representation,
+    /// keeping `schema` and `content` mutually exclusive. When neither is supplied, the
+    /// existing representation is preserved. Returns `false` without changing `self` if
+    /// the name or location differs.
     pub fn merge(&mut self, other: Self) -> bool {
         let Self {
             name,
@@ -264,8 +370,12 @@ impl Parameter {
         if let Some(allow_empty_value) = allow_empty_value {
             self.allow_empty_value = Some(allow_empty_value);
         }
-        if let Some(schema) = schema {
+        if !content.is_empty() {
+            self.schema = None;
+            self.content = content;
+        } else if let Some(schema) = schema {
             self.schema = Some(schema);
+            self.content.clear();
         }
         if let Some(style) = style {
             self.style = Some(style);
@@ -276,16 +386,15 @@ impl Parameter {
         if let Some(allow_reserved) = allow_reserved {
             self.allow_reserved = Some(allow_reserved);
         }
-        if let Some(example) = example {
-            self.example = Some(example);
+        if self.examples.is_empty() && examples.is_empty() {
+            if let Some(example) = example {
+                self.example = Some(example);
+            }
         }
-        for (k, v) in examples {
-            self.examples.insert(k, v);
+        self.examples.extend(examples);
+        if !self.examples.is_empty() {
+            self.example = None;
         }
-        for (k, v) in content {
-            self.content.insert(k, v);
-        }
-
         self.extensions.extend(extensions);
         true
     }
@@ -318,9 +427,12 @@ impl Parameter {
     }
 
     /// Add or change [`Parameter`]s schema.
+    ///
+    /// Clears any previously configured [`Parameter::content`].
     #[must_use]
     pub fn schema<I: Into<RefOr<Schema>>>(mut self, component: I) -> Self {
         self.schema = Some(component.into());
+        self.content.clear();
         self
     }
 
@@ -348,7 +460,7 @@ impl Parameter {
     /// Add or change example of [`Parameter`]'s potential value.
     #[must_use]
     pub fn example(mut self, example: Value) -> Self {
-        self.example = Some(example);
+        self.example = self.examples.is_empty().then_some(example);
         self
     }
 
@@ -362,6 +474,7 @@ impl Parameter {
         example: E,
     ) -> Self {
         self.examples.insert(name.into(), example.into());
+        self.example = None;
         self
     }
 
@@ -377,16 +490,20 @@ impl Parameter {
             .into_iter()
             .map(|(name, example)| (name.into(), example.into()))
             .collect();
+        if !self.examples.is_empty() {
+            self.example = None;
+        }
         self
     }
 
-    /// Insert a single media-type entry into [`Parameter::content`].
+    /// Set a single media-type entry in [`Parameter::content`].
     ///
     /// Per spec the `content` map must contain exactly one entry. Mutually exclusive with
-    /// [`Parameter::schema`].
+    /// [`Parameter::schema`]. Replaces previously configured content and clears the schema.
     #[must_use]
     pub fn content<S: Into<String>, C: Into<Content>>(mut self, media_type: S, content: C) -> Self {
-        self.content.insert(media_type.into(), content.into());
+        self.schema = None;
+        self.content = PropMap::from([(media_type.into(), content.into())]);
         self
     }
 
@@ -647,7 +764,9 @@ mod tests {
         // `Required::Unset`.
         assert_eq!(
             iter.next(),
-            Some(Parameter::new("param").required(Required::True))
+            Some(RefOr::Type(
+                Parameter::new("param").required(Required::True)
+            ))
         );
         assert!(iter.next().is_none());
     }

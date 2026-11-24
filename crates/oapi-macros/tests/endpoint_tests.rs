@@ -94,3 +94,178 @@ fn test_endpoint_singular_aliases() {
         })
     );
 }
+
+// The `request_body(...)` attribute must expand to paths that resolve through the `salvo`
+// facade, which is how this test crate (and most applications) reach `salvo-oapi`.
+#[test]
+fn test_endpoint_request_body_attribute() {
+    #[derive(serde::Deserialize, ToSchema)]
+    #[allow(dead_code)]
+    struct NewUser {
+        name: String,
+    }
+
+    #[endpoint(request_body(content = NewUser, description = "user payload"))]
+    async fn create_user() -> &'static str {
+        "ok"
+    }
+
+    // The attribute is merged into the body inferred from the `JsonBody` extractor.
+    #[endpoint(request_body(content = NewUser, description = "replacement payload"))]
+    async fn replace_user(_user: JsonBody<NewUser>) -> &'static str {
+        "ok"
+    }
+
+    #[endpoint(request_body = NewUser)]
+    async fn patch_user() -> &'static str {
+        "ok"
+    }
+
+    let router = Router::new()
+        .push(Router::with_path("users").post(create_user))
+        .push(
+            Router::with_path("users/{id}")
+                .put(replace_user)
+                .patch(patch_user),
+        );
+
+    let doc =
+        serde_json::to_value(OpenApi::new("test api", "0.0.1").merge_router(&router)).unwrap();
+    let schema_ref = json!({"$ref": "#/components/schemas/endpoint_tests.test_endpoint_request_body_attribute.NewUser"});
+    assert_json_eq!(
+        doc["paths"]["/users"]["post"]["requestBody"],
+        json!({
+            "description": "user payload",
+            "content": {"application/json": {"schema": schema_ref}},
+            "required": true
+        })
+    );
+    let merged = &doc["paths"]["/users/{id}"]["put"]["requestBody"];
+    assert_eq!(merged["description"], "replacement payload");
+    assert_eq!(merged["content"]["application/json"]["schema"], schema_ref);
+    let short_form = &doc["paths"]["/users/{id}"]["patch"]["requestBody"];
+    assert_eq!(
+        short_form["content"]["application/json"]["schema"],
+        schema_ref
+    );
+}
+
+// `links(...)` must expand to a path that exists: `Link` is re-exported from the crate
+// root, its `link` module is private.
+#[test]
+fn test_endpoint_response_links() {
+    #[endpoint(responses(
+        (status_code = 200, description = "success response",
+            links(
+                ("link_name" = (
+                    operation_id = "test_links",
+                    parameters(("key" = "value"), ("json_value" = json!(1))),
+                    request_body = "this is body",
+                    description = "follow up",
+                    server(url = "http://localhost")
+                )),
+                ("by_ref" = (operation_ref = "#/paths/~1users/get"))
+            )
+        )
+    ))]
+    async fn linked() {}
+
+    let router = Router::new().push(Router::with_path("linked").get(linked));
+    let doc =
+        serde_json::to_value(OpenApi::new("test api", "0.0.1").merge_router(&router)).unwrap();
+    assert_json_eq!(
+        doc["paths"]["/linked"]["get"]["responses"]["200"]["links"],
+        json!({
+            "link_name": {
+                "operationId": "test_links",
+                "parameters": {"key": "value", "json_value": 1},
+                "requestBody": "this is body",
+                "description": "follow up",
+                "server": {"url": "http://localhost"}
+            },
+            "by_ref": {"operationRef": "#/paths/~1users/get"}
+        })
+    );
+}
+
+// `allow_reserved` takes a `bool` on `Parameter`; both the tuple form and the
+// `ToParameters` field attribute must compile and reach the document.
+#[test]
+fn test_endpoint_parameter_allow_reserved() {
+    #[derive(serde::Deserialize, ToParameters)]
+    #[salvo(parameters(default_parameter_in = Query))]
+    #[allow(dead_code)]
+    struct Search {
+        #[salvo(parameter(allow_reserved))]
+        filter: String,
+        #[salvo(parameter(allow_reserved = false))]
+        strict: String,
+        plain: String,
+    }
+
+    #[endpoint(parameters(
+        ("q" = String, Query, allow_reserved),
+        ("r" = String, Query, allow_reserved = false),
+    ))]
+    async fn tuple_form() {}
+
+    #[endpoint]
+    async fn derive_form(_search: Search) {}
+
+    let router = Router::new()
+        .push(Router::with_path("tuple").get(tuple_form))
+        .push(Router::with_path("derive").get(derive_form));
+    let doc =
+        serde_json::to_value(OpenApi::new("test api", "0.0.1").merge_router(&router)).unwrap();
+
+    let tuple = &doc["paths"]["/tuple"]["get"]["parameters"];
+    assert_eq!(tuple[0]["name"], "q");
+    assert_eq!(tuple[0]["allowReserved"], true);
+    assert_eq!(tuple[1]["name"], "r");
+    assert_eq!(tuple[1]["allowReserved"], false);
+
+    let derive = &doc["paths"]["/derive"]["get"]["parameters"];
+    assert_eq!(derive[0]["name"], "filter");
+    assert_eq!(derive[0]["allowReserved"], true);
+    assert_eq!(derive[1]["name"], "strict");
+    assert_eq!(derive[1]["allowReserved"], false);
+    assert_eq!(derive[2]["name"], "plain");
+    assert!(derive[2].get("allowReserved").is_none());
+}
+
+// A handler function becomes a unit struct with the same name, so an unprefixed binding in the
+// expansion of *another* handler in scope would resolve to that struct instead of binding.
+// The names below are the ones the argument-extraction code used to bind.
+#[test]
+fn test_handler_names_do_not_capture_generated_bindings() {
+    #[handler]
+    async fn data() {}
+    #[handler]
+    async fn e() {}
+    #[endpoint]
+    async fn status_code() {}
+
+    #[handler]
+    async fn plain(id: QueryParam<u32, true>) -> String {
+        id.into_inner().to_string()
+    }
+
+    #[endpoint]
+    async fn documented(id: QueryParam<u32, true>) -> String {
+        id.into_inner().to_string()
+    }
+
+    let router = Router::new()
+        .push(Router::with_path("data").get(data))
+        .push(Router::with_path("e").get(e))
+        .push(Router::with_path("status_code").get(status_code))
+        .push(Router::with_path("plain").get(plain))
+        .push(Router::with_path("documented").get(documented));
+    let doc =
+        serde_json::to_value(OpenApi::new("test api", "0.0.1").merge_router(&router)).unwrap();
+    assert_eq!(
+        doc["paths"]["/documented"]["get"]["parameters"][0]["name"],
+        "id"
+    );
+    assert!(doc["paths"]["/status_code"]["get"].is_object());
+}

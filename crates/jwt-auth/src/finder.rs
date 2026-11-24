@@ -4,7 +4,7 @@ use salvo_core::async_trait;
 use salvo_core::http::header::{AUTHORIZATION, HeaderName};
 use salvo_core::http::{Method, Request};
 
-use super::ALL_METHODS;
+use super::STANDARD_METHODS;
 
 /// Trait for extracting JWT tokens from HTTP requests.
 ///
@@ -40,23 +40,29 @@ pub trait JwtTokenFinder: Send + Sync {
 /// // Custom configuration for specific methods
 /// let get_only = HeaderFinder::new().allowed_methods(vec![Method::GET]);
 /// ```
-#[derive(Eq, PartialEq, Clone, Default, Debug)]
+#[derive(Eq, PartialEq, Clone, Debug)]
 #[non_exhaustive]
 pub struct HeaderFinder {
-    /// Allowed HTTP methods for which this finder should extract tokens.
-    /// If the request's method is not in this list, the finder will not attempt extraction.
-    pub allowed_methods: Vec<Method>,
+    /// Methods for token extraction: `None` accepts all methods, including extensions.
+    /// `Some(methods)` is an explicit allowlist; `Some(Vec::new())` disables extraction.
+    pub allowed_methods: Option<Vec<Method>>,
 
     /// List of headers names to check for Bearer tokens.
     pub header_names: Vec<HeaderName>,
 }
+impl Default for HeaderFinder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HeaderFinder {
     /// Creates a new `HeaderFinder`.
     #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self {
-            allowed_methods: ALL_METHODS.to_vec(),
+            allowed_methods: None,
             header_names: vec![AUTHORIZATION],
         }
     }
@@ -75,16 +81,21 @@ impl HeaderFinder {
         self
     }
 
-    /// Returns a mutable reference to the allowed HTTP methods.
+    /// Returns an explicit method allowlist for mutation.
+    ///
+    /// If unrestricted, first restricts extraction to the standard HTTP methods.
+    /// Clearing this list disables extraction. Set `allowed_methods` to `None`
+    /// to accept all methods again.
     #[inline]
     pub fn allowed_methods_mut(&mut self) -> &mut Vec<Method> {
-        &mut self.allowed_methods
+        self.allowed_methods
+            .get_or_insert_with(|| STANDARD_METHODS.to_vec())
     }
-    /// Sets the allowed HTTP methods and returns `Self`.
+    /// Restricts extraction to these methods. An empty list disables extraction.
     #[inline]
     #[must_use]
     pub fn allowed_methods(mut self, methods: Vec<Method>) -> Self {
-        self.allowed_methods = methods;
+        self.allowed_methods = Some(methods);
         self
     }
     /// Deprecated alias for [`Self::allowed_methods_mut`].
@@ -105,7 +116,11 @@ impl HeaderFinder {
 impl JwtTokenFinder for HeaderFinder {
     #[inline]
     async fn find_token(&self, req: &mut Request) -> Option<String> {
-        if self.allowed_methods.contains(req.method()) {
+        if self
+            .allowed_methods
+            .as_ref()
+            .is_none_or(|methods| methods.contains(req.method()))
+        {
             for header_name in &self.header_names {
                 if let Some(Ok(auth)) = req.headers().get(header_name).map(|auth| auth.to_str())
                     && let Some((scheme, token)) = auth.split_once(' ')
@@ -168,8 +183,9 @@ mod tests {
 #[derive(Eq, PartialEq, Clone, Default, Debug)]
 #[non_exhaustive]
 pub struct FormFinder {
-    /// Allowed HTTP methods for which this finder should extract tokens.
-    pub allowed_methods: Vec<Method>,
+    /// Methods for token extraction: `None` accepts all methods, including extensions.
+    /// `Some(methods)` is an explicit allowlist; `Some(Vec::new())` disables extraction.
+    pub allowed_methods: Option<Vec<Method>>,
 
     /// Name of the form field containing the token.
     pub field_name: Cow<'static, str>,
@@ -180,19 +196,24 @@ impl FormFinder {
     pub fn new<T: Into<Cow<'static, str>>>(field_name: T) -> Self {
         Self {
             field_name: field_name.into(),
-            allowed_methods: ALL_METHODS.to_vec(),
+            allowed_methods: None,
         }
     }
-    /// Returns a mutable reference to the allowed HTTP methods.
+    /// Returns an explicit method allowlist for mutation.
+    ///
+    /// If unrestricted, first restricts extraction to the standard HTTP methods.
+    /// Clearing this list disables extraction. Set `allowed_methods` to `None`
+    /// to accept all methods again.
     #[inline]
     pub fn allowed_methods_mut(&mut self) -> &mut Vec<Method> {
-        &mut self.allowed_methods
+        self.allowed_methods
+            .get_or_insert_with(|| STANDARD_METHODS.to_vec())
     }
-    /// Sets the allowed HTTP methods and returns `Self`.
+    /// Restricts extraction to these methods. An empty list disables extraction.
     #[inline]
     #[must_use]
     pub fn allowed_methods(mut self, methods: Vec<Method>) -> Self {
-        self.allowed_methods = methods;
+        self.allowed_methods = Some(methods);
         self
     }
     /// Deprecated alias for [`Self::allowed_methods_mut`].
@@ -213,12 +234,23 @@ impl FormFinder {
 impl JwtTokenFinder for FormFinder {
     #[inline]
     async fn find_token(&self, req: &mut Request) -> Option<String> {
-        if self.allowed_methods.contains(req.method()) {
-            req.form(&self.field_name).await
+        if self
+            .allowed_methods
+            .as_ref()
+            .is_none_or(|methods| methods.contains(req.method()))
+        {
+            non_blank(req.form(&self.field_name).await)
         } else {
             None
         }
     }
+}
+
+/// A blank value is not a token. Returning it would stop `JwtAuth` from asking
+/// the finders after this one, as [`HeaderFinder`] already avoids for an empty
+/// `Bearer` credential.
+fn non_blank(token: Option<String>) -> Option<String> {
+    token.filter(|token| !token.trim().is_empty())
 }
 
 /// Extracts JWT tokens from URL query parameters.
@@ -240,8 +272,9 @@ impl JwtTokenFinder for FormFinder {
 #[derive(Eq, PartialEq, Clone, Default, Debug)]
 #[non_exhaustive]
 pub struct QueryFinder {
-    /// Allowed HTTP methods for which this finder should extract tokens.
-    pub allowed_methods: Vec<Method>,
+    /// Methods for token extraction: `None` accepts all methods, including extensions.
+    /// `Some(methods)` is an explicit allowlist; `Some(Vec::new())` disables extraction.
+    pub allowed_methods: Option<Vec<Method>>,
 
     /// Name of the query parameter containing the token.
     pub query_name: Cow<'static, str>,
@@ -252,19 +285,24 @@ impl QueryFinder {
     pub fn new<T: Into<Cow<'static, str>>>(query_name: T) -> Self {
         Self {
             query_name: query_name.into(),
-            allowed_methods: ALL_METHODS.to_vec(),
+            allowed_methods: None,
         }
     }
-    /// Returns a mutable reference to the allowed HTTP methods.
+    /// Returns an explicit method allowlist for mutation.
+    ///
+    /// If unrestricted, first restricts extraction to the standard HTTP methods.
+    /// Clearing this list disables extraction. Set `allowed_methods` to `None`
+    /// to accept all methods again.
     #[inline]
     pub fn allowed_methods_mut(&mut self) -> &mut Vec<Method> {
-        &mut self.allowed_methods
+        self.allowed_methods
+            .get_or_insert_with(|| STANDARD_METHODS.to_vec())
     }
-    /// Sets the allowed HTTP methods and returns `Self`.
+    /// Restricts extraction to these methods. An empty list disables extraction.
     #[inline]
     #[must_use]
     pub fn allowed_methods(mut self, methods: Vec<Method>) -> Self {
-        self.allowed_methods = methods;
+        self.allowed_methods = Some(methods);
         self
     }
     /// Deprecated alias for [`Self::allowed_methods_mut`].
@@ -286,8 +324,12 @@ impl QueryFinder {
 impl JwtTokenFinder for QueryFinder {
     #[inline]
     async fn find_token(&self, req: &mut Request) -> Option<String> {
-        if self.allowed_methods.contains(req.method()) {
-            req.query(&self.query_name)
+        if self
+            .allowed_methods
+            .as_ref()
+            .is_none_or(|methods| methods.contains(req.method()))
+        {
+            non_blank(req.query(&self.query_name))
         } else {
             None
         }
@@ -313,8 +355,9 @@ impl JwtTokenFinder for QueryFinder {
 #[derive(Eq, PartialEq, Clone, Default, Debug)]
 #[non_exhaustive]
 pub struct CookieFinder {
-    /// Allowed HTTP methods for which this finder should extract tokens.
-    pub allowed_methods: Vec<Method>,
+    /// Methods for token extraction: `None` accepts all methods, including extensions.
+    /// `Some(methods)` is an explicit allowlist; `Some(Vec::new())` disables extraction.
+    pub allowed_methods: Option<Vec<Method>>,
 
     /// Name of the cookie containing the token.
     pub cookie_name: Cow<'static, str>,
@@ -325,19 +368,24 @@ impl CookieFinder {
     pub fn new<T: Into<Cow<'static, str>>>(cookie_name: T) -> Self {
         Self {
             cookie_name: cookie_name.into(),
-            allowed_methods: ALL_METHODS.to_vec(),
+            allowed_methods: None,
         }
     }
-    /// Returns a mutable reference to the allowed HTTP methods.
+    /// Returns an explicit method allowlist for mutation.
+    ///
+    /// If unrestricted, first restricts extraction to the standard HTTP methods.
+    /// Clearing this list disables extraction. Set `allowed_methods` to `None`
+    /// to accept all methods again.
     #[inline]
     pub fn allowed_methods_mut(&mut self) -> &mut Vec<Method> {
-        &mut self.allowed_methods
+        self.allowed_methods
+            .get_or_insert_with(|| STANDARD_METHODS.to_vec())
     }
-    /// Sets the allowed HTTP methods and returns `Self`.
+    /// Restricts extraction to these methods. An empty list disables extraction.
     #[inline]
     #[must_use]
     pub fn allowed_methods(mut self, methods: Vec<Method>) -> Self {
-        self.allowed_methods = methods;
+        self.allowed_methods = Some(methods);
         self
     }
     /// Deprecated alias for [`Self::allowed_methods_mut`].
@@ -358,8 +406,12 @@ impl CookieFinder {
 impl JwtTokenFinder for CookieFinder {
     #[inline]
     async fn find_token(&self, req: &mut Request) -> Option<String> {
-        if self.allowed_methods.contains(req.method()) {
-            req.cookie(&self.cookie_name).map(|c| c.value().to_owned())
+        if self
+            .allowed_methods
+            .as_ref()
+            .is_none_or(|methods| methods.contains(req.method()))
+        {
+            non_blank(req.cookie(&self.cookie_name).map(|c| c.value().to_owned()))
         } else {
             None
         }

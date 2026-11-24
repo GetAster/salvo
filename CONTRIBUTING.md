@@ -14,6 +14,11 @@ Thank you for contributing to Salvo.
 2. Fork the repository and create a topic branch from `main`.
 3. Clone your fork and enter the workspace root.
 
+Salvo and the examples workspace require Rust 1.95 or newer. The MSRV CI job
+reads the root workspace declaration and checks the library crates and the
+Toasty example with that toolchain. It checks the root workspace with both
+default features and all targets and features, including benchmark targets.
+
 ```bash
 git clone https://github.com/<your-user>/salvo.git
 cd salvo
@@ -32,6 +37,7 @@ Run these commands before opening a pull request:
 ```bash
 cargo +nightly fmt --all -- --check
 cargo check --all --bins --examples --tests
+cargo +1.95.0 check --workspace --all-targets --all-features
 cargo test --all --all-features --no-fail-fast
 cargo test --workspace --doc
 ```
@@ -51,6 +57,36 @@ When your change affects examples, also verify the examples workspace:
 cd examples
 cargo check --all --bins --examples --tests
 ```
+
+## Performance Benchmarks
+
+The `Performance benchmarks` workflow runs the core `router_detect` and
+`service_dispatch` Criterion benchmarks on Ubuntu 24.04 with Rust 1.95.0. Run it
+manually for implementation changes; it also runs when the benchmark sources,
+their manifests, or the workflow change. Each run uploads Criterion results,
+the resolved lockfile, command output, and Git, compiler, runner image, and CPU
+metadata, including available diagnostics when the job fails.
+
+Run the same measurements locally with:
+
+```bash
+cargo +1.95.0 bench -p salvo_core --bench router_detect --bench service_dispatch -- --noplot --sample-size 20 --warm-up-time 1 --measurement-time 2
+```
+
+For a quick correctness smoke check without a release build, use:
+
+```bash
+cargo +1.95.0 bench --profile dev -p salvo_core --bench router_detect --bench service_dispatch -- --test
+```
+
+Smoke checks execute each scenario without collecting performance measurements.
+The workflow records measurements without enforcing a regression threshold.
+The runtime-cost workflow also compares identical fixtures on the same runner
+against the PR base or previous push commit and publishes a matched-workload
+summary. For manual runs, select the `baseline` input explicitly when `HEAD^`
+is not the intended comparison. See `benchmarks/runtime-costs/README.md`.
+Compare results from equivalent hardware and toolchains; hosted runner timing
+varies between runs, and a single run does not establish a performance change.
 
 ## Coding Guidelines
 
@@ -101,6 +137,23 @@ chained setters that use the `with_` prefix.
 - Write custom error, log, `panic!`, and `expect!` messages in the same style used across the Rust ecosystem: sentence starts lowercase and normally has no trailing period.
 - Prefer direct, grammatical wording that explains what is missing or why the operation failed.
 - Do not mechanically rewrite standardized protocol text such as HTTP reason phrases, RFC terms, or other externally defined wire-format strings.
+
+### Timeout And Filesystem Boundaries
+
+When changing timeout code or documentation, identify the phase being bounded: handler
+processing, connection establishment, request headers, request-body gaps, response-body
+production, transport inactivity, or total stream lifetime. Test stalled headers and stalled
+body frames separately. Include a legitimate long-stream case such as SSE, and distinguish
+body-production observations from socket delivery. A timeout around a handler future does
+not continue after it returns a streaming response.
+
+For static-file containment changes, distinguish fixed symlink/junction escapes from
+concurrent filesystem replacement. Canonical-path checks reject a fixed outside-root
+target but do not make a later path-based open atomic. A race requires an actor able to
+rename relevant directories or create/switch links; ordinary file upload access alone
+does not establish that capability. Keep served roots and their ancestors outside untrusted
+rename/link control, and document that assumption. Tests for a pre-existing escape link
+must not be presented as proof against concurrent replacement.
 
 ## Pull Requests
 

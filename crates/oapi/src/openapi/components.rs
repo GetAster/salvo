@@ -17,9 +17,13 @@ use crate::{
 ///
 /// [components]: https://spec.openapis.org/oas/latest.html#components-object
 #[non_exhaustive]
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Components {
+    // Construction state is owned by this document and is not an OpenAPI field.
+    #[serde(skip)]
+    pub(crate) composition: crate::schema::CompositionState,
+
     /// Map of reusable [OpenAPI Schema Object][schema]s.
     ///
     /// [schema]: https://spec.openapis.org/oas/latest.html#schema-object
@@ -58,11 +62,14 @@ pub struct Components {
     #[serde(skip_serializing_if = "PropMap::is_empty", default)]
     pub headers: PropMap<String, RefOr<Header>>,
 
-    /// Map of reusable [OpenAPI Security Scheme Object][security_scheme]s.
+    /// Map of reusable [OpenAPI Security Scheme Object][security_scheme]s or references.
+    ///
+    /// Direct map insertions of inline schemes must convert them with `.into()`.
+    /// Match [`RefOr::Type`] to access an inline scheme and [`RefOr::Ref`] to access a reference.
     ///
     /// [security_scheme]: https://spec.openapis.org/oas/latest.html#security-scheme-object
     #[serde(skip_serializing_if = "PropMap::is_empty", default)]
-    pub security_schemes: PropMap<String, SecurityScheme>,
+    pub security_schemes: PropMap<String, RefOr<SecurityScheme>>,
 
     /// Map of reusable [OpenAPI Link Object][link]s, indexed by name.
     ///
@@ -97,6 +104,28 @@ pub struct Components {
     pub extensions: PropMap<String, serde_json::Value>,
 }
 
+impl Clone for Components {
+    fn clone(&self) -> Self {
+        Self {
+            // A clone is a separate document construction. Do not copy active
+            // recursion markers or definitions depending on unfinished parents.
+            composition: Default::default(),
+            schemas: self.composition.clone_schemas(&self.schemas),
+            responses: self.responses.clone(),
+            parameters: self.parameters.clone(),
+            examples: self.examples.clone(),
+            request_bodies: self.request_bodies.clone(),
+            headers: self.headers.clone(),
+            security_schemes: self.security_schemes.clone(),
+            links: self.links.clone(),
+            callbacks: self.callbacks.clone(),
+            path_items: self.path_items.clone(),
+            media_types: self.media_types.clone(),
+            extensions: self.extensions.clone(),
+        }
+    }
+}
+
 impl Components {
     /// Construct a new empty [`Components`]. This is effectively same as calling
     /// [`Components::default`].
@@ -105,14 +134,14 @@ impl Components {
         Default::default()
     }
 
-    /// Add [`SecurityScheme`] to [`Components`] and returns `Self`.
+    /// Add a [`SecurityScheme`] or [`Ref`](crate::Ref) to [`Components`] and return `Self`.
     ///
     /// Accepts two arguments: the name of the [`SecurityScheme`] (used later when referenced
-    /// by [`SecurityRequirement`][requirement]s) and the [`SecurityScheme`] itself.
+    /// by [`SecurityRequirement`][requirement]s) and the scheme or reference itself.
     ///
     /// [requirement]: crate::SecurityRequirement
     #[must_use]
-    pub fn add_security_scheme<N: Into<String>, S: Into<SecurityScheme>>(
+    pub fn add_security_scheme<N: Into<String>, S: Into<RefOr<SecurityScheme>>>(
         mut self,
         name: N,
         security_scheme: S,
@@ -123,7 +152,7 @@ impl Components {
         self
     }
 
-    /// Add iterator of [`SecurityScheme`]s to [`Components`].
+    /// Add an iterator of [`SecurityScheme`]s or references to [`Components`].
     ///
     /// Accepts two arguments: the name of the [`SecurityScheme`] (used later when referenced
     /// by [`SecurityRequirement`][requirement]s) and the [`SecurityScheme`] itself.
@@ -133,7 +162,7 @@ impl Components {
     pub fn extend_security_schemes<
         I: IntoIterator<Item = (N, S)>,
         N: Into<String>,
-        S: Into<SecurityScheme>,
+        S: Into<RefOr<SecurityScheme>>,
     >(
         mut self,
         schemas: I,

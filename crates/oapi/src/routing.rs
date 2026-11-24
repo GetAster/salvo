@@ -1,6 +1,5 @@
 use std::any::TypeId;
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{LazyLock, RwLock};
+use std::collections::BTreeSet;
 
 use salvo_core::Router;
 use salvo_core::http::Method;
@@ -59,11 +58,11 @@ fn normalize_oapi_path(path: &str) -> String {
                 let Some(name) = content.get(..name_end) else {
                     break;
                 };
-                normalized.push_str(name);
+                normalized.push_str(parameter_name(name));
                 normalized.push('}');
             } else {
                 normalized.push('{');
-                normalized.push_str(content);
+                normalized.push_str(parameter_name(content));
                 normalized.push('}');
             }
         } else {
@@ -74,6 +73,18 @@ fn normalize_oapi_path(path: &str) -> String {
         }
     }
     normalized
+}
+
+/// Returns the name a path parameter has at runtime and in the operation's parameters.
+///
+/// A wildcard prefix (`**`, `*+`, `*?`, `*`) selects how much of the path is captured and is not
+/// part of that name. An unnamed wildcard has no name to expose and is left as written.
+fn parameter_name(name: &str) -> &str {
+    let stripped = ["*+", "*?", "**", "*"]
+        .into_iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+        .unwrap_or(name);
+    if stripped.is_empty() { name } else { stripped }
 }
 
 /// Where an operation discovered on a route belongs inside a Path Item Object.
@@ -91,6 +102,7 @@ pub(crate) struct NormNode {
     // pub(crate) router_id: usize,
     pub(crate) handler_type_id: Option<TypeId>,
     pub(crate) handler_type_name: Option<&'static str>,
+    pub(crate) handler_creator: Option<fn() -> crate::Endpoint>,
     pub(crate) method: Option<OperationSlot>,
     pub(crate) path: Option<String>,
     pub(crate) children: Vec<Self>,
@@ -99,76 +111,103 @@ pub(crate) struct NormNode {
 
 impl NormNode {
     pub(crate) fn new(router: &Router, inherited_metadata: Metadata) -> Self {
+        Self::with_method(router, inherited_metadata, None)
+    }
+
+    fn with_method(
+        router: &Router,
+        inherited_metadata: Metadata,
+        mut method: Option<Method>,
+    ) -> Self {
         let mut node = Self {
             // router_id: router.id,
             metadata: inherited_metadata,
             ..Self::default()
         };
-        // Clone out and release the guard before recursing into the children:
-        // re-acquiring a read lock while a writer is queued deadlocks.
-        let metadata = METADATA_REGISTRY
-            .read()
-            .expect("failed to lock METADATA_REGISTRY for read")
-            .get(&router.id)
-            .cloned();
-        if let Some(metadata) = metadata {
-            node.metadata.tags.extend(metadata.tags);
-            node.metadata.securities.extend(metadata.securities);
+        if let Some(metadata) = router.extensions().get::<Metadata>() {
+            node.metadata.tags.extend(metadata.tags.iter().cloned());
+            node.metadata
+                .securities
+                .extend(metadata.securities.iter().cloned());
         }
 
         for filter in router.filters() {
             match filter.info() {
                 FilterInfo::Path(path) => {
-                    node.path = Some(normalize_oapi_path(&path));
-                }
-                FilterInfo::Method(method) => {
-                    // Methods with a dedicated Path Item field map to `PathItemType`;
-                    // everything else (CONNECT and custom/extension methods) goes to
-                    // `additionalOperations`, which requires OpenAPI 3.2. Whether such a
-                    // slot is actually emitted is decided later, when the document version
-                    // is known.
-                    let item = match method {
-                        Method::GET => OperationSlot::Standard(PathItemType::Get),
-                        Method::POST => OperationSlot::Standard(PathItemType::Post),
-                        Method::PUT => OperationSlot::Standard(PathItemType::Put),
-                        Method::DELETE => OperationSlot::Standard(PathItemType::Delete),
-                        Method::HEAD => OperationSlot::Standard(PathItemType::Head),
-                        Method::OPTIONS => OperationSlot::Standard(PathItemType::Options),
-                        Method::TRACE => OperationSlot::Standard(PathItemType::Trace),
-                        Method::PATCH => OperationSlot::Standard(PathItemType::Patch),
-                        Method::QUERY => OperationSlot::Standard(PathItemType::Query),
-                        other => OperationSlot::Additional(other.as_str().to_owned()),
-                    };
-                    // A standard method never loses to a custom one, so combining a
-                    // standard method filter with a custom one does not erase the standard
-                    // mapping (the previous string-parsing path had the same behavior via
-                    // its `_ => {}` arm).
-                    if matches!(item, OperationSlot::Standard(_))
-                        || !matches!(node.method, Some(OperationSlot::Standard(_)))
-                    {
-                        node.method = Some(item);
+                    let path = normalize_oapi_path(&path);
+                    if let Some(current) = &mut node.path {
+                        if !path.trim_matches('/').is_empty() {
+                            if current.trim_matches('/').is_empty() {
+                                *current = path;
+                            } else {
+                                current.truncate(current.trim_end_matches('/').len());
+                                current.push('/');
+                                current.push_str(path.trim_start_matches('/'));
+                            }
+                        }
+                    } else {
+                        node.path = Some(path);
                     }
+                }
+                FilterInfo::Method(current) => {
+                    // Router filters and all ancestor filters are conjunctive. A
+                    // different method cannot override an earlier constraint: no
+                    // request can reach this node or any of its descendants.
+                    if method.as_ref().is_some_and(|method| method != &current) {
+                        return node;
+                    }
+                    method = Some(current);
                 }
                 // Other filter kinds (Scheme/Host/Port/Other) do not carry
                 // information that maps to OpenAPI path items.
                 _ => {}
             }
         }
+        // Preserve extension method spelling; version compatibility is checked
+        // when the operation is inserted into the OpenAPI document.
+        node.method = method.as_ref().map(|method| match *method {
+            Method::GET => OperationSlot::Standard(PathItemType::Get),
+            Method::POST => OperationSlot::Standard(PathItemType::Post),
+            Method::PUT => OperationSlot::Standard(PathItemType::Put),
+            Method::DELETE => OperationSlot::Standard(PathItemType::Delete),
+            Method::HEAD => OperationSlot::Standard(PathItemType::Head),
+            Method::OPTIONS => OperationSlot::Standard(PathItemType::Options),
+            Method::TRACE => OperationSlot::Standard(PathItemType::Trace),
+            Method::PATCH => OperationSlot::Standard(PathItemType::Patch),
+            Method::QUERY => OperationSlot::Standard(PathItemType::Query),
+            _ => OperationSlot::Additional(method.as_str().to_owned()),
+        });
         node.handler_type_id = router.goal.as_ref().map(|h| h.type_id());
         node.handler_type_name = router.goal.as_ref().map(|h| h.type_name());
+        node.handler_creator = router.goal.as_ref().and_then(|handler| {
+            handler
+                .type_data()?
+                .downcast_ref::<fn() -> crate::Endpoint>()
+                .copied()
+        });
         let routers = router.routers();
         if !routers.is_empty() {
             for router in routers {
-                node.children.push(Self::new(router, node.metadata.clone()));
+                node.children.push(Self::with_method(
+                    router,
+                    node.metadata.clone(),
+                    method.clone(),
+                ));
             }
         }
         node
     }
 }
 
-/// A component for save router metadata.
-type MetadataMap = RwLock<HashMap<usize, Metadata>>;
-static METADATA_REGISTRY: LazyLock<MetadataMap> = LazyLock::new(MetadataMap::default);
+fn router_metadata(router: &mut Router) -> &mut Metadata {
+    let extensions = router.extensions_mut();
+    if extensions.get::<Metadata>().is_none() {
+        extensions.insert(Metadata::default());
+    }
+    extensions
+        .get_mut::<Metadata>()
+        .expect("metadata was inserted")
+}
 
 /// Router extension trait for openapi metadata.
 pub trait RouterExt {
@@ -203,43 +242,29 @@ pub trait RouterExt {
 }
 
 impl RouterExt for Router {
-    fn oapi_security(self, security: SecurityRequirement) -> Self {
-        let mut guard = METADATA_REGISTRY
-            .write()
-            .expect("failed to lock METADATA_REGISTRY for write");
-        let metadata = guard.entry(self.id).or_default();
-        metadata.securities.push(security);
+    fn oapi_security(mut self, security: SecurityRequirement) -> Self {
+        router_metadata(&mut self).securities.push(security);
         self
     }
-    fn oapi_securities<I>(self, iter: I) -> Self
+    fn oapi_securities<I>(mut self, iter: I) -> Self
     where
         I: IntoIterator<Item = SecurityRequirement>,
     {
-        let mut guard = METADATA_REGISTRY
-            .write()
-            .expect("failed to lock METADATA_REGISTRY for write");
-        let metadata = guard.entry(self.id).or_default();
-        metadata.securities.extend(iter);
+        router_metadata(&mut self).securities.extend(iter);
         self
     }
-    fn oapi_tag(self, tag: impl Into<String>) -> Self {
-        let mut guard = METADATA_REGISTRY
-            .write()
-            .expect("failed to lock METADATA_REGISTRY for write");
-        let metadata = guard.entry(self.id).or_default();
-        metadata.tags.insert(tag.into());
+    fn oapi_tag(mut self, tag: impl Into<String>) -> Self {
+        router_metadata(&mut self).tags.insert(tag.into());
         self
     }
-    fn oapi_tags<I, V>(self, iter: I) -> Self
+    fn oapi_tags<I, V>(mut self, iter: I) -> Self
     where
         I: IntoIterator<Item = V>,
         V: Into<String>,
     {
-        let mut guard = METADATA_REGISTRY
-            .write()
-            .expect("failed to lock METADATA_REGISTRY for write");
-        let metadata = guard.entry(self.id).or_default();
-        metadata.tags.extend(iter.into_iter().map(Into::into));
+        router_metadata(&mut self)
+            .tags
+            .extend(iter.into_iter().map(Into::into));
         self
     }
 }
@@ -256,6 +281,16 @@ mod tests {
     use super::normalize_oapi_path;
 
     #[test]
+    fn repeated_path_filters_keep_constraints_and_slash_boundaries() {
+        let router = salvo_core::Router::new()
+            .path("/api/")
+            .path("/{version:num}/")
+            .path("/");
+        let node = super::NormNode::new(&router, Default::default());
+        assert_eq!(node.path.as_deref(), Some("/api/{version}/"));
+    }
+
+    #[test]
     fn normalize_braced_path_constraints() {
         assert_eq!(normalize_oapi_path("/posts/{id}"), "/posts/{id}");
         assert_eq!(normalize_oapi_path("/posts/{id:num}"), "/posts/{id}");
@@ -269,6 +304,27 @@ mod tests {
             normalize_oapi_path("/posts/article_{id:num}"),
             "/posts/article_{id}"
         );
+    }
+
+    #[test]
+    fn normalize_wildcard_path_parameters() {
+        for wildcard in ["{**rest}", "{*+rest}", "{*?rest}", "{*rest}"] {
+            assert_eq!(
+                normalize_oapi_path(&format!("/files/{wildcard}")),
+                "/files/{rest}",
+                "{wildcard}"
+            );
+        }
+        assert_eq!(
+            normalize_oapi_path(r"/files/{**rest|public/.*}"),
+            "/files/{rest}"
+        );
+        assert_eq!(normalize_oapi_path("/a/{*+rest}/b"), "/a/{rest}/b");
+        // There is no name to expose for an unnamed wildcard.
+        for wildcard in ["{**}", "{*+}", "{*?}", "{*}"] {
+            let path = format!("/files/{wildcard}");
+            assert_eq!(normalize_oapi_path(&path), path);
+        }
     }
 
     /// Building a document while another thread adds router metadata must not

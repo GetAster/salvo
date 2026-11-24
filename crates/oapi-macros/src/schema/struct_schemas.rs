@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use proc_macro2::TokenStream;
-use quote::{ToTokens, format_ident, quote};
+use quote::{ToTokens, quote};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::token::Comma;
@@ -17,13 +17,12 @@ use crate::feature::attributes::{
     self, Alias, Bound, Default, Ignore, Name, NoRecursion, RenameAll, Required, SkipBound,
 };
 use crate::feature::{
-    Feature, FeaturesExt, IsSkipped, TryToTokensExt, parse_features, pop_feature,
-    pop_feature_as_inner,
+    Feature, FeaturesExt, IsSkipped, parse_features, pop_feature, pop_feature_as_inner,
 };
 use crate::schema::{Description, Inline};
 use crate::type_tree::TypeTree;
 use crate::{
-    Deprecated, DiagLevel, DiagResult, Diagnostic, IntoInner, SerdeContainer, SerdeValue,
+    AnyValue, Deprecated, DiagLevel, DiagResult, Diagnostic, IntoInner, SerdeContainer, SerdeValue,
     TryToTokens, serde_util,
 };
 
@@ -49,6 +48,121 @@ struct NamedStructFieldOptions<'a> {
     required: Option<Required>,
     is_option: bool,
     ignore: Option<crate::parse_utils::LitBoolOrExprPath>,
+}
+
+pub(crate) fn transparent_field(
+    fields: &Punctuated<Field, Token![,]>,
+) -> DiagResult<(usize, &Field)> {
+    let mut selected = None;
+    for (index, field) in fields.iter().enumerate() {
+        let rules = serde_util::parse_value(&field.attrs).map_err(Diagnostic::from)?;
+        if is_not_skipped(rules.as_ref()) {
+            if selected.is_some() {
+                return Err(Diagnostic::spanned(
+                    fields.span(),
+                    DiagLevel::Error,
+                    "serde transparent requires exactly one serialized field",
+                ));
+            }
+            selected = Some((index, field));
+        }
+    }
+    selected.ok_or_else(|| {
+        Diagnostic::spanned(
+            fields.span(),
+            DiagLevel::Error,
+            "serde transparent requires a serialized field",
+        )
+    })
+}
+
+fn transparent_schema(
+    fields: &Punctuated<Field, Token![,]>,
+    attributes: &[Attribute],
+    mut features: Option<Vec<Feature>>,
+    description: Option<&Description>,
+    struct_name: &str,
+    compose_context: Option<&crate::component::ComposeContext>,
+) -> DiagResult<TokenStream> {
+    let (index, field) = transparent_field(fields)?;
+    let field_features = field
+        .attrs
+        .parse_features::<NamedFieldFeatures>()?
+        .into_inner()
+        .unwrap_or_default();
+    let features = features.get_or_insert_with(Vec::new);
+    for feature in field_features {
+        // Property names, requiredness and visibility do not wrap the value of
+        // a transparent container. All value-level features retain their meaning.
+        if matches!(
+            feature,
+            Feature::Rename(_) | Feature::Required(_) | Feature::Skip(_) | Feature::Ignore(_)
+        ) {
+            continue;
+        }
+        features.retain(|existing| {
+            std::mem::discriminant(existing) != std::mem::discriminant(&feature)
+        });
+        features.push(feature);
+    }
+    if let Some(with_schema) = pop_feature!(features => Feature::SchemaWith(_)) {
+        return with_schema.try_to_token_stream();
+    }
+    let value_type = features.pop_value_type_feature();
+    let type_tree = value_type
+        .as_ref()
+        .map(|value| value.as_type_tree())
+        .transpose()?
+        .unwrap_or(TypeTree::from_type(&field.ty)?);
+    let member = field
+        .ident
+        .clone()
+        .map(syn::Member::Named)
+        .unwrap_or_else(|| syn::Member::Unnamed(index.into()));
+    if pop_feature!(features => Feature::Default(Default(None))).is_some() {
+        features.push(Feature::Default(Default::new_default_trait(member)));
+    } else if !features
+        .iter()
+        .any(|feature| matches!(feature, Feature::Default(_)))
+        && let Some(rules) = serde_util::parse_container(attributes).map_err(Diagnostic::from)?
+        && rules.is_default
+    {
+        let constructor = match rules.default_path {
+            Some(path) => quote! { #path() },
+            None => quote! { Self::default() },
+        };
+        features.push(Feature::Default(Default(Some(AnyValue::Json(quote! {
+            (#constructor).#member
+        })))));
+    }
+    let comments = CommentAttributes::from_attributes(attributes);
+    let field_comments = CommentAttributes::from_attributes(&field.attrs);
+    let description = description
+        .map(ComponentDescription::Description)
+        .unwrap_or(ComponentDescription::CommentAttributes(
+            if comments.is_empty() {
+                &field_comments
+            } else {
+                &comments
+            },
+        ));
+    let field_deprecated =
+        pop_feature!(features => Feature::Deprecated(_)).and_then(|feature| match feature {
+            Feature::Deprecated(deprecated) => Some(Deprecated::from(deprecated.0)),
+            _ => None,
+        });
+    let deprecated = crate::get_deprecated(attributes)
+        .or_else(|| crate::get_deprecated(&field.attrs))
+        .or(field_deprecated);
+    Ok(ComponentSchema::new(ComponentSchemaProps {
+        type_tree: &type_tree,
+        features: Some(features.clone()),
+        description: Some(&description),
+        deprecated: deprecated.as_ref(),
+        object_name: struct_name,
+        compose_context,
+    })?
+    .to_token_stream())
 }
 
 impl NamedStructSchema<'_> {
@@ -112,11 +226,13 @@ impl NamedStructSchema<'_> {
                     .as_ref()
                     .expect("field ident should be exist")
                     .to_owned();
-                let struct_ident = format_ident!("{}", &self.struct_name);
-                features_inner.push(Feature::Default(Default::new_default_trait(
-                    struct_ident,
-                    field_ident.into(),
-                )));
+                let default = match container_rules.and_then(|rules| rules.default_path.as_ref()) {
+                    Some(path) if !schema_default => {
+                        Default(Some(AnyValue::Json(quote! { (#path()).#field_ident })))
+                    }
+                    _ => Default::new_default_trait(field_ident.into()),
+                };
+                features_inner.push(Feature::Default(default));
             }
         }
 
@@ -126,13 +242,13 @@ impl NamedStructSchema<'_> {
                 _ => None,
             });
 
-        let deprecated = crate::get_deprecated(&field.attrs).or_else(|| {
-            pop_feature!(field_features => Feature::Deprecated(_)).and_then(|feature| match feature
-            {
-                Feature::Deprecated(_) => Some(Deprecated::True),
+        let schema_deprecated = pop_feature!(field_features => Feature::Deprecated(_)).and_then(
+            |feature| match feature {
+                Feature::Deprecated(deprecated) => Some(Deprecated::from(deprecated.0)),
                 _ => None,
-            })
-        });
+            },
+        );
+        let deprecated = crate::get_deprecated(&field.attrs).or(schema_deprecated);
 
         let value_type = field_features
             .as_mut()
@@ -149,8 +265,11 @@ impl NamedStructSchema<'_> {
             Some(Feature::Ignore(Ignore(bool_or_exp))) => Some(bool_or_exp),
             _ => None,
         };
-        let type_tree = override_type_tree.as_ref().unwrap_or(type_tree);
+        let mut type_tree = override_type_tree.as_ref().unwrap_or(type_tree);
         let is_option = type_tree.is_option();
+        while flatten && type_tree.is_option() {
+            type_tree = &type_tree.children.as_ref().expect("Option has a child")[0];
+        }
 
         Ok(NamedStructFieldOptions {
             property: if let Some(with_schema) = with_schema {
@@ -167,7 +286,11 @@ impl NamedStructSchema<'_> {
                 if flatten && type_tree.is_map() {
                     Property::FlattenedMap(FlattenedMapSchema::new(cs)?)
                 } else {
-                    Property::Schema(ComponentSchema::new(cs)?)
+                    let schema_type = value_type
+                        .as_ref()
+                        .map(|value_type| &value_type.0)
+                        .unwrap_or(&field.ty);
+                    Property::Schema(ComponentSchema::for_type(cs, schema_type)?)
                 }
             },
             rename_field_value: rename_field,
@@ -183,6 +306,20 @@ impl TryToTokens for NamedStructSchema<'_> {
         let oapi = crate::oapi_crate();
         let container_rules =
             serde_util::parse_container(self.attributes).map_err(Diagnostic::from)?;
+        if container_rules
+            .as_ref()
+            .is_some_and(|rules| rules.transparent)
+        {
+            tokens.extend(transparent_schema(
+                self.fields,
+                self.attributes,
+                self.features.clone(),
+                self.description.as_ref(),
+                &self.struct_name,
+                self.compose_context.as_ref(),
+            )?);
+            return Ok(());
+        }
         let schema_default = self
             .features
             .as_ref()
@@ -221,7 +358,34 @@ impl TryToTokens for NamedStructSchema<'_> {
             .flatten()
             .collect::<Vec<_>>();
 
-        let mut object_tokens = quote! { #oapi::oapi::Object::new() };
+        // Object constraints still apply to the entire instance when this object
+        // becomes one member of an allOf for flattened fields.
+        let (object_features, schema_features): (Vec<_>, Vec<_>) =
+            self.features.iter().flatten().partition(|feature| {
+                matches!(
+                    feature,
+                    Feature::MaxProperties(_) | Feature::MinProperties(_)
+                )
+            });
+        let object_features = object_features
+            .into_iter()
+            .map(TryToTokens::try_to_token_stream)
+            .collect::<DiagResult<TokenStream>>()?;
+        let mut object_tokens = quote! { #oapi::oapi::Object::new() #object_features };
+        let struct_tag = match container_rules.as_ref().map(|rules| &rules.enum_repr) {
+            Some(serde_util::SerdeEnumRepr::InternallyTagged { tag }) => {
+                let name = serde_util::parse_value(self.attributes)
+                    .map_err(Diagnostic::from)?
+                    .and_then(|rules| rules.rename)
+                    .unwrap_or_else(|| self.struct_name.trim_start_matches("r#").to_owned());
+                object_tokens.extend(quote! {
+                    .property(#tag, #oapi::oapi::Object::with_type(#oapi::oapi::schema::BasicType::String).enum_values([#name]))
+                    .required(#tag)
+                });
+                Some((tag, name))
+            }
+            _ => None,
+        };
         for (field, field_rule) in field_values {
             let mut field_name = &*field
                 .ident
@@ -311,33 +475,64 @@ impl TryToTokens for NamedStructSchema<'_> {
             .fields
             .iter()
             .map(|field| {
-                let field_rule = serde_util::parse_value(&field.attrs).map_err(Diagnostic::from)?;
-                Ok((field, field_rule))
+                let rules = serde_util::parse_value(&field.attrs).map_err(Diagnostic::from)?;
+                let skipped = field
+                    .attrs
+                    .parse_features::<NamedFieldFeatures>()?
+                    .into_inner()
+                    .is_some_and(|features| features.is_skipped());
+                Ok((field, rules, skipped))
             })
             .collect::<DiagResult<Vec<_>>>()?
             .into_iter()
-            .filter(|(_, field_rule)| is_flatten(field_rule.as_ref()))
-            .map(|(field, _)| field)
+            .filter(|(_, rules, skipped)| {
+                !skipped && is_not_skipped(rules.as_ref()) && is_flatten(rules.as_ref())
+            })
+            .map(|(field, ..)| field)
             .collect();
 
         let all_of = if !flatten_fields.is_empty() {
-            let mut flattened_tokens = TokenStream::new();
+            let mut flattened_tokens = quote! { #oapi::oapi::schema::AllOf::new() };
+            let mut has_flattened_schema = false;
             let mut flattened_map_field = None;
+            let mut flattened_map_schema = None;
 
             for field in flatten_fields {
-                let NamedStructFieldOptions { property, .. } =
-                    self.field_as_schema_property(field, true, container_rules.as_ref())?;
+                let NamedStructFieldOptions {
+                    property,
+                    ignore,
+                    is_option,
+                    ..
+                } = self.field_as_schema_property(field, true, container_rules.as_ref())?;
 
+                let guard = match ignore {
+                    Some(crate::parse_utils::LitBoolOrExprPath::LitBool(lit)) if lit.value() => {
+                        continue;
+                    }
+                    Some(crate::parse_utils::LitBoolOrExprPath::ExprPath(path)) => Some(path),
+                    _ => None,
+                };
                 match property {
                     Property::Schema(_) | Property::SchemaWith(_) => {
                         let property = property.try_to_token_stream()?;
-                        flattened_tokens.extend(quote! { .item(#property) })
+                        let property = if is_option {
+                            quote! { #oapi::oapi::schema::optional_flatten_schema((#property).into(), &__salvo_flatten_base, components) }
+                        } else {
+                            property
+                        };
+                        has_flattened_schema = true;
+                        flattened_tokens = if let Some(path) = guard {
+                            quote! {{ let __all_of = #flattened_tokens;
+                                if !#path() { __all_of.item(#property) } else { __all_of }
+                            }}
+                        } else {
+                            quote! { #flattened_tokens.item(#property) }
+                        };
                     }
-                    Property::FlattenedMap(_) => match flattened_map_field {
+                    Property::FlattenedMap(ref map) => match flattened_map_field {
                         None => {
                             let property = property.try_to_token_stream()?;
-                            object_tokens
-                                .extend(quote! { .additional_properties(Some(#property)) });
+                            flattened_map_schema = Some((property, map.key_schema.clone(), guard));
                             flattened_map_field = Some(field);
                         }
                         Some(flattened_map_field) => {
@@ -362,14 +557,46 @@ impl TryToTokens for NamedStructSchema<'_> {
                 }
             }
 
-            if flattened_tokens.is_empty() {
+            if !has_flattened_schema {
+                if let Some((property, key_schema, guard)) = flattened_map_schema {
+                    object_tokens = if let Some(path) = guard {
+                        quote! {{ let __obj = #object_tokens;
+                            if !#path() { #oapi::oapi::schema::with_flattened_map_key(
+                                __obj.additional_properties(#property), (#key_schema).into(), components) } else { __obj }
+                        }}
+                    } else {
+                        quote! { #oapi::oapi::schema::with_flattened_map_key(
+                        #object_tokens.additional_properties(#property), (#key_schema).into(), components) }
+                    };
+                }
                 tokens.extend(object_tokens);
                 false
             } else {
+                let schema = quote! {
+                    {
+                        let __salvo_flatten_base = #object_tokens;
+                        (#flattened_tokens).item(__salvo_flatten_base)
+                    }
+                };
+                let schema = if let Some((property, key_schema, guard)) = flattened_map_schema {
+                    // additionalProperties only sees this local object's properties.
+                    // Evaluate all siblings/references before constraining remaining keys.
+                    let catch_all = quote! {
+                        .item(#oapi::oapi::Object::new().additional_properties(#property)
+                            .property_names(#oapi::oapi::schema::serialized_map_key_schema((#key_schema).into(), components)))
+                    };
+                    if let Some(path) = guard {
+                        quote! {{ let __schema = #schema;
+                            if !#path() { __schema #catch_all } else { __schema }
+                        }}
+                    } else {
+                        quote! { #schema #catch_all }
+                    }
+                } else {
+                    schema
+                };
                 tokens.extend(quote! {
-                    #oapi::oapi::schema::AllOf::new()
-                        #flattened_tokens
-                    .item(#object_tokens)
+                    #oapi::oapi::schema::flatten_all_of_schema(#schema, components)
                 });
                 true
             }
@@ -379,10 +606,29 @@ impl TryToTokens for NamedStructSchema<'_> {
         };
 
         if all_of && (schema_default || serde_default) {
-            let struct_ident = format_ident!("{}", &self.struct_name);
             let mut default_value_tokens = TokenStream::new();
+            if let Some((tag, name)) = &struct_tag {
+                default_value_tokens.extend(quote! {
+                    __default.insert(#tag.into(), #oapi::oapi::__private::serde_json::json!(#name));
+                });
+            }
+            let default_constructor = match container_rules
+                .as_ref()
+                .and_then(|rules| rules.default_path.as_ref())
+            {
+                Some(path) if !schema_default => quote! { #path() },
+                _ => quote! { Self::default() },
+            };
 
             for field in self.fields {
+                if field
+                    .attrs
+                    .parse_features::<NamedFieldFeatures>()?
+                    .into_inner()
+                    .is_some_and(|features| features.is_skipped())
+                {
+                    continue;
+                }
                 let field_rule = serde_util::parse_value(&field.attrs).map_err(Diagnostic::from)?;
                 if !is_not_skipped(field_rule.as_ref()) {
                     continue;
@@ -417,7 +663,7 @@ impl TryToTokens for NamedStructSchema<'_> {
                 if is_flatten(field_rule.as_ref()) {
                     let insert_tokens = quote! {
                         if let #oapi::oapi::__private::serde_json::Value::Object(__flattened) =
-                            #oapi::oapi::__private::serde_json::to_value(#struct_ident::default().#field_ident).unwrap()
+                            #oapi::oapi::__private::serde_json::to_value((#default_constructor).#field_ident).unwrap()
                         {
                             __default.extend(__flattened);
                         }
@@ -450,7 +696,7 @@ impl TryToTokens for NamedStructSchema<'_> {
                     let insert_tokens = quote! {
                         __default.insert(
                             #name.to_owned(),
-                            #oapi::oapi::__private::serde_json::to_value(#struct_ident::default().#field_ident).unwrap(),
+                            #oapi::oapi::__private::serde_json::to_value((#default_constructor).#field_ident).unwrap(),
                         );
                     };
                     if let Some(guard_tokens) = maybe_guard {
@@ -489,8 +735,8 @@ impl TryToTokens for NamedStructSchema<'_> {
             tokens.extend(quote! { .deprecated(#deprecated) });
         }
 
-        if let Some(struct_features) = self.features.as_ref() {
-            tokens.extend(struct_features.try_to_token_stream()?)
+        for feature in schema_features {
+            feature.try_to_tokens(tokens)?;
         }
 
         let comments = CommentAttributes::from_attributes(self.attributes);
@@ -527,22 +773,86 @@ impl UnnamedStructSchema<'_> {
     }
 }
 
+// Enumerate distinct serialized subsequences, merging only equivalent item schemas.
+// The bound applies to distinct shapes, so homogeneous optional tuples stay linear.
+fn conditional_tuple_shapes(
+    keys: &[String],
+    optional: &[bool],
+    span: proc_macro2::Span,
+) -> DiagResult<Vec<Vec<usize>>> {
+    const MAX_SHAPES: usize = 256;
+    let mut shapes = vec![Vec::new()];
+    for (index, optional) in optional.iter().enumerate() {
+        let mut next = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for shape in shapes {
+            let mut included = shape.clone();
+            included.push(index);
+            for candidate in std::iter::once(included).chain(optional.then_some(shape)) {
+                let key = candidate
+                    .iter()
+                    .map(|index| keys[*index].clone())
+                    .collect::<Vec<_>>();
+                if seen.insert(key) {
+                    next.push(candidate);
+                    if next.len() > MAX_SHAPES {
+                        return Err(Diagnostic::spanned(span, DiagLevel::Error,
+                            "conditional tuple serialization produces more than 256 distinct schema shapes")
+                            .help("reduce independently skipped fields, use named fields, or implement ToSchema manually"));
+                    }
+                }
+            }
+        }
+        shapes = next;
+    }
+    Ok(shapes)
+}
+
 impl TryToTokens for UnnamedStructSchema<'_> {
     fn try_to_tokens(&self, tokens: &mut TokenStream) -> DiagResult<()> {
+        if serde_util::parse_container(self.attributes)
+            .map_err(Diagnostic::from)?
+            .is_some_and(|rules| rules.transparent)
+        {
+            tokens.extend(transparent_schema(
+                self.fields,
+                self.attributes,
+                self.features.clone(),
+                self.description.as_ref(),
+                &self.struct_name,
+                self.compose_context.as_ref(),
+            )?);
+            return Ok(());
+        }
         let oapi = crate::oapi_crate();
-        let fields_len = self.fields.len();
-        let first_field = self.fields.first().ok_or_else(|| {
-            Diagnostic::spanned(
-                self.fields.span(),
-                DiagLevel::Error,
-                "a tuple struct used as a schema must have at least one field",
-            )
-        })?;
+        let is_newtype = self.fields.len() == 1;
+        let fields = self
+            .fields
+            .iter()
+            .map(|field| {
+                let rules = serde_util::parse_value(&field.attrs).map_err(Diagnostic::from)?;
+                // Serde's newtype serializer always serializes its single field.
+                Ok((is_newtype || is_not_skipped(rules.as_ref())).then_some(field))
+            })
+            .collect::<DiagResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let fields_len = fields.len();
+        let Some(first_field) = fields.first() else {
+            if is_newtype {
+                tokens.extend(
+                    quote! { #oapi::oapi::Object::with_type(#oapi::oapi::schema::BasicType::Null) },
+                );
+            } else {
+                tokens.extend(quote! { #oapi::oapi::schema::Array::new().items(#oapi::oapi::schema::ArrayItems::False).min_items(0).max_items(0) });
+            }
+            return Ok(());
+        };
         let first_part = &TypeTree::from_type(&first_field.ty)?;
 
         let all_fields_are_same = fields_len == 1
-            || self
-                .fields
+            || fields
                 .iter()
                 .skip(1)
                 .map(|field| TypeTree::from_type(&field.ty))
@@ -551,6 +861,115 @@ impl TryToTokens for UnnamedStructSchema<'_> {
                 .all(|schema_part| first_part == schema_part);
 
         let deprecated = crate::get_deprecated(self.attributes);
+        let optional = fields
+            .iter()
+            .map(|field| {
+                serde_util::parse_value(&field.attrs)
+                    .map(|rules| rules.is_some_and(|rules| rules.skip_serializing_if))
+                    .map_err(Diagnostic::from)
+            })
+            .collect::<DiagResult<Vec<_>>>()?;
+        if !is_newtype && optional.iter().any(|optional| *optional) {
+            let mut features = self.features.clone().unwrap_or_default();
+            // These validators describe a scalar/newtype, not a tuple container.
+            if let Some(feature) = features.iter().find(|feature| {
+                matches!(
+                    feature,
+                    Feature::MultipleOf(_)
+                        | Feature::Maximum(_)
+                        | Feature::Minimum(_)
+                        | Feature::ExclusiveMaximum(_)
+                        | Feature::ExclusiveMinimum(_)
+                        | Feature::MaxLength(_)
+                        | Feature::MinLength(_)
+                        | Feature::Pattern(_)
+                        | Feature::MaxItems(_)
+                        | Feature::MinItems(_)
+                )
+            }) {
+                return Err(Diagnostic::spanned(
+                    self.fields.span(),
+                    DiagLevel::Error,
+                    format!(
+                        "{feature} attribute is not allowed for unnamed structs with multiple fields"
+                    ),
+                ));
+            }
+            let value_type = all_fields_are_same
+                .then(|| features.pop_value_type_feature())
+                .flatten();
+            let override_type = value_type
+                .as_ref()
+                .map(|value| value.as_type_tree())
+                .transpose()?;
+            let item_format = pop_feature!(features => Feature::Format(_));
+            let item_features = features
+                .iter()
+                .filter(|feature| matches!(feature, Feature::NoRecursion(_)))
+                .cloned()
+                .chain(item_format)
+                .collect::<Vec<_>>();
+            let items = fields
+                .iter()
+                .map(|field| {
+                    let type_tree = TypeTree::from_type(&field.ty)?;
+                    Ok(ComponentSchema::new(ComponentSchemaProps {
+                        type_tree: override_type.as_ref().unwrap_or(&type_tree),
+                        features: Some(item_features.clone()),
+                        description: None,
+                        deprecated: None,
+                        object_name: self.struct_name.as_ref(),
+                        compose_context: self.compose_context.as_ref(),
+                    })?
+                    .to_token_stream())
+                })
+                .collect::<DiagResult<Vec<_>>>()?;
+            let keys = items
+                .iter()
+                .zip(&fields)
+                .map(|(item, field)| {
+                    // Keep schema/documentation attributes in the equivalence key too,
+                    // so future item-level annotations cannot be merged accidentally.
+                    let attrs = field
+                        .attrs
+                        .iter()
+                        .filter(|attr| !attr.path().is_ident("serde"));
+                    quote! { #item #(#attrs)* }.to_string()
+                })
+                .collect::<Vec<_>>();
+            let shapes = conditional_tuple_shapes(&keys, &optional, self.fields.span())?;
+            let variants = shapes.iter().map(|shape| {
+                let length = shape.len();
+                let prefix = (!shape.is_empty()).then(|| {
+                    quote! {
+                        .prefix_items([#(__salvo_tuple_items[#shape].clone()),*])
+                    }
+                });
+                quote! {
+                    .item(#oapi::oapi::schema::Array::new()
+                        .items(#oapi::oapi::schema::ArrayItems::False)
+                        #prefix .min_items(#length).max_items(#length))
+                }
+            });
+            let count = items.len();
+            let metadata = features
+                .iter()
+                .map(TryToTokens::try_to_token_stream)
+                .collect::<DiagResult<TokenStream>>()?;
+            let comments = CommentAttributes::from_attributes(self.attributes);
+            let description = self
+                .description
+                .as_ref()
+                .map(ComponentDescription::Description)
+                .or(Some(ComponentDescription::CommentAttributes(&comments)));
+            let deprecated = deprecated.map(|deprecated| quote! { .deprecated(#deprecated) });
+            tokens.extend(quote! {{
+                let __salvo_tuple_items: [#oapi::oapi::RefOr<#oapi::oapi::schema::Schema>; #count] =
+                    [#(Into::<#oapi::oapi::RefOr<#oapi::oapi::schema::Schema>>::into(#items)),*];
+                #oapi::oapi::schema::AnyOf::new() #(#variants)* #metadata #description #deprecated
+            }});
+            return Ok(());
+        }
         if all_fields_are_same {
             let mut unnamed_struct_features = self.features.clone();
             let value_type = unnamed_struct_features
@@ -561,9 +980,7 @@ impl TryToTokens for UnnamedStructSchema<'_> {
                 .map(|value_type| value_type.as_type_tree())
                 .transpose()?;
 
-            if fields_len == 1
-                && let Some(ref mut features) = unnamed_struct_features
-            {
+            if is_newtype && let Some(ref mut features) = unnamed_struct_features {
                 let inline = parse_schema_features_with(&first_field.attrs, |input| {
                     Ok(parse_features!(input as attributes::Inline))
                 })?
@@ -572,19 +989,15 @@ impl TryToTokens for UnnamedStructSchema<'_> {
                 features.extend(inline);
 
                 if pop_feature!(features => Feature::Default(Default(None))).is_some() {
-                    let struct_ident = format_ident!("{}", &self.struct_name);
                     let index: syn::Index = 0.into();
-                    features.push(Feature::Default(Default::new_default_trait(
-                        struct_ident,
-                        index.into(),
-                    )));
+                    features.push(Feature::Default(Default::new_default_trait(index.into())));
                 }
             }
 
             // The struct has multiple unnamed fields.
             // Validation related features are only allowed on unnamed structs with a single field
             // (i.e., newtype pattern).
-            if fields_len > 1
+            if !is_newtype
                 && let Some(ref mut features) = unnamed_struct_features
                 && let Some((name, span)) = features.iter().find_map(|feature| match feature {
                     Feature::MultipleOf(attr) => Some(("multiple_of", attr.span())),
@@ -617,23 +1030,44 @@ impl TryToTokens for UnnamedStructSchema<'_> {
                 .or(Some(ComponentDescription::CommentAttributes(&comments)));
 
             tokens.extend(
-                ComponentSchema::new(ComponentSchemaProps {
-                    type_tree: override_type_tree.as_ref().unwrap_or(first_part),
-                    features: unnamed_struct_features,
-                    description: description.as_ref(),
-                    deprecated: deprecated.as_ref(),
-                    object_name: self.struct_name.as_ref(),
-                    compose_context: self.compose_context.as_ref(),
-                })?
+                ComponentSchema::for_type(
+                    ComponentSchemaProps {
+                        type_tree: override_type_tree.as_ref().unwrap_or(first_part),
+                        features: unnamed_struct_features,
+                        description: description.as_ref(),
+                        deprecated: deprecated.as_ref(),
+                        object_name: self.struct_name.as_ref(),
+                        compose_context: self.compose_context.as_ref(),
+                    },
+                    value_type
+                        .as_ref()
+                        .map(|value_type| &value_type.0)
+                        .unwrap_or(&first_field.ty),
+                )?
                 .to_token_stream(),
             );
         } else {
-            // Struct that has multiple unnamed fields is serialized to array by default with serde.
-            // See: https://serde.rs/json.html
-            // Typically OpenAPI does not support multi type arrays thus we simply consider the case
-            // as generic object array
+            // JSON Schema 2020-12 describes heterogeneous serde tuples with
+            // positional schemas, rather than requiring every item to be an object.
+            let items = fields
+                .iter()
+                .map(|field| {
+                    let type_tree = TypeTree::from_type(&field.ty)?;
+                    Ok(ComponentSchema::new(ComponentSchemaProps {
+                        type_tree: &type_tree,
+                        features: None,
+                        description: None,
+                        deprecated: None,
+                        object_name: self.struct_name.as_ref(),
+                        compose_context: self.compose_context.as_ref(),
+                    })?
+                    .to_token_stream())
+                })
+                .collect::<DiagResult<Vec<_>>>()?;
             tokens.extend(quote! {
-                #oapi::oapi::Object::new()
+                #oapi::oapi::schema::Array::new()
+                    .items(#oapi::oapi::schema::ArrayItems::False)
+                    .prefix_items([#(Into::<#oapi::oapi::RefOr<#oapi::oapi::schema::Schema>>::into(#items)),*])
             });
 
             if let Some(deprecated) = deprecated {
@@ -649,20 +1083,71 @@ impl TryToTokens for UnnamedStructSchema<'_> {
             }
         };
 
-        if fields_len > 1 {
+        if !is_newtype {
             let comments = CommentAttributes::from_attributes(self.attributes);
             let description = self
                 .description
                 .as_ref()
                 .map(ComponentDescription::Description)
                 .or(Some(ComponentDescription::CommentAttributes(&comments)));
+            if all_fields_are_same {
+                tokens.extend(quote! { .to_array() });
+            }
             tokens.extend(quote! {
-            .to_array()
                 .max_items(#fields_len)
                 .min_items(#fields_len)
                 #description
             })
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod conditional_tuple_tests {
+    use proc_macro2::Span;
+
+    use super::conditional_tuple_shapes;
+
+    #[test]
+    fn limits_distinct_shapes_without_expanding_homogeneous_combinations() {
+        let keys = vec!["same schema".to_owned(); 20];
+        let shapes = conditional_tuple_shapes(&keys, &[true; 20], Span::call_site()).unwrap();
+        assert_eq!(shapes.len(), 21);
+        let keys = (0..9)
+            .map(|index| format!("different schema {index}"))
+            .collect::<Vec<_>>();
+        let error: syn::Error = conditional_tuple_shapes(&keys, &[true; 9], Span::call_site())
+            .unwrap_err()
+            .into();
+        assert!(
+            error
+                .to_string()
+                .contains("more than 256 distinct schema shapes")
+        );
+        assert!(error.to_string().contains("implement ToSchema manually"));
+    }
+
+    #[test]
+    fn reports_combinatorial_tuple_expansion_as_a_macro_diagnostic() {
+        let input = syn::parse_quote! {
+            struct Many(
+                #[serde(skip_serializing_if = "never")] [u8; 1],
+                #[serde(skip_serializing_if = "never")] [u8; 2],
+                #[serde(skip_serializing_if = "never")] [u8; 3],
+                #[serde(skip_serializing_if = "never")] [u8; 4],
+                #[serde(skip_serializing_if = "never")] [u8; 5],
+                #[serde(skip_serializing_if = "never")] [u8; 6],
+                #[serde(skip_serializing_if = "never")] [u8; 7],
+                #[serde(skip_serializing_if = "never")] [u8; 8],
+                #[serde(skip_serializing_if = "never")] [u8; 9],
+            );
+        };
+        let error: syn::Error = crate::schema::to_schema(input).unwrap_err().into();
+        assert!(
+            error
+                .to_string()
+                .contains("more than 256 distinct schema shapes")
+        );
     }
 }

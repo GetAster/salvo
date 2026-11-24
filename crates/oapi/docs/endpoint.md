@@ -85,6 +85,9 @@ pub async fn authenticated_action() {}
   json file for body schema.
 
 **Advanced format definition by `request_body(...)`**
+Literal `ref("...")` references are emitted verbatim without registering a Rust schema.
+The existing `ref(Type)` form registers and references a type implementing [`ToSchema`][to_schema].
+
 * `content = ...` Can be _`content = Type`_, _`content = inline(Type)`_ or _`content = ref("...")`_. The
   given _`Type`_ can be any Rust type that is JSON parseable. It can be Option, Vec
   or Map etc. With _`inline(...)`_ the schema will be inlined instead of a referenced
@@ -92,6 +95,8 @@ pub async fn authenticated_action() {}
   can be used to reference external json file for body schema.
 
 * `description = "..."` Define the description for the request body object as str.
+  When the body schema is inferred from an extractor such as `JsonBody<T>`,
+  `request_body(description = "...")` overrides its description without repeating `content`.
 
 * `content_type = "..."` Can be used to override the default behavior of auto resolving the content type
   from the `content` attribute. If defined the value should be valid content type such as
@@ -554,3 +559,15 @@ async fn get_user() -> Json<User> {
 [xml]: struct.Xml.html
 [const]: https://doc.rust-lang.org/std/keyword.const.html
 [expression]: https://spec.openapis.org/oas/latest.html#runtime-expressions
+
+Deprecated endpoint values retain caller-facing diagnostics:
+
+```compile_fail
+#![allow(deprecated)]
+use salvo_oapi::endpoint;
+#[endpoint]
+#[deprecated(note = "use the replacement endpoint")]
+fn old() -> &'static str { "old" }
+#[deny(deprecated)]
+fn caller() { let _endpoint = old; }
+```

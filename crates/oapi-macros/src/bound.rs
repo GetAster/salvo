@@ -3,6 +3,182 @@ use std::collections::HashSet;
 use syn::Token;
 use syn::punctuated::{Pair, Punctuated};
 
+use crate::feature::{Feature, IsSkipped};
+use crate::schema::feature::{
+    EnumNamedFieldVariantFeatures, EnumUnnamedFieldVariantFeatures, FromAttributes,
+    NamedFieldFeatures, NamedFieldStructFeatures, UnnamedFieldStructFeatures,
+};
+use crate::{DiagResult, Diagnostic, IntoInner, serde_util};
+
+/// Bound inference follows the types used by generated schemas, rather than
+/// types replaced or omitted by field attributes. Keep the original AST intact
+/// for schema generation and for diagnostics.
+pub(crate) fn effective_schema_data(
+    data: &syn::Data,
+    attributes: &[syn::Attribute],
+) -> DiagResult<syn::Data> {
+    fn unnamed_override(fields: &mut syn::Fields, features: &[Feature]) -> DiagResult<()> {
+        if let syn::Fields::Unnamed(unnamed) = fields
+            && unnamed.unnamed.len() != 1
+        {
+            unnamed.unnamed = unnamed
+                .unnamed
+                .iter()
+                .map(|field| {
+                    let rules = serde_util::parse_value(&field.attrs).map_err(Diagnostic::from)?;
+                    Ok((!rules.is_some_and(|rules| rules.skip)).then(|| field.clone()))
+                })
+                .collect::<DiagResult<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+        }
+        let Some(Feature::ValueType(value_type)) = features
+            .iter()
+            .find(|feature| matches!(feature, Feature::ValueType(_)))
+        else {
+            return Ok(());
+        };
+        let types = fields
+            .iter()
+            .map(|field| crate::type_tree::TypeTree::from_type(&field.ty))
+            .collect::<DiagResult<Vec<_>>>()?;
+        // UnnamedStructSchema applies container overrides to newtypes and
+        // homogeneous tuples; heterogeneous tuples keep each original type.
+        if types
+            .first()
+            .is_some_and(|first| types.iter().all(|ty| ty == first))
+        {
+            for field in fields.iter_mut() {
+                field.ty = value_type.0.clone();
+            }
+        }
+        Ok(())
+    }
+    fn fields(fields: &mut syn::Fields) -> DiagResult<()> {
+        if !matches!(fields, syn::Fields::Named(_)) {
+            return Ok(());
+        }
+        for field in fields.iter_mut() {
+            let rules = serde_util::parse_value(&field.attrs).map_err(Diagnostic::from)?;
+            let features = field
+                .attrs
+                .parse_features::<NamedFieldFeatures>()?
+                .into_inner()
+                .unwrap_or_default();
+            if rules.is_some_and(|rules| rules.skip)
+                || features.is_skipped()
+                || features.iter().any(|feature| matches!(feature, Feature::SchemaWith(_)))
+                || features.iter().any(|feature| matches!(feature, Feature::Ignore(crate::feature::attributes::Ignore(crate::parse_utils::LitBoolOrExprPath::LitBool(value))) if value.value()))
+            {
+                field.ty = syn::parse_quote!(());
+            } else if let Some(Feature::ValueType(value_type)) = features.iter().find(|feature| matches!(feature, Feature::ValueType(_))) {
+                field.ty = value_type.0.clone();
+            }
+        }
+        Ok(())
+    }
+    let mut data = data.clone();
+    if let syn::Data::Struct(data) = &mut data
+        && serde_util::parse_container(attributes)
+            .map_err(Diagnostic::from)?
+            .is_some_and(|rules| rules.transparent)
+    {
+        let fields = match &data.fields {
+            syn::Fields::Named(fields) => &fields.named,
+            syn::Fields::Unnamed(fields) => &fields.unnamed,
+            syn::Fields::Unit => {
+                return Err(Diagnostic::new(
+                    crate::DiagLevel::Error,
+                    "serde transparent requires a field",
+                ));
+            }
+        };
+        let (_, selected) = crate::schema::transparent_field(fields)?;
+        let mut field = selected.clone();
+        let container_features = match &data.fields {
+            syn::Fields::Named(_) => attributes
+                .parse_features::<NamedFieldStructFeatures>()?
+                .into_inner(),
+            _ => attributes
+                .parse_features::<UnnamedFieldStructFeatures>()?
+                .into_inner(),
+        }
+        .unwrap_or_default();
+        let features = field
+            .attrs
+            .parse_features::<NamedFieldFeatures>()?
+            .into_inner()
+            .unwrap_or_default();
+        if features
+            .iter()
+            .any(|feature| matches!(feature, Feature::SchemaWith(_)))
+        {
+            field.ty = syn::parse_quote!(());
+        } else if let Some(Feature::ValueType(value_type)) = features
+            .iter()
+            .chain(container_features.iter())
+            .find(|feature| matches!(feature, Feature::ValueType(_)))
+        {
+            field.ty = value_type.0.clone();
+        }
+        field.ident = None;
+        field.colon_token = None;
+        data.fields = syn::Fields::Unnamed(syn::FieldsUnnamed {
+            paren_token: Default::default(),
+            unnamed: std::iter::once(field).collect(),
+        });
+        // The selected value's effective schema type is now complete. Do not
+        // reapply tuple-container overrides over its field-level overrides.
+        return Ok(syn::Data::Struct(data.clone()));
+    }
+    match &mut data {
+        syn::Data::Struct(data) => {
+            if matches!(&data.fields, syn::Fields::Unnamed(_)) {
+                let features = attributes
+                    .parse_features::<UnnamedFieldStructFeatures>()?
+                    .into_inner()
+                    .unwrap_or_default();
+                unnamed_override(&mut data.fields, &features)?;
+            } else {
+                fields(&mut data.fields)?;
+            }
+        }
+        syn::Data::Enum(data) => {
+            for variant in &mut data.variants {
+                if crate::schema::is_skipped_newtype_variant(variant)? {
+                    variant.fields = syn::Fields::Unit;
+                }
+                let features = match &variant.fields {
+                    syn::Fields::Named(_) => variant
+                        .attrs
+                        .parse_features::<EnumNamedFieldVariantFeatures>()?
+                        .into_inner()
+                        .unwrap_or_default(),
+                    syn::Fields::Unnamed(_) => variant
+                        .attrs
+                        .parse_features::<EnumUnnamedFieldVariantFeatures>()?
+                        .into_inner()
+                        .unwrap_or_default(),
+                    syn::Fields::Unit => Vec::new(),
+                };
+                if features.is_skipped()
+                    || serde_util::parse_value(&variant.attrs)
+                        .map_err(Diagnostic::from)?
+                        .is_some_and(|rules| rules.skip)
+                {
+                    variant.fields = syn::Fields::Unit;
+                } else {
+                    unnamed_override(&mut variant.fields, &features)?;
+                    fields(&mut variant.fields)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(data)
+}
+
 // Remove the default from every type parameter because in the generated impls
 // they look like associated types: "error: associated type bindings are not
 // allowed here".
@@ -54,11 +230,7 @@ fn ungroup(mut ty: &syn::Type) -> &syn::Type {
 //         #[serde(skip_serializing)]
 //         c: C,
 //     }
-pub(crate) fn with_bound(
-    data: &syn::Data,
-    generics: &syn::Generics,
-    bounds: &Punctuated<syn::TypeParamBound, syn::token::Plus>,
-) -> syn::Generics {
+pub(crate) fn relevant_types(data: &syn::Data, generics: &syn::Generics) -> Vec<syn::TypePath> {
     struct FindTyParams<'ast> {
         // Set of all generic type parameters on the current struct (A, B, C in
         // the example). Initialized up front.
@@ -227,7 +399,7 @@ pub(crate) fn with_bound(
 
     let relevant_type_params = visitor.relevant_type_params;
     let associated_type_usage = visitor.associated_type_usage;
-    let new_predicates = generics
+    generics
         .type_params()
         .map(|param| param.ident.clone())
         .filter(|id| relevant_type_params.contains(id))
@@ -237,6 +409,16 @@ pub(crate) fn with_bound(
             path: id.into(),
         })
         .chain(associated_type_usage.into_iter().cloned())
+        .collect()
+}
+
+pub(crate) fn with_bound(
+    data: &syn::Data,
+    generics: &syn::Generics,
+    bounds: &Punctuated<syn::TypeParamBound, syn::token::Plus>,
+) -> syn::Generics {
+    let new_predicates = relevant_types(data, generics)
+        .into_iter()
         .map(|bounded_ty| {
             syn::WherePredicate::Type(syn::PredicateType {
                 attrs: Vec::new(),

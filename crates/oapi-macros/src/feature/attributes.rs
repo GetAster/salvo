@@ -57,7 +57,12 @@ impl Parse for Examples {
 
 impl ToTokens for Examples {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        if !self.0.is_empty() {
+        if self.0.is_empty() {
+            let oapi = crate::oapi_crate();
+            tokens.extend(quote! {
+                ::std::iter::empty::<#oapi::oapi::__private::serde_json::Value>()
+            });
+        } else {
             let examples = Array::Borrowed(&self.0).to_token_stream();
             examples.to_tokens(tokens);
         }
@@ -74,8 +79,8 @@ impl_get_name!(Examples = "examples");
 #[derive(Clone, Debug)]
 pub(crate) struct Default(pub(crate) Option<AnyValue>);
 impl Default {
-    pub(crate) fn new_default_trait(struct_ident: Ident, field_ident: syn::Member) -> Self {
-        Self(Some(AnyValue::new_default_trait(struct_ident, field_ident)))
+    pub(crate) fn new_default_trait(field_ident: syn::Member) -> Self {
+        Self(Some(AnyValue::new_default_trait(field_ident)))
     }
 }
 impl Parse for Default {

@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use proc_macro2::{Span, TokenStream};
-use quote::{ToTokens, quote};
+use quote::quote;
+use syn::ext::IdentExt;
 use syn::parse::Parse;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -31,6 +32,8 @@ use crate::{
 };
 
 impl_merge!(ToParametersFeatures, FieldFeatures);
+
+const QUERYSTRING_DERIVE_ERROR: &str = "querystring is not supported by ToParameters; use Query for named parameters or construct a Parameter with content manually";
 
 /// Container attribute `#[salvo(parameters(...))]`.
 pub(crate) struct ToParametersFeatures(Vec<Feature>);
@@ -71,7 +74,15 @@ impl TryToTokens for ToParameters {
         let ex_lifetime = GenericParam::Lifetime(LifetimeParam::new(ex_life.clone()));
         let mut ex_generics = self.generics.clone();
         ex_generics.params.insert(0, ex_lifetime);
-        let ex_impl_generics = ex_generics.split_for_impl().0;
+        if !self.generics.params.is_empty() {
+            ex_generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote! {
+                    Self: #salvo::serde::Deserialize<'__macro_gen_ex>
+                });
+        }
+        let (ex_impl_generics, _, ex_where_clause) = ex_generics.split_for_impl();
 
         // Container-level config is spelled `parameters(...)`, but the singular
         // `parameter(...)` is accepted as an alias so the key matches its
@@ -93,7 +104,8 @@ impl TryToTokens for ToParameters {
             .collect::<Result<Vec<_>, Diagnostic>>()?
             .into_iter()
             .reduce(|acc, item| acc.merge(item));
-        let serde_container = serde_util::parse_container(&self.attrs).map_err(Diagnostic::from)?;
+        let serde_container =
+            serde_util::parse_container_for_deserialize(&self.attrs).map_err(Diagnostic::from)?;
 
         let names = parameters_features.as_mut().and_then(|features| {
             let to_parameters_names = pop_feature!(features => Feature::ToParametersNames(_));
@@ -110,9 +122,14 @@ impl TryToTokens for ToParameters {
                 default_parameter_in
             {
                 match default_parameter_in {
-                    // `querystring` describes the whole query string as one value; salvo
-                    // extracts from the same place, so it shares `SourceFrom::Query`.
-                    ParameterIn::Query | ParameterIn::QueryString => {
+                    ParameterIn::QueryString => {
+                        return Err(Diagnostic::spanned(
+                            ident.span(),
+                            DiagLevel::Error,
+                            QUERYSTRING_DERIVE_ERROR,
+                        ));
+                    }
+                    ParameterIn::Query => {
                         quote! { #salvo::extract::metadata::SourceFrom::Query }
                     }
                     ParameterIn::Header => quote! { #salvo::extract::metadata::SourceFrom::Header },
@@ -127,7 +144,11 @@ impl TryToTokens for ToParameters {
             .get_struct_fields(names.as_ref())?
             .enumerate()
             .map(|(index, field)| {
-                let field_serde_params = serde_util::parse_value(&field.attrs).map_err(Diagnostic::from)?;
+                let field_serde_params = serde_util::parse_value_for_deserialize(&field.attrs).map_err(Diagnostic::from)?;
+                if field_serde_params.as_ref().is_some_and(|params| params.flatten && !params.skip) {
+                    return Err(Diagnostic::spanned(field.span(), DiagLevel::Error,
+                        "serde(flatten) is not supported by ToParameters; list named parameters explicitly or use a custom extractor"));
+                }
                 if matches!(&field_serde_params, Some(params) if !params.skip) {
                     Ok(Some(Parameter {
                         field,
@@ -158,21 +179,12 @@ impl TryToTokens for ToParameters {
             .flatten()
             .collect::<Vec<Parameter>>();
 
-        let extract_fields = if self.is_named_struct() {
-            params
-                .iter()
-                .map(|param| param.to_extract_field_token_stream(&salvo))
-                .collect::<DiagResult<Vec<TokenStream>>>()?
-        } else if let Some(names) = &names {
-            names
-                .iter()
-                .map(|name| quote! { #salvo::extract::metadata::Field::new(#name)})
-                .collect::<Vec<_>>()
-        } else {
-            vec![]
-        };
+        let extract_fields = params
+            .iter()
+            .map(|param| param.to_extract_field_token_stream(&salvo))
+            .collect::<DiagResult<Vec<TokenStream>>>()?;
 
-        fn quote_rename_rule(salvo: &Ident, rename_all: RenameRule) -> TokenStream {
+        fn quote_rename_rule(salvo: &syn::Path, rename_all: RenameRule) -> TokenStream {
             let rename_all = match rename_all {
                 RenameRule::LowerCase => "LowerCase",
                 RenameRule::UpperCase => "UpperCase",
@@ -218,19 +230,21 @@ impl TryToTokens for ToParameters {
             .map(TryToTokens::try_to_token_stream)
             .collect::<DiagResult<Array<TokenStream>>>()?;
         tokens.extend(quote!{
-            impl #ex_impl_generics #oapi::oapi::ToParameters<'__macro_gen_ex> for #ident #ty_generics #where_clause {
+            impl #ex_impl_generics #oapi::oapi::ToParameters<'__macro_gen_ex> for #ident #ty_generics #ex_where_clause {
                 fn to_parameters(components: &mut #oapi::oapi::Components) -> #oapi::oapi::Parameters {
-                    #oapi::oapi::Parameters(#params.to_vec())
+                    #oapi::oapi::Parameters(#params.into_iter().map(#oapi::oapi::RefOr::Type).collect())
                 }
             }
             impl #impl_generics #oapi::oapi::EndpointArgRegister for #ident #ty_generics #where_clause {
                 fn register(components: &mut #oapi::oapi::Components, operation: &mut #oapi::oapi::Operation, _arg: &str) {
-                    for parameter in <Self as #oapi::oapi::ToParameters>::to_parameters(components) {
-                        operation.parameters.insert(parameter);
-                    }
+                    // Registering schemas does not deserialize a request, so it
+                    // must not inherit the extraction impl's serde bounds.
+                    operation.parameters.extend(#oapi::oapi::Parameters(
+                        #params.into_iter().map(#oapi::oapi::RefOr::Type).collect()
+                    ));
                 }
             }
-            impl #ex_impl_generics #salvo::Extractible<'__macro_gen_ex> for #ident #ty_generics #where_clause {
+            impl #ex_impl_generics #salvo::Extractible<'__macro_gen_ex> for #ident #ty_generics #ex_where_clause {
                 fn metadata() -> &'static #salvo::extract::Metadata {
                     static METADATA: ::std::sync::OnceLock<#salvo::extract::Metadata> = ::std::sync::OnceLock::new();
                     METADATA.get_or_init(||
@@ -241,10 +255,10 @@ impl TryToTokens for ToParameters {
                             #serde_rename_all
                     )
                 }
-                async fn extract(req: &'__macro_gen_ex mut #salvo::Request, depot: &'__macro_gen_ex mut #salvo::Depot) -> ::std::result::Result<Self, impl #salvo::Writer + Send + std::fmt::Debug + 'static> {
+                async fn extract(req: &'__macro_gen_ex mut #salvo::Request, depot: &'__macro_gen_ex mut #salvo::Depot) -> ::std::result::Result<Self, impl #salvo::Writer + ::std::marker::Send + ::std::fmt::Debug + 'static> {
                     #salvo::serde::from_request(req, depot, Self::metadata()).await
                 }
-                async fn extract_with_arg(req: &'__macro_gen_ex mut #salvo::Request, depot: &'__macro_gen_ex mut #salvo::Depot, _arg: &str) -> ::std::result::Result<Self, impl #salvo::Writer + Send + std::fmt::Debug + 'static> {
+                async fn extract_with_arg(req: &'__macro_gen_ex mut #salvo::Request, depot: &'__macro_gen_ex mut #salvo::Depot, _arg: &str) -> ::std::result::Result<Self, impl #salvo::Writer + ::std::marker::Send + ::std::fmt::Debug + 'static> {
                     Self::extract(req, depot).await
                 }
             }
@@ -254,9 +268,6 @@ impl TryToTokens for ToParameters {
 }
 
 impl ToParameters {
-    fn is_named_struct(&self) -> bool {
-        matches!(&self.data, Data::Struct(data_struct) if matches!(&data_struct.fields, syn::Fields::Named(_)))
-    }
     fn get_struct_fields(
         &self,
         field_names: Option<&Vec<String>>,
@@ -395,6 +406,99 @@ struct Parameter<'a> {
 }
 
 impl Parameter<'_> {
+    fn sequence_delimiter(&self, features: &[Feature]) -> DiagResult<Option<char>> {
+        use crate::parameter::ParameterStyle;
+        use crate::type_tree::GenericType;
+        let mut ty = TypeTree::from_type(&self.field.ty)?;
+        while matches!(
+            ty.generic_type,
+            Some(
+                GenericType::Option
+                    | GenericType::Box
+                    | GenericType::Arc
+                    | GenericType::Rc
+                    | GenericType::Cow
+                    | GenericType::RefCell
+            )
+        ) {
+            let Some(child) = ty.children.as_mut().and_then(|children| children.pop()) else {
+                break;
+            };
+            ty = child;
+        }
+        let sequence = matches!(
+            ty.generic_type,
+            Some(GenericType::Vec | GenericType::Set | GenericType::LinkedList)
+        );
+        #[cfg(feature = "smallvec")]
+        let sequence = sequence || matches!(ty.generic_type, Some(GenericType::SmallVec));
+        let location = features
+            .iter()
+            .find_map(|feature| match feature {
+                Feature::ParameterIn(value) => Some(&value.0),
+                _ => None,
+            })
+            .or_else(|| match self.container_attributes.default_parameter_in {
+                Some(Feature::DefaultParameterIn(value)) => Some(&value.0),
+                _ => None,
+            })
+            .unwrap_or(&ParameterIn::Query);
+        let style = features
+            .iter()
+            .find_map(|feature| match feature {
+                Feature::Style(value) => Some(value.0),
+                _ => None,
+            })
+            .or_else(|| match self.container_attributes.default_style {
+                Some(Feature::DefaultStyle(value)) => Some(value.0),
+                _ => None,
+            })
+            .unwrap_or_else(|| match location {
+                ParameterIn::Header | ParameterIn::Path => ParameterStyle::Simple,
+                _ => ParameterStyle::Form,
+            });
+        let explode = features
+            .iter()
+            .find_map(|feature| match feature {
+                Feature::Explode(value) => Some(value.0),
+                _ => None,
+            })
+            .unwrap_or(matches!(style, ParameterStyle::Form));
+        if !sequence {
+            if !matches!(ty.generic_type, Some(GenericType::Map))
+                && matches!(
+                    (location, style),
+                    (ParameterIn::Query, ParameterStyle::Form)
+                        | (
+                            ParameterIn::Header | ParameterIn::Path,
+                            ParameterStyle::Simple
+                        )
+                        | (
+                            ParameterIn::Cookie,
+                            ParameterStyle::Form | ParameterStyle::Cookie
+                        )
+                )
+            {
+                return Ok(None);
+            }
+            return Err(Diagnostic::spanned(
+                self.field.span(),
+                DiagLevel::Error,
+                "unsupported parameter encoding in ToParameters; scalar query/cookie parameters use Form, scalar path/header parameters use Simple; object parameters and other styles require a custom extractor",
+            ));
+        }
+        match (location, style, explode) {
+            (ParameterIn::Query, ParameterStyle::Form, true) => Ok(None),
+            (ParameterIn::Query, ParameterStyle::Form, false)
+            | (ParameterIn::Header, ParameterStyle::Simple, _) => Ok(Some(',')),
+            (ParameterIn::Query, ParameterStyle::PipeDelimited, false) => Ok(Some('|')),
+            _ => Err(Diagnostic::spanned(
+                self.field.span(),
+                DiagLevel::Error,
+                "unsupported array parameter encoding in ToParameters; use Form or PipeDelimited query arrays, Simple header arrays, or a custom extractor",
+            )),
+        }
+    }
     /// Resolve [`Parameter`] features and split features into two [`Vec`]s. Features are split by
     /// whether they should be rendered in [`Parameter`] itself or in [`Parameter`]s schema.
     ///
@@ -426,6 +530,19 @@ impl Parameter<'_> {
             .into_iter()
             .reduce(|acc, item| acc.merge(item))
             .unwrap_or_default();
+
+        if field_features.iter().any(|feature| {
+            matches!(
+                feature,
+                Feature::ParameterIn(attributes::ParameterIn(ParameterIn::QueryString))
+            )
+        }) {
+            return Err(Diagnostic::spanned(
+                self.field.span(),
+                DiagLevel::Error,
+                QUERYSTRING_DERIVE_ERROR,
+            ));
+        }
 
         Ok(field_features.into_iter().fold(
             (Vec::<Feature>::new(), Vec::<Feature>::new()),
@@ -461,14 +578,24 @@ impl Parameter<'_> {
         ))
     }
 
-    fn to_extract_field_token_stream(&self, salvo: &Ident) -> DiagResult<TokenStream> {
+    fn to_extract_field_token_stream(&self, salvo: &syn::Path) -> DiagResult<TokenStream> {
         let (_, mut param_features) = self.resolve_field_features()?;
+        let delimiter = self
+            .sequence_delimiter(&param_features)?
+            .map(|delimiter| quote! { .value_delimiter(Some(#delimiter)) });
         let name = self
             .field
             .ident
             .as_ref()
-            .expect("struct field name should be exists")
-            .to_string();
+            .map(|ident| ident.unraw().to_string())
+            .or_else(|| self.container_attributes.name.cloned())
+            .ok_or_else(|| {
+                Diagnostic::spanned(
+                    self.field.span(),
+                    DiagLevel::Error,
+                    "No name specified for unnamed field",
+                )
+            })?;
 
         let rename = param_features
             .pop_rename_feature()
@@ -480,10 +607,23 @@ impl Parameter<'_> {
                 .as_ref()
                 .map(|rename| quote!(.serde_rename(#rename)))
         });
+        let aliases: Vec<_> = self
+            .field_serde_params
+            .iter()
+            .flat_map(|rules| &rules.aliases)
+            .map(|alias| quote!(.add_alias(#alias)))
+            .collect();
+        let defaulted = (self.field.ident.is_none()
+            && (self
+                .field_serde_params
+                .as_ref()
+                .is_some_and(|rules| rules.is_default)
+                || self.serde_container.is_some_and(|rules| rules.is_default)))
+        .then(|| quote!(.defaulted(true)));
         if let Some(parameter_in) = param_features.pop_parameter_in_feature() {
             let source = match parameter_in {
-                // `querystring` describes the whole query string as one value; salvo extracts
-                // from the same place, so it shares `SourceFrom::Query`.
+                // QueryString is rejected by resolve_field_features before extraction
+                // metadata is generated; named query parameters use this source.
                 attributes::ParameterIn(
                     crate::parameter::ParameterIn::Query
                     | crate::parameter::ParameterIn::QueryString,
@@ -505,12 +645,18 @@ impl Parameter<'_> {
                     .add_source(#source)
                     #rename
                     #serde_rename
+                    #(#aliases)*
+                    #defaulted
+                    #delimiter
             })
         } else {
             Ok(quote! {
                 #salvo::extract::metadata::Field::new(#name)
                 #rename
                 #serde_rename
+                #(#aliases)*
+                #defaulted
+                #delimiter
             })
         }
     }
@@ -588,56 +734,133 @@ impl TryToTokens for Parameter<'_> {
         let schema_with = pop_feature!(param_features => Feature::SchemaWith(_))
             .map(|f| f.try_to_token_stream())
             .transpose()?;
+        let description = CommentAttributes::from_attributes(&field.attrs).as_formatted_string();
+        if !description.is_empty() {
+            tokens.extend(quote! { .description(#description)})
+        }
+
+        let value_type = param_features.pop_value_type_feature();
+        let component = value_type
+            .as_ref()
+            .map(|value_type| value_type.as_type_tree())
+            .transpose()?
+            .unwrap_or(type_tree);
+
+        let required: Option<attributes::Required> =
+            pop_feature!(param_features => Feature::Required(_)).into_inner();
+        let component_required = !component.is_option()
+            && crate::is_required(self.field_serde_params.as_ref(), self.serde_container);
+
+        let required = match (required, component_required) {
+            (Some(required_feature), _) => Into::<Required>::into(required_feature.is_true()),
+            (None, component_required) => Into::<Required>::into(component_required),
+        };
+        tokens.extend(quote! {
+            .required(#required)
+        });
+        tokens.extend(param_features.try_to_token_stream()?);
+
         if let Some(schema_with) = schema_with {
             tokens.extend(quote! { .schema(#schema_with) });
         } else {
-            let description =
-                CommentAttributes::from_attributes(&field.attrs).as_formatted_string();
-            if !description.is_empty() {
-                tokens.extend(quote! { .description(#description)})
-            }
-
-            let value_type = param_features.pop_value_type_feature();
-            let component = value_type
-                .as_ref()
-                .map(|value_type| value_type.as_type_tree())
-                .transpose()?
-                .unwrap_or(type_tree);
-
-            let required: Option<attributes::Required> =
-                pop_feature!(param_features => Feature::Required(_)).into_inner();
-            let component_required = !component.is_option()
-                && crate::is_required(self.field_serde_params.as_ref(), self.serde_container);
-
-            let required = match (required, component_required) {
-                (Some(required_feature), _) => Into::<Required>::into(required_feature.is_true()),
-                (None, component_required) => Into::<Required>::into(component_required),
-            };
-            tokens.extend(quote! {
-                .required(#required)
-            });
-            tokens.extend(param_features.try_to_token_stream()?);
-
-            let user_explicit_inline = schema_features
-                .iter()
-                .any(|f| matches!(f, Feature::Inline(Inline(true))));
-            let schema = if user_explicit_inline {
-                let oapi = crate::oapi_crate();
-                crate::component::build_inline_compose_block(&component, &oapi)
-            } else {
-                ComponentSchema::for_params(component::ComponentSchemaProps {
+            let schema = ComponentSchema::for_params(
+                component::ComponentSchemaProps {
                     type_tree: &component,
                     features: Some(schema_features),
                     description: None,
                     deprecated: None,
                     object_name: "",
                     compose_context: None,
-                })?
-                .to_token_stream()
-            };
+                },
+                value_type
+                    .as_ref()
+                    .map(|value_type| &value_type.0)
+                    .unwrap_or(&field.ty),
+            )?;
 
             tokens.extend(quote! { .schema(#schema) });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use syn::parse_quote;
+
+    #[test]
+    fn unsupported_non_array_encodings_require_a_custom_extractor() {
+        for input in [
+            parse_quote! { struct Query { #[salvo(parameter(style = DeepObject, explode = true))] filter: Filter } },
+            parse_quote! { struct Path { #[salvo(parameter(parameter_in = Path, style = Label))] id: u32 } },
+            parse_quote! { #[salvo(parameters(default_parameter_in = Path, default_style = Matrix))] struct Path { id: u32 } },
+            parse_quote! { struct Query { #[salvo(parameter(style = Simple))] id: String } },
+            parse_quote! { struct Query { #[salvo(parameter(style = PipeDelimited))] id: String } },
+            parse_quote! { struct Header { #[salvo(parameter(parameter_in = Header, style = Form))] id: String } },
+            parse_quote! { struct Map { values: std::collections::BTreeMap<String, String> } },
+        ] {
+            let error = crate::parameter::to_parameters(input).unwrap_err();
+            assert!(
+                error
+                    .emit_as_item_tokens()
+                    .to_string()
+                    .contains("custom extractor")
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_array_encodings_produce_derive_errors() {
+        for input in [
+            parse_quote! { struct Array { #[salvo(parameter(style = DeepObject))] values: Vec<String> } },
+            parse_quote! { #[salvo(parameters(default_parameter_in = Path, default_style = Matrix))] struct Array { values: Vec<String> } },
+            parse_quote! { struct Array { #[salvo(parameter(style = PipeDelimited, explode = true))] values: Vec<String> } },
+        ] {
+            assert!(crate::parameter::to_parameters(input).is_err());
+        }
+    }
+
+    #[test]
+    fn querystring_container_is_rejected_instead_of_generating_an_invalid_schema() {
+        let input = parse_quote! {
+            #[salvo(parameters(default_parameter_in = QueryString))]
+            struct WholeQuery { filter: String }
+        };
+        assert!(crate::parameter::to_parameters(input).is_err());
+    }
+
+    #[test]
+    fn querystring_field_is_rejected_instead_of_extracting_a_named_query() {
+        let input = parse_quote! {
+            struct WholeQuery {
+                #[salvo(parameter(parameter_in = QueryString))]
+                filter: String,
+            }
+        };
+        assert!(crate::parameter::to_parameters(input).is_err());
+    }
+
+    #[test]
+    fn serde_flatten_is_rejected_before_building_an_unusable_extractor() {
+        let input = parse_quote! { struct Params { #[serde(flatten)] nested: Nested } };
+        let error = crate::parameter::to_parameters(input).unwrap_err();
+        assert!(
+            error
+                .emit_as_item_tokens()
+                .to_string()
+                .contains("serde(flatten)")
+        );
+    }
+
+    #[test]
+    fn ordinary_query_parameters_remain_supported() {
+        let input = parse_quote! {
+            #[salvo(parameters(default_parameter_in = Query))]
+            struct Query {
+                #[salvo(parameter(parameter_in = Query))]
+                filter: String,
+            }
+        };
+        assert!(crate::parameter::to_parameters(input).is_ok());
     }
 }

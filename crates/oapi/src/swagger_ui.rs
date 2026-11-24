@@ -11,6 +11,7 @@ pub mod oauth;
 pub use config::Config;
 pub use oauth::Config as OauthConfig;
 use rust_embed::RustEmbed;
+use salvo_core::hyper::body::Bytes;
 use salvo_core::http::{HeaderValue, ResBody, StatusError, header};
 use salvo_core::routing::redirect_to_dir_url;
 use salvo_core::{Depot, Error, FlowCtrl, Handler, Request, Response, Router, async_trait};
@@ -19,7 +20,7 @@ use serde::Serialize;
 use crate::html::{description_meta, escape_html, keywords_meta, script_safe_json};
 
 #[derive(RustEmbed)]
-#[folder = "src/swagger_ui/v5.32.11"]
+#[folder = "src/swagger_ui/v5.34.0"]
 struct SwaggerUiDist;
 
 const INDEX_TMPL: &str = r#"
@@ -143,13 +144,15 @@ impl SwaggerUi {
     /// ```
     #[must_use]
     pub fn url<U: Into<Url<'static>>>(mut self, url: U) -> Self {
-        self.config.urls.push(url.into());
+        self.config.push_url(url.into());
         self
     }
 
     /// Add multiple [`Url`]s to Swagger UI.
     ///
     /// Takes one [`Vec`] argument containing tuples of [`Url`] and [OpenApi][crate::OpenApi].
+    /// It replaces the urls configured so far, and the [`Url`] marked as primary is selected
+    /// when the page opens.
     ///
     /// Situations where this comes handy is when there is a need or wish to separate different parts
     /// of the api to separate api docs.
@@ -171,7 +174,7 @@ impl SwaggerUi {
     /// ```
     #[must_use]
     pub fn urls(mut self, urls: Vec<Url<'static>>) -> Self {
-        self.config.urls = urls;
+        self.config.set_urls(urls);
         self
     }
 
@@ -238,7 +241,11 @@ impl Handler for SwaggerUi {
                     header::CONTENT_TYPE,
                     HeaderValue::from_str(&file.content_type).expect("content type parse failed"),
                 );
-                res.body(ResBody::Once(file.bytes.to_vec().into()));
+                let bytes = match file.bytes {
+                    Cow::Borrowed(bytes) => Bytes::from_static(bytes),
+                    Cow::Owned(bytes) => Bytes::from(bytes),
+                };
+                res.body(ResBody::Once(bytes));
             }
             Ok(None) => {
                 tracing::warn!(path, "swagger ui file not found");
@@ -395,7 +402,7 @@ pub fn serve<'a>(
                 &format!("window.ui.initOAuth({});", &oauth_json),
             );
         }
-        Some(Cow::Owned(index.as_bytes().to_vec()))
+        Some(Cow::Owned(index.into_bytes()))
     } else {
         SwaggerUiDist::get(path).map(|f| f.data)
     };
@@ -429,5 +436,97 @@ mod tests {
             html.contains("\\u003c/script\\u003e"),
             "`<` must be escaped to \\u003c inside the config json"
         );
+    }
+
+    /// The `url`, `urls` and `urls.primaryName` settings handed to Swagger UI.
+    fn documents(swagger: &SwaggerUi) -> serde_json::Value {
+        let config = serde_json::to_value(&swagger.config).unwrap();
+        serde_json::json!([config["url"], config["urls"], config["urls.primaryName"]])
+    }
+
+    #[test]
+    fn url_adds_a_document_without_hiding_the_first_one() {
+        // Swagger UI ignores `url` once `urls` is set, so every document has to be listed.
+        let swagger = SwaggerUi::new("/a.json").url("/b.json").url("/c.json");
+        assert_eq!(
+            documents(&swagger),
+            documents(&SwaggerUi::new(Config::new(["/a.json", "/b.json", "/c.json"])))
+        );
+        assert_eq!(
+            documents(&swagger),
+            serde_json::json!([
+                null,
+                [
+                    {"name": "/a.json", "url": "/a.json"},
+                    {"name": "/b.json", "url": "/b.json"},
+                    {"name": "/c.json", "url": "/c.json"}
+                ],
+                null
+            ])
+        );
+
+        let swagger = SwaggerUi::new(Config::new([Url::new("first", "/a.json")]))
+            .url(Url::with_primary("second", "/b.json", true));
+        assert_eq!(
+            documents(&swagger),
+            serde_json::json!([
+                null,
+                [
+                    {"name": "first", "url": "/a.json"},
+                    {"name": "second", "url": "/b.json"}
+                ],
+                "second"
+            ])
+        );
+    }
+
+    #[test]
+    fn urls_replaces_the_documents_and_keeps_the_primary_one() {
+        let urls = || {
+            vec![
+                Url::new("first", "/a.json"),
+                Url::with_primary("second", "/b.json", true),
+            ]
+        };
+        let swagger = SwaggerUi::new("/unused.json").urls(urls());
+        assert_eq!(
+            documents(&swagger),
+            documents(&SwaggerUi::new(Config::new(urls())))
+        );
+        assert_eq!(
+            documents(&swagger),
+            serde_json::json!([
+                null,
+                [
+                    {"name": "first", "url": "/a.json"},
+                    {"name": "second", "url": "/b.json"}
+                ],
+                "second"
+            ])
+        );
+
+        // A later call does not keep the primary document of an earlier one.
+        let swagger = swagger.urls(vec![Url::new("third", "/c.json"), Url::new("", "/d.json")]);
+        assert_eq!(
+            documents(&swagger),
+            serde_json::json!([
+                null,
+                [
+                    {"name": "third", "url": "/c.json"},
+                    {"name": "/d.json", "url": "/d.json"}
+                ],
+                null
+            ])
+        );
+    }
+
+    #[test]
+    fn other_settings_survive_url_changes() {
+        let swagger = SwaggerUi::new(Config::new(["/a.json"]).persist_authorization(true))
+            .url("/b.json")
+            .urls(vec![Url::new("only", "/c.json"), Url::new("other", "/d.json")]);
+        let config = serde_json::to_value(&swagger.config).unwrap();
+        assert_eq!(config["persistAuthorization"], true);
+        assert_eq!(config["urls"][0]["name"], "only");
     }
 }

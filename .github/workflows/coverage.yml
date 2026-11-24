@@ -4,6 +4,12 @@ permissions:
   contents: read
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/coverage.yml'
+      - '.github/scripts/run_coverage.sh'
+      - '.github/scripts/test_run_coverage.py'
+      - '.github/COVERAGE.md'
   push:
     branches:
       - main
@@ -12,31 +18,51 @@ on:
       - '**/Cargo.toml'         # or dependency updates
       - '.github/workflows/**'  # or workflow changes
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
   cover:
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: 1
     strategy:
       fail-fast: false
       matrix:
         version:
-          - stable
+          - '1.99.1'
 
     name: Coverage ${{ matrix.version }} - x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.version }}
           components: rustfmt, clippy
 
+      - name: Verify failure diagnostics
+        run: python3 .github/scripts/test_run_coverage.py
+
+      - name: Install coverage tool
+        run: cargo install cargo-tarpaulin --version 0.37.6 --locked
+
       - name: Generate coverage file
-        run: |
-          cargo install cargo-tarpaulin
-          cargo tarpaulin --all-features --out xml
+        run: bash .github/scripts/run_coverage.sh
+
+      - name: Preserve coverage diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: coverage-${{ github.sha }}-${{ github.run_attempt }}
+          path: coverage-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload to codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         with:
-          file: cobertura.xml
+          files: coverage-artifacts/cobertura.xml

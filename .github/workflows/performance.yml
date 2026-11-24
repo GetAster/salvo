@@ -1,0 +1,88 @@
+name: Performance benchmarks
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/core/src/**'
+      - 'crates/macros/src/**'
+      - 'crates/core/benches/**'
+      - 'Cargo.toml'
+      - 'crates/core/Cargo.toml'
+      - 'crates/macros/Cargo.toml'
+      - '.github/workflows/performance.yml'
+      - '.github/scripts/test_performance_paths.py'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/src/**'
+      - 'crates/macros/src/**'
+      - 'crates/core/benches/**'
+      - 'Cargo.toml'
+      - 'crates/core/Cargo.toml'
+      - 'crates/macros/Cargo.toml'
+      - '.github/workflows/performance.yml'
+      - '.github/scripts/test_performance_paths.py'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  criterion:
+    name: Core routing and dispatch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check benchmark trigger coverage
+        run: |
+          python3 -m pip install 'PyYAML==6.0.3'
+          python3 .github/scripts/test_performance_paths.py
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: '1.95.0'
+      - name: Record benchmark environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-artifacts
+          {
+            git rev-parse HEAD
+            git show -s --format=fuller HEAD
+            rustc -Vv
+            cargo -V
+            uname -a
+            lscpu
+            printf 'RUNNER_OS=%s\nRUNNER_ARCH=%s\nImageOS=%s\nImageVersion=%s\n' \
+              "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+          } > benchmark-artifacts/environment.txt
+      - name: Resolve benchmark dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo generate-lockfile 2>&1 | tee benchmark-artifacts/resolve.log
+          cp Cargo.lock benchmark-artifacts/Cargo.lock
+      - name: Run Criterion benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench --locked -p salvo_core --bench router_detect --bench service_dispatch -- \
+            --noplot --sample-size 20 --warm-up-time 1 --measurement-time 2 \
+            2>&1 | tee benchmark-artifacts/criterion.log
+      - name: Upload benchmark results and environment
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: core-criterion-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            benchmark-artifacts/
+            target/criterion/
+          if-no-files-found: warn
+          retention-days: 30

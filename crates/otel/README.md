@@ -18,10 +18,10 @@
 <a href="https://codecov.io/gh/salvo-rs/salvo"><img alt="codecov" src="https://codecov.io/gh/salvo-rs/salvo/branch/main/graph/badge.svg" /></a>
 <br>
 <a href="https://crates.io/crates/salvo"><img alt="crates.io" src="https://img.shields.io/crates/v/salvo" /></a>
-<a href="https://docs.rs/salvo"><img alt="Documentation" src="https://docs.rs/salvo/badge.svg" /></a>
+<a href="https://docs.rs/salvo"><img alt="Documentation" src="https://img.shields.io/docsrs/salvo.svg" /></a>
 <a href="https://crates.io/crates/salvo"><img alt="Download" src="https://img.shields.io/crates/d/salvo.svg" /></a>
 <a href="https://github.com/rust-secure-code/safety-dance/"><img alt="unsafe forbidden" src="https://img.shields.io/badge/unsafe-forbidden-success.svg" /></a>
-<a href="https://blog.rust-lang.org/2026/03/05/Rust-1.94.0/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.94%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2026/04/16/Rust-1.95.0/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.95%2B-blue" /></a>
 <br>
 <a href="https://salvo.rs">
     <img alt="Website" src="https://img.shields.io/badge/https-salvo.rs-%23f00" />
@@ -75,7 +75,7 @@ filtering on `error.type` or `http.response.status_code`.
 
 Both middlewares follow the [HTTP semantic conventions][semconv] for attribute
 names and values: `http.request.method`, `http.route`,
-`http.response.status_code`, `url.scheme`, `url.path`, `url.query`,
+`http.response.status_code`, `url.scheme`, `url.path`,
 `network.protocol.version` and `error.type`.
 
 The request target is reported as the matched route template (`/users/{id}`)
@@ -88,6 +88,25 @@ own with `Metrics::with_known_methods`.
 through the `salvo` crate, by its own `matched-path` feature.
 
 [semconv]: https://opentelemetry.io/docs/specs/semconv/http/http-metrics/
+
+### Query privacy
+
+`Tracing` omits query strings by default, including OAuth authorization codes,
+access tokens, passwords, and application-specific credentials. To record only
+non-sensitive fields, explicitly configure an allowlist:
+
+```rust,ignore
+let tracing = Tracing::new(provider.tracer("my-service"))
+    .query_fields(["page", "sort"]);
+```
+
+Only these fields appear in `url.query`; all other fields are omitted entirely.
+Names are matched case-sensitively after percent decoding and converting `+` to
+a space. Repeated fields retain their order and original encoding. An empty
+allowlist disables query recording. The signature fields `sig`, `Signature`,
+`AWSAccessKeyId`, and `X-Goog-Signature` always have their values replaced with
+`REDACTED` when listed. Only allow values that are safe for your telemetry
+backend; never add credential fields to the allowlist.
 
 ## Installation
 
@@ -123,6 +142,21 @@ async fn main() {
 ```
 
 ## Documentation & Resources
+
+Metrics and tracing observe the response after Service runs all middleware,
+media-type validation and catchers. This includes errors produced by an outer
+timeout or panic catcher after the instrumentation starts. Buffered catcher
+bodies are included in response-size measurements; HEAD and streamed bodies
+remain unmeasured. Durations and spans end before network transmission, so they
+do not describe stream completion or actual bytes delivered to the client.
+Tower layers that short-circuit, return an error or replace the request still
+produce final observations; request attributes are captured before dispatch.
+
+Cancelling the entire request releases the active-request count and span without
+inventing a response status or duration measurement. Middleware invoked directly
+without a Service keeps its existing behavior of observing after `call_next`.
+`salvo-otel` enables core's optional `response-observers` feature automatically;
+core builds without that feature do not allocate an observer queue per request.
 
 - [API Documentation](https://docs.rs/salvo-otel)
 - [Example Projects](https://github.com/salvo-rs/salvo/tree/main/examples)

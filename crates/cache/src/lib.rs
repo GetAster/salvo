@@ -82,6 +82,19 @@
 //!
 //! - Streaming responses ([`ResBody::Stream`]) cannot be cached
 //! - Error responses are not cached
+//! - Range and conditional requests bypass the cache, so the origin handler can apply its range and
+//!   precondition semantics to the current request
+//! - Unchanged headers already present before the cache are ambiguous: an inner handler may have
+//!   explicitly written the same value. An entry is reused only when those outer headers still
+//!   match its original context. Changing per-request headers can therefore reduce cache hits. Put
+//!   such headers on the response after the cache returns when possible; they are never replayed
+//!   stale.
+//! - This is application response memoization, not a complete HTTP intermediary cache: retention is
+//!   configured by the store, and entries do not implement Age or conditional revalidation.
+//!   Requests with `no-cache`, `no-store`, `max-age`, or `min-fresh` bypass both lookup and
+//!   storage, including miss coalescing. Freshness directives bypass conservatively because HTTP
+//!   response age is unknown. Legacy `Pragma: no-cache` also bypasses. Other HTTP cache directives
+//!   do not override store policy.
 //!
 //! Read more: <https://salvo.rs>
 #![doc(html_favicon_url = "https://salvo.rs/favicon-32x32.png")]
@@ -91,13 +104,16 @@
 use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error as StdError;
-use std::fmt::{self, Debug, Formatter};
+use std::fmt::{self, Debug, Formatter, Write};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
 use salvo_core::handler::Skipper;
-use salvo_core::http::header::{AUTHORIZATION, CACHE_CONTROL, COOKIE, SET_COOKIE, VARY};
+use salvo_core::http::header::{
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_RANGE, COOKIE, IF_MATCH, IF_MODIFIED_SINCE,
+    IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE, RANGE, SET_COOKIE, VARY,
+};
 use salvo_core::http::{HeaderMap, ResBody, StatusCode};
 use salvo_core::{Depot, Error, FlowCtrl, Handler, Request, Response, async_trait, cfg_feature};
 use tokio::sync::Notify;
@@ -188,7 +204,12 @@ impl RequestIssuer {
         self.use_scheme = value;
         self
     }
-    /// Whether to use the request's URI authority when generating the key.
+    /// Whether to isolate keys by authority.
+    ///
+    /// Origin-form requests without a URI authority use one valid `Host` header instead.
+    /// Missing, repeated, or invalid Host values disable caching when this option is enabled,
+    /// and so does a `Host` header that differs from the URI authority.
+    /// Disabling this option makes host isolation the application's responsibility.
     #[must_use]
     pub fn use_authority(mut self, value: bool) -> Self {
         self.use_authority = value;
@@ -218,29 +239,56 @@ impl CacheIssuer for RequestIssuer {
     type Key = String;
     async fn issue(&self, req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
         let mut key = String::with_capacity(req.uri().path().len() + 16);
-        if self.use_scheme
-            && let Some(scheme) = req.uri().scheme_str()
-        {
-            key.push_str(scheme);
-            key.push_str("://");
+        // Prefix every component with its byte length. Neither methods nor URI
+        // components are safe to concatenate with an unescaped delimiter.
+        let mut component = |value: &str| {
+            let _ = write!(key, "{}:{value}", value.len());
+        };
+        if self.use_scheme {
+            component(req.uri().scheme_str().unwrap_or(req.scheme().as_str()));
         }
-        if self.use_authority
-            && let Some(authority) = req.uri().authority()
-        {
-            key.push_str(authority.as_str());
+        if self.use_authority {
+            let authority = match req.uri().authority() {
+                Some(authority) => {
+                    // An absolute-form target may name another authority than
+                    // the Host header. Handlers can read either one, so such a
+                    // response must not be stored under either key.
+                    let mut hosts = req.headers().get_all(salvo_core::http::header::HOST).iter();
+                    if let Some(host) = hosts.next()
+                        && (hosts.next().is_some()
+                            || !host
+                                .as_bytes()
+                                .eq_ignore_ascii_case(authority.as_str().as_bytes()))
+                    {
+                        return None;
+                    }
+                    authority.clone()
+                }
+                None => {
+                    let mut hosts = req.headers().get_all(salvo_core::http::header::HOST).iter();
+                    let host = hosts.next()?;
+                    if hosts.next().is_some() {
+                        return None;
+                    }
+                    let host = host.to_str().ok()?;
+                    if host.contains('@') {
+                        return None;
+                    }
+                    host.parse::<salvo_core::http::uri::Authority>().ok()?
+                }
+            };
+            component(authority.as_str());
         }
         if self.use_path {
-            key.push_str(req.uri().path());
+            component(req.uri().path());
         }
         if self.use_query
             && let Some(query) = req.uri().query()
         {
-            key.push('?');
-            key.push_str(query);
+            component(query);
         }
         if self.use_method {
-            key.push('|');
-            key.push_str(req.method().as_str());
+            component(req.method().as_str());
         }
         Some(key)
     }
@@ -429,7 +477,27 @@ impl TryFrom<&ResBody> for CachedBody {
         match body {
             ResBody::None => Ok(Self::None),
             ResBody::Once(bytes) => Ok(Self::Once(bytes.to_owned())),
-            ResBody::Chunks(chunks) => Ok(Self::Chunks(chunks.to_owned())),
+            ResBody::Chunks(chunks) => {
+                if chunks.len() <= 1 {
+                    return Ok(Self::Once(chunks.front().cloned().unwrap_or_default()));
+                }
+                // Bound the extra insertion-time allocation. Small fragmented
+                // bodies are compacted once instead of cloning a descriptor
+                // array on every hit; large responses keep shared chunks.
+                const MAX_COMPACT_BYTES: usize = 64 * 1024;
+                let len = chunks.iter().try_fold(0usize, |len, chunk| {
+                    len.checked_add(chunk.len())
+                        .filter(|len| *len <= MAX_COMPACT_BYTES)
+                });
+                let Some(len) = len else {
+                    return Ok(Self::Chunks(chunks.clone()));
+                };
+                let mut bytes = Vec::with_capacity(len);
+                for chunk in chunks {
+                    bytes.extend_from_slice(chunk);
+                }
+                Ok(Self::Once(Bytes::from(bytes)))
+            }
             _ => Err(Error::other("unsupported body type")),
         }
     }
@@ -456,14 +524,23 @@ pub struct CachedEntry {
     ///
     /// *Notice: If the response's body is streaming, it will be ignored and not cached.
     pub body: CachedBody,
+    // Preconditions for headers whose ownership cannot be inferred from a value diff.
+    // None denotes a manually constructed entry without provenance.
+    outer_headers: Option<HeaderMap>,
 }
 impl CachedEntry {
-    /// Create a new `CachedEntry`.
+    /// Create a new `CachedEntry` without outer-header provenance.
+    ///
+    /// Such entries conservatively bypass cache reuse until their saved context is
+    /// restored with [`Self::with_outer_header_context`]. Stores should preserve entries
+    /// they receive (for example by cloning), or persist [`Self::outer_header_context`]
+    /// alongside status, headers, and body.
     pub fn new(status: Option<StatusCode>, headers: HeaderMap, body: CachedBody) -> Self {
         Self {
             status,
             headers,
             body,
+            outer_headers: None,
         }
     }
 
@@ -482,6 +559,39 @@ impl CachedEntry {
     /// *Notice: If the response's body is streaming, it will be ignored and not cached.
     pub fn body(&self) -> &CachedBody {
         &self.body
+    }
+
+    /// Header context that a store must preserve when reconstructing this entry.
+    pub fn outer_header_context(&self) -> Option<&HeaderMap> {
+        self.outer_headers.as_ref()
+    }
+
+    /// Restore the header context previously obtained from [`Self::outer_header_context`].
+    ///
+    /// Use the exact saved context; inventing or omitting header values can make an
+    /// entry unsafe to replay after outer middleware changes its response headers.
+    #[must_use]
+    pub fn with_outer_header_context(mut self, context: HeaderMap) -> Self {
+        self.outer_headers = Some(context);
+        self
+    }
+
+    fn matches_outer_headers(&self, current: &HeaderMap) -> bool {
+        let Some(expected) = self.outer_headers.as_ref() else {
+            return false;
+        };
+        for name in expected.keys() {
+            if !expected
+                .get_all(name)
+                .iter()
+                .eq(current.get_all(name).iter())
+            {
+                return false;
+            }
+        }
+        current
+            .keys()
+            .all(|name| self.headers.contains_key(name) || expected.contains_key(name))
     }
 }
 
@@ -557,10 +667,11 @@ where
 
     /// Allow caching requests or responses that contain private-user cache signals.
     ///
-    /// By default, requests with `Authorization` or `Cookie`, and responses with `Set-Cookie`,
-    /// `Vary`, or `Cache-Control: private`, are not cached. Enabling this lifts those
-    /// privacy restrictions. `Cache-Control: no-store`/`no-cache` responses are never
-    /// cached regardless of this setting.
+    /// By default, requests with `Authorization` or `Cookie`, and responses with a
+    /// `Set-Cookie` header or `Cache-Control: private`, are not cached. Enabling this
+    /// lifts those privacy restrictions. Responses with pending cookie jar changes,
+    /// `Vary`, or `Cache-Control: no-store`/`no-cache` are never cached. Range requests
+    /// and partial responses are also excluded regardless of this setting.
     #[inline]
     #[must_use]
     pub fn cache_private(mut self, cache_private: bool) -> Self {
@@ -611,7 +722,9 @@ fn cached_response(
     headers_before: &HeaderMap,
     cache_private: bool,
 ) -> Option<CachedEntry> {
-    if res.body.is_stream() || res.body.is_error() {
+    // Cookie jar changes are serialized into headers only after middleware returns.
+    // Entries cannot replay the jar, so skip these responses even in private mode.
+    if res.body.is_stream() || res.body.is_error() || res.has_cookie_changes() {
         return None;
     }
     // Only cache successful responses. Use the *effective* status: a missing
@@ -625,7 +738,8 @@ fn cached_response(
     } else {
         StatusCode::OK
     });
-    if !effective_status.is_success() {
+    // The cache stores complete representations and does not assemble byte ranges.
+    if !effective_status.is_success() || effective_status == StatusCode::PARTIAL_CONTENT {
         return None;
     }
     // `no-store`/`no-cache` forbid storing or reusing without revalidation in
@@ -655,7 +769,13 @@ fn cached_response(
             return None;
         }
     };
-    Some(CachedEntry::new(res.status_code, headers, body))
+    let mut outer_headers = headers_before.clone();
+    for name in headers.keys() {
+        outer_headers.remove(name);
+    }
+    let mut entry = CachedEntry::new(res.status_code, headers, body);
+    entry.outer_headers = Some(outer_headers);
+    Some(entry)
 }
 
 /// Headers the inner handler contributed, i.e. names whose values changed
@@ -665,10 +785,8 @@ fn cached_response(
 fn handler_response_headers(before: &HeaderMap, after: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for name in after.keys() {
-        let after_values = after.get_all(name).iter().collect::<Vec<_>>();
-        let before_values = before.get_all(name).iter().collect::<Vec<_>>();
-        if after_values != before_values {
-            for value in after_values {
+        if !after.get_all(name).iter().eq(before.get_all(name).iter()) {
+            for value in after.get_all(name) {
                 headers.append(name.clone(), value.clone());
             }
         }
@@ -678,6 +796,22 @@ fn handler_response_headers(before: &HeaderMap, after: &HeaderMap) -> HeaderMap 
 
 fn request_has_private_cache_headers(req: &Request) -> bool {
     req.headers().contains_key(AUTHORIZATION) || req.headers().contains_key(COOKIE)
+}
+
+fn request_disallows_reuse(req: &Request) -> bool {
+    ["no-cache", "no-store", "max-age", "min-fresh"]
+        .into_iter()
+        .any(|directive| cache_control_contains(req.headers(), directive))
+        || req
+            .headers()
+            .get_all(salvo_core::http::header::PRAGMA)
+            .iter()
+            .any(|value| {
+                value
+                    .as_bytes()
+                    .split(|byte| *byte == b',')
+                    .any(|part| part.trim_ascii().eq_ignore_ascii_case(b"no-cache"))
+            })
 }
 
 fn response_has_private_cache_headers(headers: &HeaderMap) -> bool {
@@ -698,19 +832,42 @@ fn response_disallows_caching(headers: &HeaderMap) -> bool {
     cache_control_contains(headers, "no-store")
         || cache_control_contains(headers, "no-cache")
         || headers.contains_key(VARY)
+        || headers.contains_key(CONTENT_RANGE)
 }
 
 fn cache_control_contains(headers: &HeaderMap, directive: &str) -> bool {
     headers.get_all(CACHE_CONTROL).iter().any(|value| {
-        value.to_str().ok().is_some_and(|value| {
-            value.split(',').any(|part| {
-                let part = part.trim();
-                part.eq_ignore_ascii_case(directive)
-                    || part
-                        .split_once('=')
-                        .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(directive))
+        // Quoted extension values may contain commas, escapes and opaque
+        // obs-text bytes. Scan the original field instead of requiring ASCII
+        // text or treating a comma inside a quoted value as a directive boundary.
+        let mut quoted = false;
+        let mut escaped = false;
+        value
+            .as_bytes()
+            .split(|&byte| {
+                if escaped {
+                    escaped = false;
+                } else if quoted && byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = !quoted;
+                } else if !quoted && byte == b',' {
+                    return true;
+                }
+                false
             })
-        })
+            .any(|part| {
+                // Qualified private/no-cache directives still apply. Values
+                // (including quoted field-name lists) are not directive names.
+                let mut name = part.split(|&byte| byte == b'=').next().unwrap_or_default();
+                while matches!(name.first(), Some(b' ' | b'\t')) {
+                    name = &name[1..];
+                }
+                while matches!(name.last(), Some(b' ' | b'\t')) {
+                    name = &name[..name.len() - 1];
+                }
+                name.eq_ignore_ascii_case(directive.as_bytes())
+            })
     })
 }
 
@@ -729,6 +886,14 @@ where
         ctrl: &mut FlowCtrl,
     ) {
         if self.skipper.skipped(req, depot)
+            || request_disallows_reuse(req)
+            // Range is not part of the default key, and hits do not apply ranges.
+            || req.headers().contains_key(RANGE)
+            // Hits and coalesced followers skip the origin handler. Let it
+            // evaluate preconditions instead of reusing an unconditional response.
+            || [IF_MATCH, IF_UNMODIFIED_SINCE, IF_NONE_MATCH, IF_MODIFIED_SINCE, IF_RANGE]
+                .iter()
+                .any(|header| req.headers().contains_key(header))
             || (!self.cache_private && request_has_private_cache_headers(req))
         {
             ctrl.call_next(req, depot, res).await;
@@ -741,7 +906,12 @@ where
             ctrl.call_next(req, depot, res).await;
             return;
         };
-        let Some(cache) = self.store.load_entry(&key).await else {
+        let Some(cache) = self
+            .store
+            .load_entry(&key)
+            .await
+            .filter(|entry| entry.matches_outer_headers(res.headers()))
+        else {
             match self.in_flight.enter(key.clone()) {
                 FlightPermit::Leader(guard) => {
                     let cached_data = call_next_and_cache(
@@ -758,7 +928,10 @@ where
                 }
                 FlightPermit::Follower(flight) => {
                     flight.wait().await;
-                    if let Some(cache) = flight.entry() {
+                    if let Some(cache) = flight
+                        .entry()
+                        .filter(|entry| entry.matches_outer_headers(res.headers()))
+                    {
                         respond_from_cache(res, cache);
                         ctrl.skip_rest();
                     } else {
@@ -799,6 +972,7 @@ fn respond_from_cache(res: &mut Response, cache: CachedEntry) {
         status,
         headers,
         body,
+        ..
     } = cache;
     if let Some(status) = status {
         res.status_code(status);
@@ -1098,7 +1272,10 @@ mod tests {
         chunks.push_back(Bytes::from("chunk2"));
         let res_body = ResBody::Chunks(chunks.clone());
         let result: Result<CachedBody, _> = (&res_body).try_into();
-        assert_eq!(result.unwrap(), CachedBody::Chunks(chunks));
+        assert_eq!(
+            result.unwrap(),
+            CachedBody::Once(Bytes::from_static(b"chunk1chunk2"))
+        );
     }
 
     #[test]
@@ -1190,6 +1367,20 @@ mod tests {
         let debug_str = format!("{entry:?}");
         assert!(debug_str.contains("CachedEntry"));
         assert!(debug_str.contains("status"));
+    }
+
+    #[test]
+    fn reconstructed_entries_need_their_saved_outer_header_context() {
+        let mut before = HeaderMap::new();
+        before.insert("x-default", "from-outer".parse().unwrap());
+        let unknown = CachedEntry::new(Some(StatusCode::OK), HeaderMap::new(), CachedBody::None);
+        assert!(!unknown.matches_outer_headers(&before));
+        assert!(!unknown.matches_outer_headers(&HeaderMap::new()));
+
+        let restored = unknown.with_outer_header_context(before.clone());
+        assert_eq!(restored.outer_header_context(), Some(&before));
+        assert!(restored.matches_outer_headers(&before));
+        assert!(!restored.matches_outer_headers(&HeaderMap::new()));
     }
 
     #[test]
@@ -1359,6 +1550,116 @@ mod tests {
             res.headers_mut().insert(name, value.parse().unwrap());
             assert!(cached_response(&res, &HeaderMap::new(), false).is_none());
             assert!(cached_response(&res, &HeaderMap::new(), true).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn cookie_jar_changes_are_not_cached() {
+        #[derive(Debug)]
+        struct CookiePage {
+            calls: Arc<AtomicUsize>,
+            remove: bool,
+        }
+        #[async_trait]
+        impl Handler for CookiePage {
+            async fn handle(
+                &self,
+                _req: &mut Request,
+                _depot: &mut Depot,
+                res: &mut Response,
+                _ctrl: &mut FlowCtrl,
+            ) {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.remove {
+                    res.remove_cookie("session");
+                } else {
+                    res.add_cookie(salvo_core::http::cookie::Cookie::new(
+                        "session",
+                        format!("session-{call}"),
+                    ));
+                }
+                res.render(format!("session-specific body {call}"));
+            }
+        }
+
+        for cache_private in [false, true] {
+            for remove in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let cache = Cache::new(MokaStore::new(100), RequestIssuer::default())
+                    .cache_private(cache_private);
+                let service = Service::new(Router::new().hoop(cache).goal(CookiePage {
+                    calls: calls.clone(),
+                    remove,
+                }));
+                for call in 1..=2 {
+                    let mut res = TestClient::get("http://example.test/").send(&service).await;
+                    assert!(res.headers().contains_key(SET_COOKIE));
+                    assert_eq!(
+                        res.take_string().await.unwrap(),
+                        format!("session-specific body {call}")
+                    );
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn range_requests_bypass_cached_full_responses() {
+        #[handler]
+        async fn range_page(req: &mut Request, res: &mut Response) {
+            if req.headers().contains_key(salvo_core::http::header::RANGE) {
+                res.status_code(StatusCode::PARTIAL_CONTENT);
+                res.add_header("content-range", "bytes 0-1/4", true)
+                    .unwrap();
+                res.render("ab");
+            } else {
+                res.render("abcd");
+            }
+        }
+
+        // Exercise both request orders: a range must neither poison the full entry
+        // nor receive an already cached full representation.
+        for range_first in [false, true] {
+            let cache = Cache::new(MokaStore::new(100), RequestIssuer::default());
+            let service = Service::new(Router::new().hoop(cache).get(range_page));
+            for range in [range_first, !range_first, range_first] {
+                let request = TestClient::get("http://example.test/");
+                let request = if range {
+                    request.add_header("range", "bytes=0-1", true)
+                } else {
+                    request
+                };
+                let mut res = request.send(&service).await;
+                assert_eq!(
+                    res.status_code,
+                    Some(if range {
+                        StatusCode::PARTIAL_CONTENT
+                    } else {
+                        StatusCode::OK
+                    })
+                );
+                assert_eq!(
+                    res.take_string().await.unwrap(),
+                    if range { "ab" } else { "abcd" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_response_rejects_partial_representations() {
+        for cache_private in [false, true] {
+            let mut res = Response::new();
+            res.render("ab");
+            res.status_code(StatusCode::PARTIAL_CONTENT);
+            assert!(cached_response(&res, &HeaderMap::new(), cache_private).is_none());
+
+            // Also reject an incomplete representation with an incorrect 200 status.
+            res.status_code(StatusCode::OK);
+            res.add_header("content-range", "bytes 0-1/4", true)
+                .unwrap();
+            assert!(cached_response(&res, &HeaderMap::new(), cache_private).is_none());
         }
     }
 

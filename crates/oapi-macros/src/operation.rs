@@ -5,7 +5,7 @@ use proc_macro2::{Ident, TokenStream};
 use quote::{ToTokens, quote};
 use syn::parse::Parse;
 use syn::token::Paren;
-use syn::{Expr, ExprPath, Path, Token, Type, parenthesized};
+use syn::{Expr, ExprPath, LitStr, Path, Token, Type, parenthesized};
 
 use crate::endpoint::EndpointAttr;
 use crate::parse_utils::LitStrOrExpr;
@@ -120,10 +120,10 @@ impl<'a> Operation<'a> {
             modifiers.push({
                 let rb = rb.try_to_token_stream()?;
                 quote! {
-                    if let Some(request_body) = operation.request_body.as_mut() {
+                    if let Some(#oapi::oapi::RefOr::Type(request_body)) = operation.request_body.as_mut() {
                         request_body.merge(#rb);
                     } else {
-                        operation.request_body = Some(#rb);
+                        operation.request_body = Some((#rb).into());
                     }
                 }
             });
@@ -138,7 +138,7 @@ impl<'a> Operation<'a> {
         // });
         if let Some(security_requirements) = self.security {
             modifiers.push(quote! {
-                operation.securities.append(&mut #security_requirements.into_iter().collect());
+                operation.securities.get_or_insert_default().extend(#security_requirements);
             })
         }
         if let Some(operation_id) = &self.operation_id {
@@ -198,12 +198,8 @@ impl<'a> Operation<'a> {
                     let code = &tuple.status_code;
                     if let Some(inner) = &tuple.inner {
                         match inner {
-                            ResponseTupleInner::Ref(inline) => {
-                                let ty = &inline.ty;
-                                modifiers.push(quote! {
-                                    let _= <#ty as #oapi::oapi::ToSchema>::to_schema(components);
-                                });
-                            }
+                            // ToResponse registers its response and any body schemas itself.
+                            ResponseTupleInner::Ref(_) => {}
                             ResponseTupleInner::Value(value) => {
                                 if let Some(content) = &value.response_type {
                                     modifiers
@@ -223,7 +219,7 @@ impl<'a> Operation<'a> {
     }
 }
 
-fn generate_register_schemas(oapi: &Ident, content: &PathType) -> Vec<TokenStream> {
+fn generate_register_schemas(oapi: &syn::Path, content: &PathType) -> Vec<TokenStream> {
     let mut modifiers = vec![];
     match content {
         PathType::RefPath(path) => {
@@ -312,6 +308,7 @@ impl ToTokens for Summary<'_> {
 #[derive(Debug)]
 pub(crate) enum PathType<'p> {
     RefPath(Path),
+    RefLocation(LitStr),
     MediaType(InlineType<'p>),
     InlineSchema(TokenStream, Type),
 }
@@ -342,7 +339,11 @@ impl Parse for PathType<'_> {
             }
             let ref_stream;
             parenthesized!(ref_stream in input);
-            Ok(Self::RefPath(ref_stream.parse::<ExprPath>()?.path))
+            if ref_stream.peek(LitStr) {
+                Ok(Self::RefLocation(ref_stream.parse()?))
+            } else {
+                Ok(Self::RefPath(ref_stream.parse::<ExprPath>()?.path))
+            }
         } else {
             Ok(Self::MediaType(input.parse()?))
         }

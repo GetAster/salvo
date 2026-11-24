@@ -96,16 +96,16 @@ impl HttpBuilder {
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        // When both HTTP/1 and HTTP/2 are enabled, consume only enough bytes to
+        // Consume only enough bytes to
         // distinguish the HTTP/2 prior-knowledge preface. `Rewind` preserves
         // those bytes so the selected Hyper connection receives the full input.
         //
         // Detection and Hyper's own header-read timeout share one `http1_header_timeout`
         // budget: track when detection began so the remainder can be handed to Hyper,
         // rather than letting a client that stalls detection then get a fresh full timeout.
-        #[cfg(all(feature = "http1", feature = "http2"))]
+        #[cfg(any(feature = "http1", feature = "http2"))]
         let detect_started = tokio::time::Instant::now();
-        #[cfg(all(feature = "http1", feature = "http2"))]
+        #[cfg(any(feature = "http1", feature = "http2"))]
         let (version, socket) = {
             // The initial protocol-detection read is bounded by the HTTP/1 header timeout.
             // A disabled fuse (`disable_fuse()` → no config, or a config with this timeout
@@ -113,6 +113,10 @@ impl HttpBuilder {
             // config keeps its header timeout, so a silent connection is still bounded.
             let detect_timeout = fuse_config.and_then(|config| config.http1_header_timeout);
             tokio::select! {
+                // Look at the read first. Once it has decided the protocol, the request
+                // that arrived with it belongs to the connection handling below, even if
+                // the server is asked to stop at the same moment.
+                biased;
                 result = read_version(socket) => result?,
                 _ = async {
                     match detect_timeout {
@@ -127,15 +131,25 @@ impl HttpBuilder {
                     tracing::info!(?state, "closing connection during protocol detection");
                     return Ok(());
                 },
+                // A connection that has not selected a protocol yet has no request to
+                // drain. Close it on graceful stop instead of keeping the server alive
+                // until the detection read times out, as the QUIC handshake path does.
+                _ = async {
+                    if let Some(token) = &graceful_stop_token {
+                        token.cancelled().await;
+                    } else {
+                        pending::<()>().await;
+                    }
+                } => {
+                    tracing::info!("closing connection during protocol detection: server is shutting down");
+                    return Ok(());
+                },
             }
         };
         #[cfg(all(not(feature = "http1"), not(feature = "http2")))]
         let version = Version::HTTP_11; // Just make the compiler happy.
-        #[cfg(all(feature = "http1", not(feature = "http2")))]
-        let version = Version::HTTP_11;
-        #[cfg(all(not(feature = "http1"), feature = "http2"))]
-        let version = Version::HTTP_2;
 
+        let version = conn_ctrl.select_http_version(version)?;
         match version {
             Version::HTTP_10 | Version::HTTP_11 => {
                 #[cfg(not(feature = "http1"))]
@@ -153,7 +167,6 @@ impl HttpBuilder {
                         // When both protocols are enabled, the detection read already spent part
                         // of this budget; subtract it so the whole header-read window stays a
                         // single `http1_header_timeout` instead of restarting after detection.
-                        #[cfg(feature = "http2")]
                         let timeout = timeout.saturating_sub(detect_started.elapsed());
                         http1.header_read_timeout(Some(timeout));
                     }
@@ -165,6 +178,9 @@ impl HttpBuilder {
                     // connection control are driven by the same task. This avoids
                     // spawning a supervisor task for every accepted connection.
                     tokio::select! {
+                        // Poll the connection first, so that a request which has already
+                        // arrived is read before a graceful shutdown closes what is idle.
+                        biased;
                         result = &mut conn => {
                             if let Err(error) = result {
                                 tracing::debug!(?error, "HTTP/1 connection ended with an error");

@@ -23,6 +23,12 @@
 //!
 //! # Security Considerations
 //!
+//! This crate uses jsonwebtoken 12. Raw HMAC secret constructors, including
+//! [`ConstDecoder::from_secret`], now return a `Result` and reject empty secrets.
+//! Handle this result when upgrading, for example with
+//! `ConstDecoder::from_secret(secret)?`. The `ring` feature selects the
+//! RustCrypto backend; `aws-lc-rs` selects AWS-LC.
+//!
 //! **Warning: avoid passing JWT tokens in URL query parameters in production.**
 //!
 //! While this crate supports extracting tokens from query parameters (via [`QueryFinder`]),
@@ -62,7 +68,7 @@
 //!     install_crypto_provider()
 //!         .expect("install the JWT crypto provider before first use");
 //!
-//!     let auth_handler: JwtAuth<JwtClaims, _> = JwtAuth::new(ConstDecoder::from_secret(SECRET_KEY.as_bytes()))
+//!     let auth_handler: JwtAuth<JwtClaims, _> = JwtAuth::new(ConstDecoder::from_secret(SECRET_KEY.as_bytes()).unwrap())
 //!         .finders(vec![Box::new(HeaderFinder::new())])
 //!         .force_passed(true);
 //!
@@ -90,7 +96,7 @@
 //!         let token = jsonwebtoken::encode(
 //!             &jsonwebtoken::Header::default(),
 //!             &claim,
-//!             &EncodingKey::from_secret(SECRET_KEY.as_bytes()),
+//!             &EncodingKey::from_secret(SECRET_KEY.as_bytes()).unwrap(),
 //!         )?;
 //!         res.render(Text::Plain(format!(
 //!             "Use this token as `Authorization: Bearer {token}`"
@@ -216,7 +222,7 @@ pub const JWT_AUTH_TOKEN_KEY: &str = "::salvo::jwt_auth::auth_token";
 /// key used to insert auth error to depot.
 pub const JWT_AUTH_ERROR_KEY: &str = "::salvo::jwt_auth::auth_error";
 
-const ALL_METHODS: [Method; 10] = [
+const STANDARD_METHODS: [Method; 10] = [
     Method::GET,
     Method::POST,
     Method::PUT,
@@ -286,8 +292,8 @@ pub enum JwtAuthError {
     /// Decoding of JWKS error
     #[error("Decoding of JWKS error")]
     DecodeError(#[from] base64::DecodeError),
-    /// JWT is missing kid, alg, or decoding components
-    #[error("JWT is missing kid, alg, or decoding components")]
+    /// JWK has missing or unsupported verification parameters.
+    #[error("JWK has missing or unsupported verification parameters")]
     InvalidJwk,
     /// Issuer URL invalid
     #[error("Issuer URL invalid")]
@@ -318,7 +324,9 @@ pub enum JwtAuthState {
     /// Usually results in a 401 Unauthorized response unless `force_passed` is true.
     Unauthorized,
     /// A token was provided but it failed validation.
-    /// Usually results in a 403 Forbidden response unless `force_passed` is true.
+    /// Results in a 401 Unauthorized response unless `force_passed` is true.
+    /// The name is retained for compatibility; this is failed authentication,
+    /// rather than an authenticated identity lacking permission.
     Forbidden,
 }
 
@@ -343,8 +351,12 @@ pub trait JwtAuthDepotExt {
     /// Returns `JwtAuthState::Unauthorized` if no state is present in the depot.
     fn jwt_auth_state(&self) -> JwtAuthState;
 
-    /// Gets the JWT error if authentication failed.
+    /// Gets a `jsonwebtoken` error from [`ConstDecoder`]. For OIDC or a custom
+    /// decoder, use [`Self::jwt_auth_error_typed`] with its error type.
     fn jwt_auth_error(&self) -> Option<&JwtError>;
+
+    /// Gets the error type declared by the configured decoder.
+    fn jwt_auth_error_typed<E: std::error::Error + Send + Sync + 'static>(&self) -> Option<&E>;
 }
 
 impl JwtAuthDepotExt for Depot {
@@ -373,12 +385,19 @@ impl JwtAuthDepotExt for Depot {
     fn jwt_auth_error(&self) -> Option<&JwtError> {
         self.get(JWT_AUTH_ERROR_KEY).ok()
     }
+
+    fn jwt_auth_error_typed<E: std::error::Error + Send + Sync + 'static>(&self) -> Option<&E> {
+        self.get(JWT_AUTH_ERROR_KEY).ok()
+    }
 }
 
 /// JWT Authentication middleware for Salvo.
 ///
 /// `JwtAuth` extracts and validates JWT tokens from incoming requests based on the configured
 /// token finders and decoder. If valid, it stores the decoded data in the depot for later use.
+/// Each execution replaces the previous JWT authentication result, including claims,
+/// token and error. Multiple instances in one chain share this result; copy any outer
+/// identity to an application-specific depot key before running another instance.
 ///
 /// # Type Parameters
 ///
@@ -477,6 +496,16 @@ where
         res: &mut Response,
         ctrl: &mut FlowCtrl,
     ) {
+        // Authentication state belongs to this attempt. Remove values without
+        // downcasting: a previous instance may have used another claims/error type.
+        for key in [
+            JWT_AUTH_DATA_KEY,
+            JWT_AUTH_STATE_KEY,
+            JWT_AUTH_TOKEN_KEY,
+            JWT_AUTH_ERROR_KEY,
+        ] {
+            depot.remove(key);
+        }
         let token = self.find_token(req).await;
         if let Some(token) = token {
             match self.decoder.decode::<C>(&token, depot).await {
@@ -490,7 +519,9 @@ where
                     depot.insert(JWT_AUTH_STATE_KEY, JwtAuthState::Forbidden);
                     depot.insert(JWT_AUTH_ERROR_KEY, e);
                     if !self.force_passed {
-                        res.render(StatusError::forbidden());
+                        res.render(StatusError::unauthorized());
+                        res.add_header("www-authenticate", "Bearer error=\"invalid_token\"", true)
+                            .expect("static Bearer challenge is valid");
                         ctrl.skip_rest();
                     }
                 }
@@ -499,6 +530,8 @@ where
             depot.insert(JWT_AUTH_STATE_KEY, JwtAuthState::Unauthorized);
             if !self.force_passed {
                 res.render(StatusError::unauthorized());
+                res.add_header("www-authenticate", "Bearer", true)
+                    .expect("static Bearer challenge is valid");
                 ctrl.skip_rest();
             }
         }
@@ -531,21 +564,189 @@ mod tests {
             user: "test_user".into(),
             exp: (OffsetDateTime::now_utc() + Duration::days(exp_days)).unix_timestamp(),
         };
-        encode_test_token(&claim, &EncodingKey::from_secret(secret))
+        encode_test_token(&claim, &EncodingKey::from_secret(secret).unwrap())
+    }
+
+    #[tokio::test]
+    async fn blank_token_does_not_hide_a_later_finder() {
+        #[handler]
+        async fn hello() -> &'static str {
+            "hello"
+        }
+
+        let auth: JwtAuth<JwtClaims, _> =
+            JwtAuth::new(ConstDecoder::from_secret(b"secret").unwrap()).finders(vec![
+                Box::new(QueryFinder::new("jwt")),
+                Box::new(CookieFinder::new("jwt")),
+                Box::new(HeaderFinder::new()),
+            ]);
+        let service = Service::new(Router::new().hoop(auth).goal(hello));
+        let token = create_test_token(b"secret", 1);
+
+        for (url, cookie, bearer, expected) in [
+            ("http://localhost/", None, true, StatusCode::OK),
+            ("http://localhost/?jwt=", None, true, StatusCode::OK),
+            ("http://localhost/", Some("jwt="), true, StatusCode::OK),
+            // Without any token the request is unauthenticated, not forbidden.
+            (
+                "http://localhost/?jwt=",
+                None,
+                false,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "http://localhost/",
+                Some("jwt="),
+                false,
+                StatusCode::UNAUTHORIZED,
+            ),
+            ("http://localhost/", None, false, StatusCode::UNAUTHORIZED),
+            // A non-blank value is still a token and is not retried elsewhere.
+            (
+                "http://localhost/?jwt=invalid",
+                None,
+                true,
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let mut request = TestClient::get(url);
+            if let Some(cookie) = cookie {
+                request = request.add_header("cookie", cookie, true);
+            }
+            if bearer {
+                request = request.add_header("authorization", format!("Bearer {token}"), true);
+            }
+            assert_eq!(
+                request.send(&service).await.status_code,
+                Some(expected),
+                "{url} cookie={cookie:?} bearer={bearer}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_authentication_replaces_all_depot_state() {
+        #[handler]
+        async fn inspect(depot: &mut Depot) -> String {
+            serde_json::json!({
+                "state": format!("{:?}", depot.jwt_auth_state()),
+                "has_data": depot.jwt_auth_data::<JwtClaims>().is_some(),
+                "has_token": depot.jwt_auth_token().is_some(),
+                "has_error": depot.jwt_auth_error().is_some(),
+            })
+            .to_string()
+        }
+
+        let outer: JwtAuth<JwtClaims, _> =
+            JwtAuth::new(ConstDecoder::from_secret(b"outer").unwrap())
+                .finders(vec![Box::new(
+                    HeaderFinder::new().header_names(vec!["x-outer-token".parse().unwrap()]),
+                )])
+                .force_passed(true);
+        let inner: JwtAuth<JwtClaims, _> =
+            JwtAuth::new(ConstDecoder::from_secret(b"inner").unwrap())
+                .finders(vec![Box::new(
+                    HeaderFinder::new().header_names(vec!["x-inner-token".parse().unwrap()]),
+                )])
+                .force_passed(true);
+        let service = Service::new(Router::new().hoop(outer).hoop(inner).goal(inspect));
+        let outer_token = create_test_token(b"outer", 1);
+        let inner_token = create_test_token(b"inner", 1);
+
+        for (outer, inner, state, has_data, has_error) in [
+            (Some(&outer_token), None, "Unauthorized", false, false),
+            (
+                Some(&outer_token),
+                Some(&outer_token),
+                "Forbidden",
+                false,
+                true,
+            ),
+            (
+                Some(&inner_token),
+                Some(&inner_token),
+                "Authorized",
+                true,
+                false,
+            ),
+            (Some(&inner_token), None, "Unauthorized", false, false),
+            (None, Some(&inner_token), "Authorized", true, false),
+            (
+                Some(&outer_token),
+                Some(&inner_token),
+                "Authorized",
+                true,
+                false,
+            ),
+        ] {
+            let mut request = TestClient::get("http://localhost/");
+            if let Some(token) = outer {
+                request = request.add_header("x-outer-token", format!("Bearer {token}"), true);
+            }
+            if let Some(token) = inner {
+                request = request.add_header("x-inner-token", format!("Bearer {token}"), true);
+            }
+            let mut response = request.send(&service).await;
+            let body: serde_json::Value =
+                serde_json::from_str(&response.take_string().await.unwrap()).unwrap();
+            assert_eq!(body["state"], state);
+            assert_eq!(body["has_data"], has_data, "{body}");
+            assert_eq!(body["has_token"], has_data, "{body}");
+            assert_eq!(body["has_error"], has_error, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_authentication_clears_other_claims_and_error_types() {
+        #[derive(Clone, Deserialize)]
+        struct OtherClaims {
+            #[serde(rename = "user")]
+            _user: String,
+        }
+
+        #[handler]
+        async fn seed_state(depot: &mut Depot) {
+            depot.insert(
+                JWT_AUTH_DATA_KEY,
+                TokenData {
+                    header: jsonwebtoken::Header::default(),
+                    claims: OtherClaims {
+                        _user: "outer".into(),
+                    },
+                },
+            );
+            depot.insert(JWT_AUTH_ERROR_KEY, std::io::Error::other("outer error"));
+            depot.insert(JWT_AUTH_TOKEN_KEY, "outer token".to_owned());
+            depot.insert(JWT_AUTH_STATE_KEY, JwtAuthState::Authorized);
+        }
+        #[handler]
+        async fn inspect(depot: &mut Depot) -> &'static str {
+            assert!(!depot.contains_key(JWT_AUTH_DATA_KEY));
+            assert!(!depot.contains_key(JWT_AUTH_ERROR_KEY));
+            assert!(!depot.contains_key(JWT_AUTH_TOKEN_KEY));
+            assert_eq!(depot.jwt_auth_state(), JwtAuthState::Unauthorized);
+            "anonymous"
+        }
+
+        let auth: JwtAuth<JwtClaims, _> =
+            JwtAuth::new(ConstDecoder::from_secret(b"inner").unwrap()).force_passed(true);
+        let service = Service::new(Router::new().hoop(seed_state).hoop(auth).goal(inspect));
+        let mut response = TestClient::get("http://localhost/").send(&service).await;
+        assert_eq!(response.take_string().await.unwrap(), "anonymous");
     }
 
     // ==================== ConstDecoder Tests ====================
 
     #[test]
     fn test_const_decoder_new() {
-        let key = DecodingKey::from_secret(b"test_secret");
+        let key = DecodingKey::from_secret(b"test_secret").unwrap();
         let decoder = ConstDecoder::new(key);
         assert!(format!("{decoder:?}").contains("ConstDecoder"));
     }
 
     #[test]
     fn test_const_decoder_with_validation() {
-        let key = DecodingKey::from_secret(b"test_secret");
+        let key = DecodingKey::from_secret(b"test_secret").unwrap();
         let mut validation = Validation::default();
         validation.validate_exp = false;
         let decoder = ConstDecoder::with_validation(key, validation);
@@ -554,7 +755,7 @@ mod tests {
 
     #[test]
     fn test_const_decoder_from_secret() {
-        let decoder = ConstDecoder::from_secret(b"my_secret_key");
+        let decoder = ConstDecoder::from_secret(b"my_secret_key").unwrap();
         assert!(format!("{decoder:?}").contains("ConstDecoder"));
     }
 
@@ -572,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn test_const_decoder_decode_valid_token() {
         let secret = b"test_secret_key";
-        let decoder = ConstDecoder::from_secret(secret);
+        let decoder = ConstDecoder::from_secret(secret).unwrap();
         let token = create_test_token(secret, 1);
 
         let mut depot = Depot::new();
@@ -585,7 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_const_decoder_decode_invalid_token() {
-        let decoder = ConstDecoder::from_secret(b"correct_secret");
+        let decoder = ConstDecoder::from_secret(b"correct_secret").unwrap();
         let token = create_test_token(b"wrong_secret", 1);
 
         let mut depot = Depot::new();
@@ -596,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn test_const_decoder_decode_expired_token() {
         let secret = b"test_secret_key";
-        let decoder = ConstDecoder::from_secret(secret);
+        let decoder = ConstDecoder::from_secret(secret).unwrap();
         let token = create_test_token(secret, -1); // Expired
 
         let mut depot = Depot::new();
@@ -609,8 +810,7 @@ mod tests {
     #[test]
     fn test_header_finder_new() {
         let finder = HeaderFinder::new();
-        assert_eq!(finder.allowed_methods.len(), ALL_METHODS.len());
-        assert!(finder.allowed_methods.contains(&Method::QUERY));
+        assert!(finder.allowed_methods.is_none());
         assert_eq!(finder.header_names.len(), 1); // Authorization
     }
 
@@ -627,9 +827,21 @@ mod tests {
     #[test]
     fn test_header_finder_allowed_methods() {
         let finder = HeaderFinder::new().allowed_methods(vec![Method::GET, Method::POST]);
-        assert_eq!(finder.allowed_methods.len(), 2);
-        assert!(finder.allowed_methods.contains(&Method::GET));
-        assert!(finder.allowed_methods.contains(&Method::POST));
+        assert_eq!(finder.allowed_methods.as_ref().unwrap().len(), 2);
+        assert!(
+            finder
+                .allowed_methods
+                .as_ref()
+                .unwrap()
+                .contains(&Method::GET)
+        );
+        assert!(
+            finder
+                .allowed_methods
+                .as_ref()
+                .unwrap()
+                .contains(&Method::POST)
+        );
     }
 
     #[test]
@@ -655,7 +867,7 @@ mod tests {
     fn test_query_finder_new() {
         let finder = QueryFinder::new("token");
         assert_eq!(finder.query_name, "token");
-        assert_eq!(finder.allowed_methods.len(), ALL_METHODS.len());
+        assert!(finder.allowed_methods.is_none());
     }
 
     #[test]
@@ -673,8 +885,14 @@ mod tests {
     #[test]
     fn test_query_finder_allowed_methods() {
         let finder = QueryFinder::new("token").allowed_methods(vec![Method::GET]);
-        assert_eq!(finder.allowed_methods.len(), 1);
-        assert!(finder.allowed_methods.contains(&Method::GET));
+        assert_eq!(finder.allowed_methods.as_ref().unwrap().len(), 1);
+        assert!(
+            finder
+                .allowed_methods
+                .as_ref()
+                .unwrap()
+                .contains(&Method::GET)
+        );
     }
 
     // ==================== CookieFinder Tests ====================
@@ -683,20 +901,20 @@ mod tests {
     fn test_cookie_finder_new() {
         let finder = CookieFinder::new("session");
         assert_eq!(finder.cookie_name, "session");
-        assert_eq!(finder.allowed_methods.len(), ALL_METHODS.len());
+        assert!(finder.allowed_methods.is_none());
     }
 
     #[test]
     fn test_cookie_finder_allowed_methods() {
         let finder = CookieFinder::new("jwt").allowed_methods(vec![Method::GET, Method::POST]);
-        assert_eq!(finder.allowed_methods.len(), 2);
+        assert_eq!(finder.allowed_methods.as_ref().unwrap().len(), 2);
     }
 
     #[test]
     fn test_cookie_finder_mut_methods() {
         let mut finder = CookieFinder::new("token");
         finder.allowed_methods_mut().clear();
-        assert!(finder.allowed_methods.is_empty());
+        assert!(finder.allowed_methods.as_ref().unwrap().is_empty());
     }
 
     // ==================== FormFinder Tests ====================
@@ -705,14 +923,20 @@ mod tests {
     fn test_form_finder_new() {
         let finder = FormFinder::new("token");
         assert_eq!(finder.field_name, "token");
-        assert_eq!(finder.allowed_methods.len(), ALL_METHODS.len());
+        assert!(finder.allowed_methods.is_none());
     }
 
     #[test]
     fn test_form_finder_allowed_methods() {
         let finder = FormFinder::new("access_token").allowed_methods(vec![Method::POST]);
-        assert_eq!(finder.allowed_methods.len(), 1);
-        assert!(finder.allowed_methods.contains(&Method::POST));
+        assert_eq!(finder.allowed_methods.as_ref().unwrap().len(), 1);
+        assert!(
+            finder
+                .allowed_methods
+                .as_ref()
+                .unwrap()
+                .contains(&Method::POST)
+        );
     }
 
     // ==================== JwtAuthState Tests ====================
@@ -783,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_jwt_auth_new() {
-        let decoder = ConstDecoder::from_secret(b"secret");
+        let decoder = ConstDecoder::from_secret(b"secret").unwrap();
         let auth: JwtAuth<JwtClaims, _> = JwtAuth::new(decoder);
         assert!(!auth.force_passed);
         assert_eq!(auth.finders.len(), 1); // Default HeaderFinder
@@ -791,14 +1015,14 @@ mod tests {
 
     #[test]
     fn test_jwt_auth_force_passed() {
-        let decoder = ConstDecoder::from_secret(b"secret");
+        let decoder = ConstDecoder::from_secret(b"secret").unwrap();
         let auth: JwtAuth<JwtClaims, _> = JwtAuth::new(decoder).force_passed(true);
         assert!(auth.force_passed);
     }
 
     #[test]
     fn test_jwt_auth_finders() {
-        let decoder = ConstDecoder::from_secret(b"secret");
+        let decoder = ConstDecoder::from_secret(b"secret").unwrap();
         let auth: JwtAuth<JwtClaims, _> = JwtAuth::new(decoder).finders(vec![
             Box::new(HeaderFinder::new()),
             Box::new(QueryFinder::new("token")),
@@ -808,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_jwt_auth_finders_mut() {
-        let decoder = ConstDecoder::from_secret(b"secret");
+        let decoder = ConstDecoder::from_secret(b"secret").unwrap();
         let mut auth: JwtAuth<JwtClaims, _> = JwtAuth::new(decoder);
         auth.finders_mut().push(Box::new(CookieFinder::new("jwt")));
         assert_eq!(auth.finders.len(), 2);
@@ -816,14 +1040,14 @@ mod tests {
 
     #[test]
     fn test_jwt_auth_decoder_mut() {
-        let decoder = ConstDecoder::from_secret(b"secret");
+        let decoder = ConstDecoder::from_secret(b"secret").unwrap();
         let mut auth: JwtAuth<JwtClaims, _> = JwtAuth::new(decoder);
         let _ = auth.decoder_mut(); // Just verify it compiles and returns
     }
 
     #[test]
     fn test_jwt_auth_debug() {
-        let decoder = ConstDecoder::from_secret(b"secret");
+        let decoder = ConstDecoder::from_secret(b"secret").unwrap();
         let auth: JwtAuth<JwtClaims, _> = JwtAuth::new(decoder);
         let debug_str = format!("{auth:?}");
         assert!(debug_str.contains("JwtAuth"));
@@ -835,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn test_jwt_auth_header_authorization() {
         let auth_handler: JwtAuth<JwtClaims, ConstDecoder> =
-            JwtAuth::new(ConstDecoder::from_secret(b"ABCDEF")).finders(vec![
+            JwtAuth::new(ConstDecoder::from_secret(b"ABCDEF").unwrap()).finders(vec![
                 Box::new(HeaderFinder::new()),
                 Box::new(QueryFinder::new("jwt_token")),
                 Box::new(CookieFinder::new("jwt_token")),
@@ -866,7 +1090,7 @@ mod tests {
             exp: (OffsetDateTime::now_utc() + Duration::days(1)).unix_timestamp(),
         };
 
-        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"ABCDEF"));
+        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"ABCDEF").unwrap());
         let content = access(&service, &token).await;
         assert!(content.contains("hello"));
 
@@ -886,15 +1110,15 @@ mod tests {
             .unwrap();
         assert!(content.contains("hello"));
 
-        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"ABCDEFG"));
+        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"ABCDEFG").unwrap());
         let content = access(&service, &token).await;
-        assert!(content.contains("Forbidden"));
+        assert!(content.contains("Unauthorized"));
     }
 
     #[tokio::test]
     async fn test_jwt_auth_unauthorized_no_token() {
         let auth_handler: JwtAuth<JwtClaims, ConstDecoder> =
-            JwtAuth::new(ConstDecoder::from_secret(b"SECRET"));
+            JwtAuth::new(ConstDecoder::from_secret(b"SECRET").unwrap());
 
         #[handler]
         async fn hello() -> &'static str {
@@ -918,7 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn test_jwt_auth_force_passed_no_token() {
         let auth_handler: JwtAuth<JwtClaims, ConstDecoder> =
-            JwtAuth::new(ConstDecoder::from_secret(b"SECRET")).force_passed(true);
+            JwtAuth::new(ConstDecoder::from_secret(b"SECRET").unwrap()).force_passed(true);
 
         #[handler]
         async fn hello(depot: &mut Depot) -> String {
@@ -942,7 +1166,7 @@ mod tests {
     #[tokio::test]
     async fn test_jwt_auth_force_passed_invalid_token() {
         let auth_handler: JwtAuth<JwtClaims, ConstDecoder> =
-            JwtAuth::new(ConstDecoder::from_secret(b"SECRET")).force_passed(true);
+            JwtAuth::new(ConstDecoder::from_secret(b"SECRET").unwrap()).force_passed(true);
 
         #[handler]
         async fn hello(depot: &mut Depot) -> String {
@@ -967,7 +1191,7 @@ mod tests {
     #[tokio::test]
     async fn test_jwt_auth_depot_data_access() {
         let auth_handler: JwtAuth<JwtClaims, ConstDecoder> =
-            JwtAuth::new(ConstDecoder::from_secret(b"SECRET"));
+            JwtAuth::new(ConstDecoder::from_secret(b"SECRET").unwrap());
 
         #[handler]
         async fn hello(depot: &mut Depot) -> String {
@@ -986,7 +1210,7 @@ mod tests {
             user: "admin".into(),
             exp: (OffsetDateTime::now_utc() + Duration::days(1)).unix_timestamp(),
         };
-        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"SECRET"));
+        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"SECRET").unwrap());
 
         let content = TestClient::get("http://127.0.0.1:5801/hello")
             .add_header("Authorization", format!("Bearer {token}"), true)
@@ -1003,7 +1227,7 @@ mod tests {
         use salvo_core::http::header::{AUTHORIZATION, PROXY_AUTHORIZATION};
 
         let auth_handler: JwtAuth<JwtClaims, ConstDecoder> =
-            JwtAuth::new(ConstDecoder::from_secret(b"SECRET"));
+            JwtAuth::new(ConstDecoder::from_secret(b"SECRET").unwrap());
 
         #[handler]
         async fn hello() -> &'static str {
@@ -1019,7 +1243,7 @@ mod tests {
             user: "proxy_user".into(),
             exp: (OffsetDateTime::now_utc() + Duration::days(1)).unix_timestamp(),
         };
-        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"SECRET"));
+        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"SECRET").unwrap());
 
         let content = TestClient::get("http://127.0.0.1:5801/hello")
             .add_header("Proxy-Authorization", format!("Bearer {token}"), true)
@@ -1031,7 +1255,7 @@ mod tests {
         assert!(content.contains("Unauthorized"));
 
         let auth_handler: JwtAuth<JwtClaims, ConstDecoder> =
-            JwtAuth::new(ConstDecoder::from_secret(b"SECRET")).finders(vec![Box::new(
+            JwtAuth::new(ConstDecoder::from_secret(b"SECRET").unwrap()).finders(vec![Box::new(
                 HeaderFinder::new().header_names(vec![AUTHORIZATION, PROXY_AUTHORIZATION]),
             )]);
         let router = Router::new()
@@ -1052,7 +1276,7 @@ mod tests {
     #[tokio::test]
     async fn test_header_finder_non_bearer_ignored() {
         let auth_handler: JwtAuth<JwtClaims, ConstDecoder> =
-            JwtAuth::new(ConstDecoder::from_secret(b"SECRET"));
+            JwtAuth::new(ConstDecoder::from_secret(b"SECRET").unwrap());
 
         #[handler]
         async fn hello() -> &'static str {
@@ -1078,7 +1302,7 @@ mod tests {
     #[tokio::test]
     async fn test_header_finder_method_filtering() {
         let auth_handler: JwtAuth<JwtClaims, ConstDecoder> =
-            JwtAuth::new(ConstDecoder::from_secret(b"SECRET")).finders(vec![Box::new(
+            JwtAuth::new(ConstDecoder::from_secret(b"SECRET").unwrap()).finders(vec![Box::new(
                 HeaderFinder::new().allowed_methods(vec![Method::POST]),
             )]);
 
@@ -1096,7 +1320,7 @@ mod tests {
             user: "test".into(),
             exp: (OffsetDateTime::now_utc() + Duration::days(1)).unix_timestamp(),
         };
-        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"SECRET"));
+        let token = encode_test_token(&claim, &EncodingKey::from_secret(b"SECRET").unwrap());
 
         // GET should not find token because the method is not allowed.
         let content = TestClient::get("http://127.0.0.1:5801/hello")

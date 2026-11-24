@@ -11,6 +11,15 @@ use super::response::{Response, Responses};
 use super::{Deprecated, ExternalDocs, RefOr, SecurityRequirement, Server};
 use crate::{Parameter, Parameters, PathItemType, PropMap, Servers};
 
+/// Nonserialized provenance is a generation cache, not part of operation value equality.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AutoOperationId(Option<(String, String)>);
+impl PartialEq for AutoOperationId {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 /// Collection for save [`Operation`]s.
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
 pub struct Operations(pub PropMap<PathItemType, Operation>);
@@ -132,6 +141,9 @@ pub struct Operation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
 
+    #[serde(skip)]
+    pub(crate) auto_operation_id: AutoOperationId,
+
     /// Additional external documentation for this operation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_docs: Option<ExternalDocs>,
@@ -142,7 +154,7 @@ pub struct Operation {
 
     /// Optional request body for this [`Operation`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_body: Option<RequestBody>,
+    pub request_body: Option<RefOr<RequestBody>>,
 
     /// List of possible responses returned by the [`Operation`].
     pub responses: Responses,
@@ -164,9 +176,14 @@ pub struct Operation {
     ///
     /// Security for the [`Operation`] can be set to optional by adding empty security with
     /// [`SecurityRequirement::default`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `None` inherits the document's security policy. `Some(Vec::new())` serializes as
+    /// `security: []` and removes that policy for this operation. Direct field users should
+    /// wrap an explicit list in `Some`; the [`Operation::securities`] builder accepts the
+    /// list directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "security")]
-    pub securities: Vec<SecurityRequirement>,
+    pub securities: Option<Vec<SecurityRequirement>>,
 
     /// Alternative [`Server`]s for this [`Operation`].
     #[serde(default, skip_serializing_if = "Servers::is_empty")]
@@ -219,30 +236,52 @@ impl Operation {
     #[must_use]
     pub fn operation_id<S: Into<String>>(mut self, operation_id: S) -> Self {
         self.operation_id = Some(operation_id.into());
+        self.auto_operation_id = AutoOperationId::default();
         self
+    }
+
+    /// Record an inferred ID for disambiguation when attaching an endpoint to routes.
+    #[doc(hidden)]
+    pub fn assign_auto_operation_id(&mut self, operation_id: String) {
+        self.operation_id = Some(operation_id.clone());
+        self.auto_operation_id = AutoOperationId(Some((operation_id.clone(), operation_id)));
+    }
+
+    pub(crate) fn auto_operation_id_base(&self) -> Option<&str> {
+        self.auto_operation_id
+            .0
+            .as_ref()
+            .filter(|(_, current)| self.operation_id.as_ref() == Some(current))
+            .map(|(base, _)| base.as_str())
+    }
+
+    pub(crate) fn update_auto_operation_id(&mut self, operation_id: String) {
+        if let Some((_, current)) = &mut self.auto_operation_id.0 {
+            current.clone_from(&operation_id);
+        }
+        self.operation_id = Some(operation_id);
     }
 
     /// Add or change parameters of the [`Operation`].
     #[must_use]
-    pub fn parameters<I: IntoIterator<Item = P>, P: Into<Parameter>>(
+    pub fn parameters<I: IntoIterator<Item = P>, P: Into<RefOr<Parameter>>>(
         mut self,
         parameters: I,
     ) -> Self {
-        self.parameters
-            .extend(parameters.into_iter().map(|parameter| parameter.into()));
+        self.parameters.extend(parameters);
         self
     }
     /// Append parameter to [`Operation`] parameters and returns `Self`.
     #[must_use]
-    pub fn add_parameter<P: Into<Parameter>>(mut self, parameter: P) -> Self {
+    pub fn add_parameter<P: Into<RefOr<Parameter>>>(mut self, parameter: P) -> Self {
         self.parameters.insert(parameter);
         self
     }
 
     /// Add or change request body of the [`Operation`].
     #[must_use]
-    pub fn request_body(mut self, request_body: RequestBody) -> Self {
-        self.request_body = Some(request_body);
+    pub fn request_body(mut self, request_body: impl Into<RefOr<RequestBody>>) -> Self {
+        self.request_body = Some(request_body.into());
         self
     }
 
@@ -274,18 +313,19 @@ impl Operation {
     }
 
     /// Add or change list of [`SecurityRequirement`]s that are available for [`Operation`].
+    /// An empty list explicitly removes the document's security policy for this operation.
     #[must_use]
     pub fn securities<I: IntoIterator<Item = SecurityRequirement>>(
         mut self,
         securities: I,
     ) -> Self {
-        self.securities = securities.into_iter().collect();
+        self.securities = Some(securities.into_iter().collect());
         self
     }
     /// Append [`SecurityRequirement`] to [`Operation`] security requirements and returns `Self`.
     #[must_use]
     pub fn add_security(mut self, security: SecurityRequirement) -> Self {
-        self.securities.push(security);
+        self.securities.get_or_insert_default().push(security);
         self
     }
 
@@ -364,7 +404,7 @@ mod tests {
         assert!(operation.responses.is_empty());
         assert!(operation.callbacks.is_empty());
         assert!(operation.deprecated.is_none());
-        assert!(operation.securities.is_empty());
+        assert!(operation.securities.is_none());
         assert!(operation.servers.is_empty());
     }
 
@@ -427,7 +467,7 @@ mod tests {
             .add_security(security_requirement1)
             .add_security(security_requirement2);
 
-        assert!(!operation.securities.is_empty());
+        assert_eq!(operation.securities.as_ref().unwrap().len(), 2);
     }
 
     #[test]

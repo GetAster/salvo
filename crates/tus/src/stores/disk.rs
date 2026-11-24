@@ -46,9 +46,40 @@ struct MetaUpload {
     id: String,
     size: Option<u64>,
     offset: u64,
-    metadata: Option<HashMap<String, Option<String>>>,
+    #[serde(default, deserialize_with = "deserialize_metadata")]
+    metadata: Option<HashMap<String, Option<Vec<u8>>>>,
     storage: Option<MetaStoreInfo>,
     creation_date: String,
+}
+
+// Existing separated-layout records stored UTF-8 strings. Read both that
+// representation and byte arrays, but always write byte arrays losslessly.
+fn deserialize_metadata<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, Option<Vec<u8>>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Text(String),
+        Bytes(Vec<u8>),
+    }
+
+    let metadata = Option::<HashMap<String, Option<Value>>>::deserialize(deserializer)?;
+    Ok(metadata.map(|values| {
+        values
+            .into_iter()
+            .map(|(key, value)| {
+                let bytes = value.map(|value| match value {
+                    Value::Text(text) => text.into_bytes(),
+                    Value::Bytes(bytes) => bytes,
+                });
+                (key, bytes)
+            })
+            .collect()
+    }))
 }
 
 impl From<UploadInfo> for MetaUpload {
@@ -78,9 +109,49 @@ impl From<MetaUpload> for UploadInfo {
 }
 
 /// Disk-backed storage for tus uploads.
+///
+/// Payloads, metadata and temporary metadata live in separate `data`, `metadata`
+/// and `metadata-tmp` directories below the configured root. Legacy flat layouts
+/// are deliberately not auto-discovered: user-uploaded JSON cannot be trusted as
+/// metadata. Stop uploads and explicitly migrate trusted records and their storage
+/// paths before reusing a legacy directory.
+///
+/// Metadata values in separated-layout JSON records are written as byte arrays.
+/// Records using the previous UTF-8 string representation remain readable;
+/// writing them upgrades their representation. Older versions cannot read the
+/// byte arrays, so do not share a store with an older writer or downgrade without
+/// migrating the records. Invalid bytes lost by older versions cannot be recovered.
+///
+/// Completing an upload commits its offset before attempting the optional final
+/// filename. Naming is best effort: use the returned storage path, which may
+/// remain the internal filename after an I/O failure. The source is retained
+/// until metadata refers to the complete destination. Cancellation can leave
+/// extra files, but the committed upload remains readable; this is not a
+/// multi-file transaction or a guarantee of durability across power loss.
 #[derive(Debug, Clone)]
 pub struct DiskStore {
     root: PathBuf,
+    #[cfg(test)]
+    checkpoint: Option<std::sync::Arc<CancellationCheckpoint>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitStage {
+    ChunkAccepted,
+    DataFlushed,
+    MetadataWritten,
+    MetadataCommitted,
+    DestinationRetained,
+    DestinationCommitted,
+    SourceRemoved,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct CancellationCheckpoint {
+    stage: CommitStage,
+    entered: tokio::sync::Notify,
 }
 
 impl Default for DiskStore {
@@ -95,6 +166,8 @@ impl DiskStore {
     pub fn new() -> Self {
         Self {
             root: "./tus-upload-files".into(),
+            #[cfg(test)]
+            checkpoint: None,
         }
     }
 
@@ -107,22 +180,37 @@ impl DiskStore {
         self
     }
 
+    #[cfg(test)]
+    async fn at_commit_stage(&self, stage: CommitStage) {
+        if let Some(checkpoint) = &self.checkpoint
+            && checkpoint.stage == stage
+        {
+            checkpoint.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+
     async fn ensure_root(&self) -> TusResult<()> {
-        fs::create_dir_all(&self.root)
-            .await
-            .map_err(|e| TusError::Internal(e.to_string()))
+        for directory in ["data", "metadata", "metadata-tmp"] {
+            fs::create_dir_all(self.root.join(directory))
+                .await
+                .map_err(|e| TusError::Internal(e.to_string()))?;
+        }
+        Ok(())
     }
 
     fn data_path(&self, id: &str) -> PathBuf {
-        self.root.join(format!("{id}.bin"))
+        self.root.join("data").join(format!("{id}.bin"))
     }
 
     fn meta_path(&self, id: &str) -> PathBuf {
-        self.root.join(format!("{id}.json"))
+        self.root.join("metadata").join(format!("{id}.json"))
     }
 
     fn meta_tmp_path(&self, id: &str) -> PathBuf {
-        self.root.join(format!("{id}.json.tmp"))
+        self.root
+            .join("metadata-tmp")
+            .join(format!("{id}.json.tmp"))
     }
 
     fn ensure_safe_upload_id(id: &str) -> TusResult<()> {
@@ -158,7 +246,7 @@ impl DiskStore {
     }
 
     fn path_is_within_root(&self, path: &Path) -> bool {
-        let Some(root) = Self::absolute_normalized_path(&self.root) else {
+        let Some(root) = Self::absolute_normalized_path(&self.root.join("data")) else {
             return false;
         };
         let Some(path) = Self::absolute_normalized_path(path) else {
@@ -195,7 +283,7 @@ impl DiskStore {
             return false;
         }
 
-        let Ok(root) = fs::canonicalize(&self.root).await else {
+        let Ok(root) = fs::canonicalize(self.root.join("data")).await else {
             return false;
         };
         let Ok(path) = fs::canonicalize(path).await else {
@@ -237,8 +325,9 @@ impl DiskStore {
         meta.metadata
             .as_ref()
             .and_then(|m| m.get(key))
-            .and_then(|v| v.as_ref())
-            .map(|v| v.to_owned())
+            .and_then(|v| v.as_deref())
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .map(str::to_owned)
     }
 
     fn sanitize_filename(name: &str) -> Option<String> {
@@ -293,15 +382,9 @@ impl DiskStore {
         }
     }
 
-    async fn move_file_no_replace(source: &Path, target: &Path) -> io::Result<bool> {
+    async fn retain_file_no_replace(source: &Path, target: &Path) -> io::Result<bool> {
         match fs::hard_link(source, target).await {
-            Ok(()) => {
-                if let Err(err) = fs::remove_file(source).await {
-                    let _ = fs::remove_file(target).await;
-                    return Err(err);
-                }
-                Ok(true)
-            }
+            Ok(()) => Ok(true),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
             Err(err) => {
                 tracing::debug!(
@@ -316,6 +399,9 @@ impl DiskStore {
     }
 
     async fn copy_file_no_replace(source: &Path, target: &Path) -> io::Result<bool> {
+        // Keep the committed source throughout the fallback copy. A cancelled
+        // copy may leave a partial destination, which later attempts must treat
+        // as a collision, never as an already-completed copy of this upload.
         let mut source_file = fs::File::open(source).await?;
         let mut target_file = match fs::OpenOptions::new()
             .write(true)
@@ -333,10 +419,6 @@ impl DiskStore {
             return Err(err);
         }
         if let Err(err) = target_file.sync_all().await {
-            let _ = fs::remove_file(target).await;
-            return Err(err);
-        }
-        if let Err(err) = fs::remove_file(source).await {
             let _ = fs::remove_file(target).await;
             return Err(err);
         }
@@ -364,6 +446,11 @@ impl DiskStore {
                 return;
             }
         };
+        // A completed upload may already use the primary or fallback name.
+        // Do not rename it again when an empty PATCH retries completion.
+        if current_path != self.data_path(&meta.id) {
+            return;
+        }
         let dir = current_path.parent().unwrap_or(self.root.as_path());
         let fallback = Self::with_id_suffix(&file_name, &meta.id);
         let candidates = [dir.join(&file_name), dir.join(fallback)];
@@ -371,14 +458,45 @@ impl DiskStore {
             if target_path == current_path {
                 return;
             }
-            match Self::move_file_no_replace(&current_path, &target_path).await {
+            match Self::retain_file_no_replace(&current_path, &target_path).await {
                 Ok(true) => {
-                    let storage = meta.storage.get_or_insert_with(|| MetaStoreInfo {
+                    #[cfg(test)]
+                    self.at_commit_stage(CommitStage::DestinationRetained).await;
+                    let mut finalized = meta.clone();
+                    let storage = finalized.storage.get_or_insert_with(|| MetaStoreInfo {
                         type_name: "file".to_owned(),
                         path: target_path.to_string_lossy().into_owned(),
                         bucket: None,
                     });
                     storage.path = target_path.to_string_lossy().into_owned();
+                    if let Err(err) = self.write_meta_atomic(&finalized).await {
+                        // The completed offset and original path are already
+                        // committed. Naming is best effort; keep that valid
+                        // record and remove only our uncommitted destination.
+                        let _ = fs::remove_file(&target_path).await;
+                        warn!(
+                            "finalize upload metadata failed: id={}, error={}",
+                            meta.id, err
+                        );
+                        return;
+                    }
+                    *meta = finalized;
+                    #[cfg(test)]
+                    self.at_commit_stage(CommitStage::DestinationCommitted)
+                        .await;
+                    // Never unlink the source before metadata points to the
+                    // complete destination. Cancellation between these steps
+                    // can leave an extra link/copy, but cannot strand the upload.
+                    // In particular, do not delete the destination in a Drop
+                    // guard: a cancelled metadata rename may have committed.
+                    if let Err(err) = fs::remove_file(&current_path).await {
+                        warn!(
+                            "finalize upload source cleanup failed: id={}, error={}",
+                            meta.id, err
+                        );
+                    }
+                    #[cfg(test)]
+                    self.at_commit_stage(CommitStage::SourceRemoved).await;
                     return;
                 }
                 Ok(false) => {}
@@ -391,17 +509,24 @@ impl DiskStore {
     }
 
     async fn read_meta(&self, id: &str) -> TusResult<MetaUpload> {
+        Self::ensure_safe_upload_id(id)?;
         let path = self.meta_path(id);
         let bytes = fs::read(path).await.map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => TusError::NotFound,
             _ => TusError::Internal(e.to_string()),
         })?;
-        serde_json::from_slice::<MetaUpload>(&bytes)
-            .map_err(|e| TusError::Internal(format!("invalid meta json: {e}")))
+        let meta = serde_json::from_slice::<MetaUpload>(&bytes)
+            .map_err(|e| TusError::Internal(format!("invalid meta json: {e}")))?;
+        Self::ensure_safe_upload_id(&meta.id)?;
+        if meta.id != id {
+            return Err(TusError::Internal("metadata upload ID mismatch".into()));
+        }
+        Ok(meta)
     }
 
     async fn write_meta_atomic(&self, meta: &MetaUpload) -> TusResult<()> {
         let id = &meta.id;
+        Self::ensure_safe_upload_id(id)?;
         let tmp = self.meta_tmp_path(id);
         let final_path = self.meta_path(id);
 
@@ -411,15 +536,16 @@ impl DiskStore {
         fs::write(&tmp, json)
             .await
             .map_err(|e| TusError::Internal(e.to_string()))?;
+        #[cfg(test)]
+        self.at_commit_stage(CommitStage::MetadataWritten).await;
 
-        #[cfg(windows)]
-        {
-            let _ = fs::remove_file(&final_path).await;
-        }
-
+        // Rename replaces an existing file on Windows as well as Unix. Keep
+        // the destination intact if replacing the temporary file fails.
         fs::rename(&tmp, &final_path)
             .await
             .map_err(|e| TusError::Internal(format!("rename meta tmp: {e}")))?;
+        #[cfg(test)]
+        self.at_commit_stage(CommitStage::MetadataCommitted).await;
 
         Ok(())
     }
@@ -456,25 +582,40 @@ impl DataStore for DiskStore {
             .await
             .map_err(|e| TusError::Internal(e.to_string()))?;
 
-        let mut meta = MetaUpload::from(upload.clone());
-        self.try_finalize_if_complete(&mut meta).await;
+        // The internal payload name is also our creation reservation. A
+        // completed payload may have moved away from it, but its metadata
+        // still owns this ID. Check after create_new so another creator cannot
+        // finish and release that name between our check and reservation.
+        let collision = match fs::symlink_metadata(self.meta_path(&upload.id)).await {
+            Ok(_) => Some(TusError::Internal("upload ID already exists".into())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => Some(TusError::Internal(error.to_string())),
+        };
+        if let Some(error) = collision {
+            if let Err(cleanup_error) = fs::remove_file(&data_path).await {
+                warn!(id = %upload.id, error = %cleanup_error, "failed to remove rejected upload reservation");
+            }
+            return Err(error);
+        }
+
+        let mut meta = MetaUpload::from(upload);
         if let Err(err) = self.write_meta_atomic(&meta).await {
             let _ = fs::remove_file(&data_path).await;
             return Err(err);
         }
 
-        Ok(upload)
+        self.try_finalize_if_complete(&mut meta).await;
+        Ok(meta.into())
     }
 
     async fn remove(&self, id: &str) -> TusResult<()> {
         Self::ensure_safe_upload_id(id)?;
         self.ensure_root().await?;
 
-        let mut meta = self.read_meta(id).await.ok();
-        let data_path = match &mut meta {
-            Some(meta) => self.resolve_meta_data_path(meta).await?,
-            None => self.data_path(id),
-        };
+        // Final filenames can look like another upload's internal payload name.
+        // Only a matching metadata record establishes ownership of the file.
+        let mut meta = self.read_meta(id).await?;
+        let data_path = self.resolve_meta_data_path(&mut meta).await?;
         let meta_path = self.meta_path(id);
         let mut removed = false;
 
@@ -523,53 +664,71 @@ impl DataStore for DiskStore {
                 _ => TusError::Internal(e.to_string()),
             })?;
 
+        // Metadata is the committed boundary. A cancelled write (or an older
+        // failed write) may have left an uncommitted tail on disk. Remove it
+        // before retrying, including retries with an empty body.
+        file.set_len(offset)
+            .await
+            .map_err(|e| TusError::Internal(e.to_string()))?;
         file.seek(SeekFrom::Start(offset))
             .await
             .map_err(|e| TusError::Internal(e.to_string()))?;
 
         let original_offset = offset;
-        let mut written: u64 = 0;
         let mut stream = stream;
-        while let Some(item) = stream.next().await {
-            let chunk = match item {
-                Ok(chunk) => chunk,
-                Err(e) if is_upload_size_limit_error(&e) => {
-                    let _ = file.set_len(original_offset).await;
+        let result = async {
+            let mut written: u64 = 0;
+            while let Some(item) = stream.next().await {
+                let chunk = item.map_err(|e| {
+                    if is_upload_size_limit_error(&e) {
+                        TusError::PayloadTooLarge
+                    } else {
+                        TusError::Internal(e.to_string())
+                    }
+                })?;
+                let new_offset = written
+                    .checked_add(chunk.len() as u64)
+                    .and_then(|w| original_offset.checked_add(w))
+                    .ok_or(TusError::PayloadTooLarge)?;
+                if meta.size.is_some_and(|size| new_offset > size) {
                     return Err(TusError::PayloadTooLarge);
                 }
-                Err(e) => return Err(TusError::Internal(e.to_string())),
-            };
-            // Accumulate with overflow checks: `write` is a public `DataStore`
-            // API and, on the deferred-size path (`meta.size == None`), there is
-            // no upper bound, so an extreme starting offset could otherwise wrap.
-            let new_offset = written
-                .checked_add(chunk.len() as u64)
-                .and_then(|w| original_offset.checked_add(w));
-            let Some(new_offset) = new_offset else {
-                let _ = file.set_len(original_offset).await;
-                return Err(TusError::PayloadTooLarge);
-            };
-            if let Some(size) = meta.size
-                && new_offset > size
-            {
-                let _ = file.set_len(original_offset).await;
-                return Err(TusError::PayloadTooLarge);
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| TusError::Internal(e.to_string()))?;
+                #[cfg(test)]
+                self.at_commit_stage(CommitStage::ChunkAccepted).await;
+                written += chunk.len() as u64;
             }
-            file.write_all(&chunk)
+
+            file.flush()
                 .await
                 .map_err(|e| TusError::Internal(e.to_string()))?;
-            written += chunk.len() as u64;
+            #[cfg(test)]
+            self.at_commit_stage(CommitStage::DataFlushed).await;
+            Ok(written)
         }
-
-        file.flush()
-            .await
-            .map_err(|e| TusError::Internal(e.to_string()))?;
+        .await;
+        let written = match result {
+            Ok(written) => written,
+            Err(error) => {
+                // Roll back stream and I/O failures as well as size violations.
+                // set_len waits for pending Tokio file writes before truncating.
+                if let Err(rollback_error) = file.set_len(original_offset).await {
+                    warn!(id, error = %rollback_error, "failed to roll back tus upload data");
+                }
+                return Err(error);
+            }
+        };
 
         // `original_offset + written` was validated each iteration above, so this
         // cannot overflow; `saturating_add` is a belt-and-braces guard.
         meta.offset = original_offset.saturating_add(written);
-        self.try_finalize_if_complete(&mut meta).await;
+        // Commit progress while the original payload is still reachable. A
+        // failed commit leaves its old offset available for a normal retry.
         self.write_meta_atomic(&meta).await?;
+        drop(file);
+        self.try_finalize_if_complete(&mut meta).await;
 
         Ok(written)
     }
@@ -622,6 +781,111 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn task_cancellation_at_commit_boundaries_allows_same_id_retry() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        for stage in [
+            CommitStage::ChunkAccepted,
+            CommitStage::DataFlushed,
+            CommitStage::MetadataWritten,
+            CommitStage::MetadataCommitted,
+            CommitStage::DestinationRetained,
+            CommitStage::DestinationCommitted,
+            CommitStage::SourceRemoved,
+        ] {
+            let (store, directory) = create_test_store();
+            let id = format!("cancel-{stage:?}");
+            let mut upload = create_test_upload_info(&id);
+            upload.size = Some(12);
+            upload.metadata = Some(Metadata(HashMap::from([(
+                "filename".into(),
+                Some(b"completed.txt".to_vec()),
+            )])));
+            store.create(upload).await.unwrap();
+            store
+                .write(
+                    &id,
+                    0,
+                    Box::pin(stream::iter([Ok(Bytes::from_static(b"prefix"))])),
+                )
+                .await
+                .unwrap();
+            fs::write(directory.path().join("data/unrelated.bin"), b"unrelated")
+                .await
+                .unwrap();
+
+            let checkpoint = Arc::new(CancellationCheckpoint {
+                stage,
+                entered: tokio::sync::Notify::new(),
+            });
+            let mut pausing_store = store.clone();
+            pausing_store.checkpoint = Some(checkpoint.clone());
+            let write_id = id.clone();
+            let task = tokio::spawn(async move {
+                pausing_store
+                    .write(
+                        &write_id,
+                        6,
+                        Box::pin(stream::iter([Ok(Bytes::from_static(b"oldold"))])),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(3), checkpoint.entered.notified())
+                .await
+                .unwrap_or_else(|_| panic!("did not reach {stage:?}"));
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+
+            // Reopen and immediately issue the next request for the same ID. Read the
+            // committed offset instead of assuming that a cancelled request did not commit.
+            let reopened = DiskStore::new().disk_root(directory.path());
+            let committed = reopened
+                .get_upload_file_info(&id)
+                .await
+                .unwrap()
+                .offset
+                .unwrap();
+            let (retry, expected): (ByteStream, &[u8]) = match committed {
+                6 => (
+                    Box::pin(stream::iter([Ok(Bytes::from_static(b"suffix"))])),
+                    b"prefixsuffix",
+                ),
+                12 => (Box::pin(stream::empty()), b"prefixoldold"),
+                offset => panic!("unexpected committed offset {offset} at {stage:?}"),
+            };
+            reopened.write(&id, committed, retry).await.unwrap();
+            let info = reopened.get_upload_file_info(&id).await.unwrap();
+            assert_eq!(info.offset, Some(12), "{stage:?}");
+            let path = info.storage.unwrap().path;
+            assert_eq!(fs::read(&path).await.unwrap(), expected, "{stage:?}");
+            reopened
+                .write(&id, 12, Box::pin(stream::empty()))
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .get_upload_file_info(&id)
+                    .await
+                    .unwrap()
+                    .storage
+                    .unwrap()
+                    .path,
+                path
+            );
+            assert_eq!(
+                fs::read(directory.path().join("data/unrelated.bin"))
+                    .await
+                    .unwrap(),
+                b"unrelated"
+            );
+        }
+    }
+
     #[test]
     fn test_disk_store_new() {
         let store = DiskStore::new();
@@ -638,21 +902,24 @@ mod tests {
     fn test_disk_store_data_path() {
         let store = DiskStore::new().disk_root("/uploads");
         let path = store.data_path("test-id");
-        assert_eq!(path, PathBuf::from("/uploads/test-id.bin"));
+        assert_eq!(path, PathBuf::from("/uploads/data/test-id.bin"));
     }
 
     #[test]
     fn test_disk_store_meta_path() {
         let store = DiskStore::new().disk_root("/uploads");
         let path = store.meta_path("test-id");
-        assert_eq!(path, PathBuf::from("/uploads/test-id.json"));
+        assert_eq!(path, PathBuf::from("/uploads/metadata/test-id.json"));
     }
 
     #[test]
     fn test_disk_store_meta_tmp_path() {
         let store = DiskStore::new().disk_root("/uploads");
         let path = store.meta_tmp_path("test-id");
-        assert_eq!(path, PathBuf::from("/uploads/test-id.json.tmp"));
+        assert_eq!(
+            path,
+            PathBuf::from("/uploads/metadata-tmp/test-id.json.tmp")
+        );
     }
 
     #[test]
@@ -710,7 +977,10 @@ mod tests {
             offset: 0,
             metadata: Some({
                 let mut m = HashMap::new();
-                m.insert("filename".to_owned(), Some("document.pdf".to_owned()));
+                m.insert(
+                    "filename".to_owned(),
+                    Some("document.pdf".as_bytes().to_vec()),
+                );
                 m
             }),
             storage: None,
@@ -743,7 +1013,10 @@ mod tests {
             offset: 0,
             metadata: Some({
                 let mut m = HashMap::new();
-                m.insert("filetype".to_owned(), Some("application/pdf".to_owned()));
+                m.insert(
+                    "filetype".to_owned(),
+                    Some("application/pdf".as_bytes().to_vec()),
+                );
                 m
             }),
             storage: None,
@@ -763,7 +1036,7 @@ mod tests {
             offset: 0,
             metadata: Some({
                 let mut m = HashMap::new();
-                m.insert("filetype".to_owned(), Some("image/png".to_owned()));
+                m.insert("filetype".to_owned(), Some("image/png".as_bytes().to_vec()));
                 m
             }),
             storage: None,
@@ -783,7 +1056,7 @@ mod tests {
             offset: 0,
             metadata: Some({
                 let mut m = HashMap::new();
-                m.insert("filetype".to_owned(), Some("invalid".to_owned()));
+                m.insert("filetype".to_owned(), Some("invalid".as_bytes().to_vec()));
                 m
             }),
             storage: None,
@@ -800,7 +1073,10 @@ mod tests {
             offset: 0,
             metadata: Some({
                 let mut m = HashMap::new();
-                m.insert("filetype".to_owned(), Some("application/".to_owned()));
+                m.insert(
+                    "filetype".to_owned(),
+                    Some("application/".as_bytes().to_vec()),
+                );
                 m
             }),
             storage: None,
@@ -823,7 +1099,7 @@ mod tests {
                 offset: 0,
                 metadata: Some({
                     let mut m = HashMap::new();
-                    m.insert("filetype".to_owned(), Some(filetype.to_owned()));
+                    m.insert("filetype".to_owned(), Some(filetype.as_bytes().to_vec()));
                     m
                 }),
                 storage: None,
@@ -841,7 +1117,10 @@ mod tests {
             offset: 0,
             metadata: Some({
                 let mut m = HashMap::new();
-                m.insert("filename".to_owned(), Some("document.pdf".to_owned()));
+                m.insert(
+                    "filename".to_owned(),
+                    Some("document.pdf".as_bytes().to_vec()),
+                );
                 m
             }),
             storage: None,
@@ -861,8 +1140,11 @@ mod tests {
             offset: 0,
             metadata: Some({
                 let mut m = HashMap::new();
-                m.insert("filename".to_owned(), Some("document".to_owned()));
-                m.insert("filetype".to_owned(), Some("application/pdf".to_owned()));
+                m.insert("filename".to_owned(), Some("document".as_bytes().to_vec()));
+                m.insert(
+                    "filetype".to_owned(),
+                    Some("application/pdf".as_bytes().to_vec()),
+                );
                 m
             }),
             storage: None,
@@ -882,7 +1164,7 @@ mod tests {
             offset: 0,
             metadata: Some({
                 let mut m = HashMap::new();
-                m.insert("filetype".to_owned(), Some("image/png".to_owned()));
+                m.insert("filetype".to_owned(), Some("image/png".as_bytes().to_vec()));
                 m
             }),
             storage: None,
@@ -931,7 +1213,7 @@ mod tests {
     #[test]
     fn test_resolve_data_path_with_storage() {
         let (store, temp_dir) = create_test_store();
-        let stored_path = temp_dir.path().join("file.bin");
+        let stored_path = temp_dir.path().join("data/file.bin");
         let storage = Some(MetaStoreInfo {
             type_name: "file".to_owned(),
             path: stored_path.to_string_lossy().into_owned(),
@@ -959,7 +1241,7 @@ mod tests {
     fn test_resolve_data_path_without_storage() {
         let store = DiskStore::new().disk_root("/uploads");
         let path = store.resolve_data_path("test-id", None);
-        assert_eq!(path, PathBuf::from("/uploads/test-id.bin"));
+        assert_eq!(path, PathBuf::from("/uploads/data/test-id.bin"));
     }
 
     #[test]
@@ -1032,6 +1314,75 @@ mod tests {
         assert_eq!(upload_info.id, "test-id");
         assert_eq!(upload_info.size, Some(2048));
         assert_eq!(upload_info.offset, Some(1024));
+    }
+
+    #[tokio::test]
+    async fn payload_json_cannot_impersonate_metadata() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        for filename in ["phantom.json", "phantom.json.tmp", "phantom.bin"] {
+            let (store, _directory) = create_test_store();
+            let forged =
+                serde_json::to_vec(&MetaUpload::from(create_test_upload_info("different")))
+                    .unwrap();
+            let mut upload = create_test_upload_info("real");
+            upload.size = Some(forged.len() as u64);
+            upload.metadata = Some(Metadata(HashMap::from([(
+                "filename".into(),
+                Some(filename.as_bytes().to_vec()),
+            )])));
+            store.create(upload).await.unwrap();
+            store
+                .write("real", 0, Box::pin(stream::iter([Ok(Bytes::from(forged))])))
+                .await
+                .unwrap();
+            assert!(matches!(
+                store.get_upload_file_info("phantom").await,
+                Err(TusError::NotFound)
+            ));
+            assert_eq!(store.get_upload_file_info("real").await.unwrap().id, "real");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_rejects_mismatched_and_unsafe_ids() {
+        let (store, directory) = create_test_store();
+        store.ensure_root().await.unwrap();
+        let mut meta = MetaUpload::from(create_test_upload_info("different"));
+        fs::write(
+            store.meta_path("requested"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(store.read_meta("requested").await.is_err());
+        meta.id = "../escape".into();
+        assert!(matches!(
+            store.write_meta_atomic(&meta).await,
+            Err(TusError::FileIdError)
+        ));
+        fs::write(
+            store.meta_path("requested"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.read_meta("requested").await,
+            Err(TusError::FileIdError)
+        ));
+        // Do not auto-import flat files, even if they look exactly like metadata.
+        fs::write(
+            directory.path().join("legacy.json"),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.read_meta("legacy").await,
+            Err(TusError::NotFound)
+        ));
     }
 
     #[tokio::test]
@@ -1112,6 +1463,28 @@ mod tests {
         let result = store.remove("non-existent").await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), TusError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn remove_requires_valid_matching_metadata() {
+        let (store, _directory) = create_test_store();
+        let id = "untrusted-record";
+        store.ensure_root().await.unwrap();
+        fs::write(store.data_path(id), b"preserve payload")
+            .await
+            .unwrap();
+
+        let mismatched =
+            serde_json::to_vec(&MetaUpload::from(create_test_upload_info("other"))).unwrap();
+        for record in [b"invalid json".as_slice(), mismatched.as_slice()] {
+            fs::write(store.meta_path(id), record).await.unwrap();
+            assert!(store.remove(id).await.is_err());
+            assert_eq!(
+                fs::read(store.data_path(id)).await.unwrap(),
+                b"preserve payload"
+            );
+            assert_eq!(fs::read(store.meta_path(id)).await.unwrap(), record);
+        }
     }
 
     #[tokio::test]
@@ -1206,6 +1579,32 @@ mod tests {
         assert!(!store.data_path(id).exists());
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn metadata_replace_failure_preserves_existing_upload() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (store, _directory) = create_test_store();
+        let id = "preserve-metadata";
+        store.create(create_test_upload_info(id)).await.unwrap();
+        let mut metadata = store.read_meta(id).await.unwrap();
+        let original = fs::read(store.meta_path(id)).await.unwrap();
+        let temporary = store.meta_tmp_path(id);
+        fs::write(&temporary, b"").await.unwrap();
+        // Permit writing the temporary file, but prevent renaming it while
+        // this handle is open. The destination must survive a failed replace.
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x1 | 0x2)
+            .open(&temporary)
+            .unwrap();
+        metadata.offset = 1;
+        assert!(store.write_meta_atomic(&metadata).await.is_err());
+        drop(handle);
+        assert_eq!(fs::read(store.meta_path(id)).await.unwrap(), original);
+    }
+
     #[tokio::test]
     async fn test_disk_store_get_upload_file_info_not_found() {
         let (store, _temp_dir) = create_test_store();
@@ -1284,6 +1683,86 @@ mod tests {
 
         let info = store.get_upload_file_info("test-write").await.unwrap();
         assert_eq!(info.offset, Some(13));
+    }
+
+    #[tokio::test]
+    async fn interrupted_write_preserves_committed_prefix() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let (store, _directory) = create_test_store();
+        let id = "interrupted-write";
+        let mut upload = create_test_upload_info(id);
+        upload.size = None;
+        store.create(upload).await.unwrap();
+        store
+            .write(
+                id,
+                0,
+                Box::pin(stream::iter([Ok(Bytes::from_static(b"prefix"))])),
+            )
+            .await
+            .unwrap();
+        let result = store
+            .write(
+                id,
+                6,
+                Box::pin(stream::iter([
+                    Ok(Bytes::from_static(b"old tail")),
+                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "interrupted")),
+                ])),
+            )
+            .await;
+        assert!(matches!(result, Err(TusError::Internal(_))));
+        assert_eq!(store.read_meta(id).await.unwrap().offset, 6);
+        assert_eq!(fs::read(store.data_path(id)).await.unwrap(), b"prefix");
+    }
+
+    #[tokio::test]
+    async fn retry_discards_uncommitted_tail_before_completing() {
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        for suffix in ["", "abc"] {
+            let (store, _directory) = create_test_store();
+            let id = "retry-old-tail";
+            let mut upload = create_test_upload_info(id);
+            upload.size = None;
+            store.create(upload).await.unwrap();
+            store
+                .write(
+                    id,
+                    0,
+                    Box::pin(stream::iter([Ok(Bytes::from_static(b"prefix"))])),
+                )
+                .await
+                .unwrap();
+            // Simulate data left beyond the committed offset by an older
+            // failed write. Even an empty completion must remove that tail.
+            fs::write(store.data_path(id), b"prefix old uncommitted tail")
+                .await
+                .unwrap();
+            store
+                .declare_upload_length(id, 6 + suffix.len() as u64)
+                .await
+                .unwrap();
+            store
+                .write(
+                    id,
+                    6,
+                    Box::pin(stream::iter([Ok(Bytes::copy_from_slice(
+                        suffix.as_bytes(),
+                    ))])),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                fs::read(store.data_path(id)).await.unwrap(),
+                format!("prefix{suffix}").as_bytes()
+            );
+            let info = store.get_upload_file_info(id).await.unwrap();
+            assert_eq!(info.offset, info.size);
+        }
     }
 
     #[tokio::test]
@@ -1433,6 +1912,215 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalization_second_commit_failure_preserves_completed_record() {
+        let (store, directory) = create_test_store();
+        let id = "completed-record";
+        let mut upload = create_test_upload_info(id);
+        upload.size = Some(5);
+        upload.metadata = Some(Metadata(HashMap::from([(
+            "filename".into(),
+            Some(b"completed.txt".to_vec()),
+        )])));
+        store.create(upload).await.unwrap();
+        let mut meta = store.read_meta(id).await.unwrap();
+        fs::write(store.data_path(id), b"hello").await.unwrap();
+        meta.offset = 5;
+        store.write_meta_atomic(&meta).await.unwrap();
+
+        fs::create_dir(store.meta_tmp_path(id)).await.unwrap();
+        store.try_finalize_if_complete(&mut meta).await;
+        let recorded = store.get_upload_file_info(id).await.unwrap();
+        assert_eq!(recorded.offset, Some(5));
+        assert_eq!(
+            recorded.storage.unwrap().path,
+            store.data_path(id).to_string_lossy()
+        );
+        assert_eq!(fs::read(store.data_path(id)).await.unwrap(), b"hello");
+        assert!(!directory.path().join("data/completed.txt").exists());
+        assert_eq!(
+            meta.storage.unwrap().path,
+            store.data_path(id).to_string_lossy()
+        );
+        fs::remove_dir(store.meta_tmp_path(id)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_finalization_states_remain_readable_and_idempotent() {
+        use salvo_core::Service;
+        use salvo_core::http::StatusCode;
+        use salvo_core::test::{ResponseExt, TestClient};
+
+        use crate::Tus;
+
+        // Reconstruct the on-disk states at cancellation boundaries. Unlike
+        // timing a task abort, this deterministically covers partial fallback
+        // copies and metadata committed before source cleanup on every platform.
+        for phase in 0..4 {
+            let (store, directory) = create_test_store();
+            let id = "interrupted-finalization";
+            let mut upload = create_test_upload_info(id);
+            upload.size = Some(5);
+            upload.metadata = Some(Metadata(HashMap::from([(
+                "filename".into(),
+                Some(b"completed.txt".to_vec()),
+            )])));
+            store.create(upload).await.unwrap();
+            fs::write(store.data_path(id), b"hello").await.unwrap();
+            let mut meta = store.read_meta(id).await.unwrap();
+            meta.offset = 5;
+            store.write_meta_atomic(&meta).await.unwrap();
+            let destination = directory.path().join("data/completed.txt");
+            match phase {
+                // Progress committed, no destination yet.
+                0 => {}
+                1 => fs::write(&destination, b"he").await.unwrap(), // Copy cancelled.
+                2 | 3 => {
+                    assert!(
+                        DiskStore::copy_file_no_replace(&store.data_path(id), &destination)
+                            .await
+                            .unwrap()
+                    );
+                    if phase == 3 {
+                        meta.storage.as_mut().unwrap().path =
+                            destination.to_string_lossy().into_owned();
+                        store.write_meta_atomic(&meta).await.unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            // Reopen from disk: recovery does not depend on process-local state.
+            let reopened = DiskStore::new().disk_root(directory.path());
+            let service = Service::new(
+                Tus::new()
+                    .path("/uploads")
+                    .store(reopened.clone())
+                    .into_router(),
+            );
+            let url = format!("http://localhost/uploads/{id}");
+            let head = TestClient::head(&url)
+                .add_header("tus-resumable", "1.0.0", true)
+                .send(&service)
+                .await;
+            assert_eq!(head.status_code, Some(StatusCode::OK));
+            assert_eq!(head.headers()["upload-offset"], "5");
+            let mut get = TestClient::get(&url)
+                .add_header("tus-resumable", "1.0.0", true)
+                .send(&service)
+                .await;
+            assert_eq!(get.status_code, Some(StatusCode::OK));
+            assert_eq!(get.take_bytes(None).await.unwrap(), "hello");
+            let replay = TestClient::patch(&url)
+                .add_header("tus-resumable", "1.0.0", true)
+                .add_header("content-type", "application/offset+octet-stream", true)
+                .add_header("upload-offset", "0", true)
+                .body("hello")
+                .send(&service)
+                .await;
+            assert_eq!(replay.status_code, Some(StatusCode::CONFLICT));
+            let mut final_path = None;
+            for _ in 0..2 {
+                let retry = TestClient::patch(&url)
+                    .add_header("tus-resumable", "1.0.0", true)
+                    .add_header("content-type", "application/offset+octet-stream", true)
+                    .add_header("upload-offset", "5", true)
+                    .body("")
+                    .send(&service)
+                    .await;
+                assert_eq!(retry.status_code, Some(StatusCode::NO_CONTENT));
+                assert_eq!(retry.headers()["upload-offset"], "5");
+                let info = reopened.get_upload_file_info(id).await.unwrap();
+                let path = info.storage.unwrap().path;
+                assert_eq!(fs::read(&path).await.unwrap(), b"hello");
+                if let Some(previous) = &final_path {
+                    assert_eq!(&path, previous);
+                }
+                final_path = Some(path);
+            }
+            let deleted = TestClient::delete(&url)
+                .add_header("tus-resumable", "1.0.0", true)
+                .send(&service)
+                .await;
+            assert_eq!(deleted.status_code, Some(StatusCode::NO_CONTENT));
+            assert!(!Path::new(&final_path.unwrap()).exists());
+            let head = TestClient::head(&url)
+                .add_header("tus-resumable", "1.0.0", true)
+                .send(&service)
+                .await;
+            assert_eq!(head.status_code, Some(StatusCode::NOT_FOUND));
+            let get = TestClient::get(&url)
+                .add_header("tus-resumable", "1.0.0", true)
+                .send(&service)
+                .await;
+            assert_eq!(get.status_code, Some(StatusCode::NOT_FOUND));
+        }
+    }
+    #[tokio::test]
+    async fn finalization_metadata_failure_keeps_upload_retryable() {
+        use bytes::Bytes;
+        use futures_util::stream;
+        let (store, _directory) = create_test_store();
+        let id = "finalization-retry";
+        let mut upload = create_test_upload_info(id);
+        upload.size = Some(5);
+        upload.metadata = Some(Metadata(HashMap::from([(
+            "filename".into(),
+            Some(b"completed.txt".to_vec()),
+        )])));
+        store.create(upload).await.unwrap();
+        // Deterministic metadata write failure on Windows and Unix.
+        fs::create_dir(store.meta_tmp_path(id)).await.unwrap();
+        assert!(
+            store
+                .write(
+                    id,
+                    0,
+                    Box::pin(stream::iter([Ok(Bytes::from_static(b"hello"))]))
+                )
+                .await
+                .is_err()
+        );
+        fs::remove_dir(store.meta_tmp_path(id)).await.unwrap();
+        let info = store.get_upload_file_info(id).await.unwrap();
+        assert_eq!(info.offset, Some(0));
+        assert!(Path::new(&info.storage.unwrap().path).exists());
+        assert_eq!(
+            store
+                .write(
+                    id,
+                    0,
+                    Box::pin(stream::iter([Ok(Bytes::from_static(b"hello"))]))
+                )
+                .await
+                .unwrap(),
+            5
+        );
+        let info = store.get_upload_file_info(id).await.unwrap();
+        assert_eq!(info.offset, Some(5));
+        assert_eq!(
+            fs::read(info.storage.unwrap().path).await.unwrap(),
+            b"hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_length_create_finalization_failure_does_not_publish_payload() {
+        let (store, directory) = create_test_store();
+        let id = "empty-finalization";
+        store.ensure_root().await.unwrap();
+        let mut upload = create_test_upload_info(id);
+        upload.size = Some(0);
+        upload.metadata = Some(Metadata(HashMap::from([(
+            "filename".into(),
+            Some(b"empty.txt".to_vec()),
+        )])));
+        fs::create_dir(store.meta_tmp_path(id)).await.unwrap();
+        assert!(store.create(upload.clone()).await.is_err());
+        assert!(!directory.path().join("data/empty.txt").exists());
+        fs::remove_dir(store.meta_tmp_path(id)).await.unwrap();
+        let created = store.create(upload).await.unwrap();
+        assert!(Path::new(&created.storage.unwrap().path).exists());
+    }
+    #[tokio::test]
     async fn test_disk_store_finalize_on_complete() {
         use bytes::Bytes;
         use futures_util::stream;
@@ -1440,7 +2128,10 @@ mod tests {
         let (store, temp_dir) = create_test_store();
 
         let mut metadata = HashMap::new();
-        metadata.insert("filename".to_owned(), Some("myfile.txt".to_owned()));
+        metadata.insert(
+            "filename".to_owned(),
+            Some("myfile.txt".as_bytes().to_vec()),
+        );
 
         let upload_info = UploadInfo {
             id: "test-finalize".to_owned(),
@@ -1465,7 +2156,7 @@ mod tests {
         assert!(storage.path.contains("myfile.txt"));
 
         // Verify file exists at final path
-        assert!(temp_dir.path().join("myfile.txt").exists());
+        assert!(temp_dir.path().join("data/myfile.txt").exists());
     }
 
     #[tokio::test]
@@ -1474,12 +2165,16 @@ mod tests {
         use futures_util::stream;
 
         let (store, temp_dir) = create_test_store();
-        fs::write(temp_dir.path().join("myfile.txt"), b"existing")
+        store.ensure_root().await.unwrap();
+        fs::write(temp_dir.path().join("data/myfile.txt"), b"existing")
             .await
             .unwrap();
 
         let mut metadata = HashMap::new();
-        metadata.insert("filename".to_owned(), Some("myfile.txt".to_owned()));
+        metadata.insert(
+            "filename".to_owned(),
+            Some("myfile.txt".as_bytes().to_vec()),
+        );
         let id = "test-finalize-fallback";
         let upload_info = UploadInfo {
             id: id.to_owned(),
@@ -1497,17 +2192,21 @@ mod tests {
         store.write(id, 0, stream).await.unwrap();
 
         assert_eq!(
-            fs::read(temp_dir.path().join("myfile.txt"))
+            fs::read(temp_dir.path().join("data/myfile.txt"))
                 .await
                 .unwrap()
                 .as_slice(),
             b"existing"
         );
         assert_eq!(
-            fs::read(temp_dir.path().join("myfile-test-finalize-fallback.txt"))
-                .await
-                .unwrap()
-                .as_slice(),
+            fs::read(
+                temp_dir
+                    .path()
+                    .join("data/myfile-test-finalize-fallback.txt")
+            )
+            .await
+            .unwrap()
+            .as_slice(),
             b"hello"
         );
 
@@ -1526,18 +2225,24 @@ mod tests {
         use futures_util::stream;
 
         let (store, temp_dir) = create_test_store();
-        fs::write(temp_dir.path().join("myfile.txt"), b"existing-primary")
+        store.ensure_root().await.unwrap();
+        fs::write(temp_dir.path().join("data/myfile.txt"), b"existing-primary")
             .await
             .unwrap();
         fs::write(
-            temp_dir.path().join("myfile-test-finalize-collision.txt"),
+            temp_dir
+                .path()
+                .join("data/myfile-test-finalize-collision.txt"),
             b"existing-fallback",
         )
         .await
         .unwrap();
 
         let mut metadata = HashMap::new();
-        metadata.insert("filename".to_owned(), Some("myfile.txt".to_owned()));
+        metadata.insert(
+            "filename".to_owned(),
+            Some("myfile.txt".as_bytes().to_vec()),
+        );
         let id = "test-finalize-collision";
         let upload_info = UploadInfo {
             id: id.to_owned(),
@@ -1555,17 +2260,21 @@ mod tests {
         store.write(id, 0, stream).await.unwrap();
 
         assert_eq!(
-            fs::read(temp_dir.path().join("myfile.txt"))
+            fs::read(temp_dir.path().join("data/myfile.txt"))
                 .await
                 .unwrap()
                 .as_slice(),
             b"existing-primary"
         );
         assert_eq!(
-            fs::read(temp_dir.path().join("myfile-test-finalize-collision.txt"))
-                .await
-                .unwrap()
-                .as_slice(),
+            fs::read(
+                temp_dir
+                    .path()
+                    .join("data/myfile-test-finalize-collision.txt")
+            )
+            .await
+            .unwrap()
+            .as_slice(),
             b"existing-fallback"
         );
         assert_eq!(
@@ -1581,7 +2290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_file_no_replace_moves_without_overwriting() {
+    async fn test_copy_file_no_replace_retains_source_without_overwriting() {
         let (_store, temp_dir) = create_test_store();
         let source = temp_dir.path().join("source.bin");
         let target = temp_dir.path().join("target.bin");
@@ -1592,7 +2301,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(!source.exists());
+        assert!(source.exists());
         assert_eq!(fs::read(&target).await.unwrap().as_slice(), b"new");
 
         let second_source = temp_dir.path().join("second-source.bin");
@@ -1611,8 +2320,11 @@ mod tests {
         let (store, _temp_dir) = create_test_store();
 
         let mut metadata = HashMap::new();
-        metadata.insert("filename".to_owned(), Some("test.pdf".to_owned()));
-        metadata.insert("filetype".to_owned(), Some("application/pdf".to_owned()));
+        metadata.insert("filename".to_owned(), Some("test.pdf".as_bytes().to_vec()));
+        metadata.insert(
+            "filetype".to_owned(),
+            Some("application/pdf".as_bytes().to_vec()),
+        );
 
         let upload_info = UploadInfo {
             id: "test-metadata".to_owned(),
@@ -1628,7 +2340,7 @@ mod tests {
         let info = store.get_upload_file_info("test-metadata").await.unwrap();
         assert!(info.metadata.is_some());
         let meta = info.metadata.unwrap();
-        assert_eq!(meta.get("filename"), Some(&Some("test.pdf".to_owned())));
+        assert_eq!(meta.get("filename"), Some(&Some(b"test.pdf".to_vec())));
     }
 
     #[test]
@@ -1639,7 +2351,7 @@ mod tests {
             offset: 0,
             metadata: Some({
                 let mut m = HashMap::new();
-                m.insert("key1".to_owned(), Some("value1".to_owned()));
+                m.insert("key1".to_owned(), Some("value1".as_bytes().to_vec()));
                 m.insert("key2".to_owned(), None);
                 m
             }),

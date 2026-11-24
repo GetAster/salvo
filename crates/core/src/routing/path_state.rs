@@ -2,20 +2,18 @@ use std::borrow::Cow;
 use std::fmt::{self, Debug, Formatter};
 use std::ops::Range;
 
-use super::{PathParams, decode_url_path};
+use super::PathParams;
+use super::path_params::CapturedPath;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PathPart {
-    Raw(Range<usize>),
-    Decoded(String),
+struct PathPart {
+    raw: Range<usize>,
+    decoded: Option<Box<str>>,
 }
 impl PathPart {
     #[inline]
     fn as_str<'a>(&'a self, source: &'a str) -> &'a str {
-        match self {
-            Self::Raw(range) => &source[range.clone()],
-            Self::Decoded(value) => value,
-        }
+        self.decoded.as_deref().unwrap_or(&source[self.raw.clone()])
     }
 
     #[inline]
@@ -37,6 +35,17 @@ pub struct PathState<'a> {
     pub(crate) end_slash: bool, // For rest match, we want include the last slash.
     pub(crate) once_ended: bool, /* Once it has ended, used to determine whether the error code
                                  * returned is 404 or 405. */
+    valid_path: bool,
+}
+
+/// A lightweight transaction boundary for path matching.
+#[derive(Clone, Copy)]
+pub(crate) struct PathCheckpoint {
+    cursor: (usize, usize),
+    params: (usize, bool, usize),
+    end_slash: bool,
+    #[cfg(feature = "matched-path")]
+    matched_parts_len: usize,
 }
 impl<'a> Debug for PathState<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -51,6 +60,7 @@ impl<'a> Debug for PathState<'a> {
         debug
             .field("end_slash", &self.end_slash)
             .field("once_ended", &self.once_ended)
+            .field("valid_path", &self.valid_path)
             .finish()
     }
 }
@@ -63,6 +73,7 @@ impl<'a, 'b> PartialEq<PathState<'b>> for PathState<'a> {
             || self.params != other.params
             || self.end_slash != other.end_slash
             || self.once_ended != other.once_ended
+            || self.valid_path != other.valid_path
         {
             return false;
         }
@@ -75,6 +86,26 @@ impl<'a, 'b> PartialEq<PathState<'b>> for PathState<'a> {
 }
 impl<'a> Eq for PathState<'a> {}
 impl<'a> PathState<'a> {
+    pub(crate) fn checkpoint(&self) -> PathCheckpoint {
+        PathCheckpoint {
+            cursor: self.cursor,
+            params: self.params.snapshot(),
+            end_slash: self.end_slash,
+            #[cfg(feature = "matched-path")]
+            matched_parts_len: self.matched_parts.len(),
+        }
+    }
+
+    pub(crate) fn rollback(&mut self, checkpoint: PathCheckpoint) {
+        self.cursor = checkpoint.cursor;
+        self.params.rollback(checkpoint.params);
+        self.end_slash = checkpoint.end_slash;
+        #[cfg(feature = "matched-path")]
+        self.matched_parts.truncate(checkpoint.matched_parts_len);
+        // `once_ended` accumulates path matches across failed router branches
+        // to distinguish 405 from 404, so it is intentionally not rolled back.
+    }
+
     /// Creates a new owned `PathState` from a borrowed path.
     #[inline]
     #[must_use]
@@ -109,7 +140,7 @@ impl<'a> PathState<'a> {
     #[must_use]
     pub fn from_cow_path(path: Cow<'a, str>) -> Self {
         let end_slash = path.ends_with('/');
-        let parts = parse_path_parts(path.as_ref());
+        let (parts, valid_path) = parse_path_parts(path.as_ref());
         Self {
             path,
             parts,
@@ -117,9 +148,15 @@ impl<'a> PathState<'a> {
             params: PathParams::new(),
             end_slash,
             once_ended: false,
+            valid_path,
             #[cfg(feature = "matched-path")]
             matched_parts: vec![],
         }
+    }
+
+    #[inline]
+    pub(crate) fn is_valid_path(&self) -> bool {
+        self.valid_path
     }
 
     #[inline]
@@ -171,6 +208,81 @@ impl<'a> PathState<'a> {
         }
     }
 
+    pub(crate) fn rest_segments_len(&self) -> usize {
+        self.parts.len().saturating_sub(self.cursor.0)
+    }
+
+    /// Capture before advancing the cursor so a wildcard never loses segment boundaries.
+    pub(crate) fn capture_tail(&mut self, name: &str, value: String) -> bool {
+        let mut ranges = Vec::new();
+        let mut encoded = String::with_capacity(value.len());
+        let mut value_offset = 0;
+        for (index, part) in self.parts.iter().enumerate().skip(self.cursor.0) {
+            let offset = if index == self.cursor.0 {
+                self.cursor.1
+            } else {
+                0
+            };
+            let Some(segment) = part.as_str(&self.path).get(offset..) else {
+                return false;
+            };
+            let raw = &self.path[part.raw.clone()];
+            // The cursor counts decoded UTF-8 bytes. Each valid percent triplet
+            // contributes one byte, even when several triplets form one character.
+            let mut raw_offset = 0;
+            for _ in 0..offset {
+                raw_offset += if raw.as_bytes()[raw_offset] == b'%'
+                    && raw
+                        .as_bytes()
+                        .get(raw_offset + 1)
+                        .is_some_and(u8::is_ascii_hexdigit)
+                    && raw
+                        .as_bytes()
+                        .get(raw_offset + 2)
+                        .is_some_and(u8::is_ascii_hexdigit)
+                {
+                    3
+                } else {
+                    1
+                };
+            }
+            if !ranges.is_empty() {
+                if value.as_bytes().get(value_offset) != Some(&b'/') {
+                    return false;
+                }
+                value_offset += 1;
+                encoded.push('/');
+            }
+            if value.get(value_offset..value_offset + segment.len()) != Some(segment) {
+                return false;
+            }
+            ranges.push(value_offset..value_offset + segment.len());
+            value_offset += segment.len();
+            encoded.push_str(&raw[raw_offset..]);
+        }
+        if self.end_slash && !ranges.is_empty() {
+            if value.as_bytes().get(value_offset) != Some(&b'/') {
+                return false;
+            }
+            value_offset += 1;
+            ranges.push(value_offset..value_offset);
+            encoded.push('/');
+        }
+        if value_offset != value.len() || self.params.greedy() {
+            return false;
+        }
+        self.params.insert_tail_tracked(
+            name,
+            value,
+            CapturedPath {
+                index: 0,
+                ranges,
+                encoded,
+            },
+        );
+        true
+    }
+
     #[inline]
     pub fn forward(&mut self, steps: usize) {
         let mut steps = steps + self.cursor.1;
@@ -209,8 +321,9 @@ impl<'a> PathState<'a> {
     }
 }
 
-fn parse_path_parts(path: &str) -> Vec<PathPart> {
+fn parse_path_parts(path: &str) -> (Vec<PathPart>, bool) {
     let mut parts = Vec::new();
+    let mut valid_path = true;
     let end = path.trim_end_matches('/').len();
     let mut cursor = path.len() - path.trim_start_matches('/').len();
     while cursor < end {
@@ -224,12 +337,33 @@ fn parse_path_parts(path: &str) -> Vec<PathPart> {
         if start == cursor {
             continue;
         }
-        match decode_url_path(&path[start..cursor]) {
-            Cow::Borrowed(_) => parts.push(PathPart::Raw(start..cursor)),
-            Cow::Owned(decoded) => parts.push(PathPart::Decoded(decoded)),
+        let raw = &path[start..cursor];
+        let decoded = if raw.as_bytes().contains(&b'%') {
+            let Ok(decoded) = percent_encoding::percent_decode_str(raw).decode_utf8() else {
+                return (parts, false);
+            };
+            decoded
+        } else {
+            Cow::Borrowed(raw)
+        };
+        if raw.contains('\\') || decoded.contains('\0') {
+            valid_path = false;
+        }
+        match decoded.as_ref() {
+            "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(PathPart {
+                raw: start..cursor,
+                decoded: match decoded {
+                    Cow::Borrowed(_) => None,
+                    Cow::Owned(value) => Some(value.into_boxed_str()),
+                },
+            }),
         }
     }
-    parts
+    (parts, valid_path)
 }
 
 #[cfg(test)]
@@ -277,11 +411,11 @@ mod tests {
         let user = "\u{7528}\u{6237}";
         let emoji = "\u{1f600}";
         let mut state =
-            PathState::from_borrowed_path("/%E7%94%A8%E6%88%B7/%F0%9F%98%80/a%2Fb/rest");
+            PathState::from_borrowed_path("/%E7%94%A8%E6%88%B7/%F0%9F%98%80/a%20b/rest");
 
         assert_eq!(
             state.parts().collect::<Vec<_>>(),
-            vec![user, emoji, "a/b", "rest"]
+            vec![user, emoji, "a b", "rest"]
         );
         assert_eq!(state.pick(), Some(user));
 
@@ -289,10 +423,186 @@ mod tests {
         assert_eq!(state.pick(), Some(emoji));
 
         state.forward(emoji.len());
-        assert_eq!(state.pick(), Some("a/b"));
+        assert_eq!(state.pick(), Some("a b"));
 
-        state.forward("a/b".len());
+        state.forward("a b".len());
         assert_eq!(state.pick(), Some("rest"));
+    }
+
+    #[test]
+    fn encoded_separators_remain_segment_data() {
+        for path in [
+            "/%2freport_note/secret.txt",
+            "/%2Freport_note/secret.txt",
+            "/%5creport_note/secret.txt",
+            "/%5Creport_note/secret.txt",
+            "/report_note%2fsecret.txt",
+            "/report_note%5csecret.txt",
+        ] {
+            assert!(
+                PathState::from_borrowed_path(path).is_valid_path(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_dot_segments_after_decoding() {
+        for path in [
+            "/./report_note/secret.txt",
+            "/%2e/report_note/secret.txt",
+            "/%2E/report_note/secret.txt",
+            "/public/../report_note/secret.txt",
+            "/public/%2e%2e/report_note/secret.txt",
+            "/public/%2E%2E/report_note/secret.txt",
+        ] {
+            let state = PathState::from_borrowed_path(path);
+            assert!(state.is_valid_path(), "{path}");
+            assert_eq!(
+                state.parts().collect::<Vec<_>>(),
+                vec!["report_note", "secret.txt"],
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_segments_discarded_by_downstream_normalization() {
+        for path in [
+            "/%00/report_note/secret.txt",
+            "/ignored%00segment/report_note/secret.txt",
+            "/%00/../report_note/secret.txt",
+            "/report_note/secret.txt%00",
+            "/\0/report_note/secret.txt",
+        ] {
+            assert!(
+                !PathState::from_borrowed_path(path).is_valid_path(),
+                "{path}"
+            );
+        }
+        for part in [
+            "C:",
+            "C%3a",
+            "CON",
+            "%43%4f%4e",
+            "NUL.txt",
+            "pRn",
+            "AUX",
+            "COM1",
+            "LPT9",
+        ] {
+            let path = format!("/{part}/report_note/secret.txt");
+            let state = PathState::from_borrowed_path(&path);
+            assert!(state.is_valid_path(), "{path}");
+        }
+    }
+
+    #[test]
+    fn unambiguous_paths_keep_url_normalization() {
+        use super::super::{decode_url_path, normalize_url_path};
+
+        // Exercise every transformation that downstream path normalization
+        // performs, including components removed by a later parent segment.
+        for prefix in [
+            "",
+            "public/..",
+            ".",
+            "%2e",
+            "%2E%2E",
+            "%00",
+            "x%00y",
+            "C:",
+            "CON.txt",
+            "COM1",
+            "%2f",
+            "%5c",
+            "%00/..",
+            "CON/..",
+            "a//..",
+            "CONSOLE",
+            "COM10",
+        ] {
+            for suffix in ["/report_note/secret.txt", "/report_note/secret.txt/"] {
+                let path = format!("/{prefix}{suffix}");
+                let state = PathState::from_borrowed_path(&path);
+                if state.is_valid_path()
+                    && !path
+                        .split('/')
+                        .any(|part| decode_url_path(part).contains('/'))
+                {
+                    assert_eq!(
+                        state.all_rest().unwrap_or_default(),
+                        normalize_url_path(&decode_url_path(&path)),
+                        "{path}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unambiguous_component_combinations_keep_url_normalization() {
+        use super::super::{decode_url_path, normalize_url_path};
+
+        // Combine components in different positions so parent references, empty
+        // paths, UTF-8 byte ranges, and invalid components cannot mask each other.
+        let components = [
+            "",
+            "a",
+            "report_note",
+            ".",
+            "..",
+            "%2e",
+            "%2e%2E",
+            "%00",
+            "a%00b",
+            "%2f",
+            "%5C",
+            "%252f",
+            "C:",
+            "CON.txt",
+            "COM10",
+            "%E7%94%A8%E6%88%B7",
+        ];
+        for first in components {
+            for second in components {
+                for third in components {
+                    for trailing in ["", "/"] {
+                        let path = format!("/{first}/{second}/{third}{trailing}");
+                        let state = PathState::from_borrowed_path(&path);
+                        if state.is_valid_path()
+                            && !path
+                                .split('/')
+                                .any(|part| decode_url_path(part).contains('/'))
+                        {
+                            let expected = normalize_url_path(&decode_url_path(&path));
+                            let rest = state.all_rest().unwrap_or_default();
+                            // The empty root has no captured tail, even when the
+                            // URI ends with '/'. Nonempty tails preserve it.
+                            if state.is_ended() {
+                                assert!(expected.is_empty() || expected == "/", "{path}");
+                            } else {
+                                assert_eq!(rest, expected, "{path}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_non_structural_percent_decoding() {
+        for (path, expected) in [
+            ("/%2eenv", ".env"),
+            ("/v1%2e2", "v1.2"),
+            ("/hello%20world", "hello world"),
+            ("/%252f", "%2f"),
+        ] {
+            let state = PathState::from_borrowed_path(path);
+            assert!(state.is_valid_path(), "{path}");
+            assert_eq!(state.parts().collect::<Vec<_>>(), vec![expected], "{path}");
+        }
     }
 
     #[test]

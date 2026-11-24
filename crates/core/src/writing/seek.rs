@@ -5,8 +5,8 @@ use headers::*;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use crate::http::header::{IF_NONE_MATCH, RANGE};
-use crate::http::{HttpRange, Request, Response, StatusCode, StatusError};
+use crate::http::header::{IF_NONE_MATCH, IF_RANGE, RANGE};
+use crate::http::{HttpRange, Method, Request, Response, StatusCode, StatusError};
 use crate::{Depot, Writer, async_trait};
 
 /// `ReadSeeker` is used to write data to [`Response`] from a reader which implements [`AsyncRead`]
@@ -61,11 +61,32 @@ where
         self
     }
 
-    /// Consume self and send content to [`Response`].
-    pub async fn send(mut self, req_headers: &HeaderMap, res: &mut Response) {
+    /// Consume self and send content to [`Response`] with GET semantics.
+    ///
+    /// Use the [`Writer`] implementation to apply the actual request method.
+    pub async fn send(self, req_headers: &HeaderMap, res: &mut Response) {
+        self.send_inner(req_headers, res, &Method::GET).await;
+    }
+
+    /// Send only the headers for a HEAD request, preserving conditional request
+    /// handling while ignoring `Range`. The reader is not read or sought.
+    pub async fn send_head(self, req_headers: &HeaderMap, res: &mut Response) {
+        self.send_inner(req_headers, res, &Method::HEAD).await;
+    }
+
+    async fn send_inner(mut self, req_headers: &HeaderMap, res: &mut Response, method: &Method) {
+        let send_body = method != Method::HEAD;
+        let retrieval = method == Method::GET || method == Method::HEAD;
+        if !send_body {
+            res.take_body();
+        }
         // check preconditions
         let precondition_failed = if !any_match(self.etag.as_ref(), req_headers) {
             true
+        } else if req_headers.contains_key(crate::http::header::IF_MATCH) {
+            // If-Match takes precedence over If-Unmodified-Since, including
+            // the wildcard existence precondition (RFC 9110 section 13.1.4).
+            false
         } else if let (Some(last_modified), Some(since)) = (
             &self.last_modified,
             req_headers.typed_get::<IfUnmodifiedSince>(),
@@ -78,7 +99,7 @@ where
         // check last modified
         let not_modified = if !none_match(self.etag.as_ref(), req_headers) {
             true
-        } else if req_headers.contains_key(IF_NONE_MATCH) {
+        } else if req_headers.contains_key(IF_NONE_MATCH) || !retrieval {
             false
         } else if let (Some(last_modified), Some(since)) = (
             &self.last_modified,
@@ -88,6 +109,16 @@ where
         } else {
             false
         };
+
+        // If-Range requires a strong tag or an exact date match. A failed or
+        // invalid validator ignores Range, including an unsatisfiable range.
+        let range_allowed = !req_headers.contains_key(IF_RANGE)
+            || req_headers.typed_get::<IfRange>().is_some_and(|if_range| {
+                !if_range.is_modified(self.etag.as_ref(), None)
+                    || self
+                        .last_modified
+                        .is_some_and(|modified| if_range == IfRange::date(modified))
+            });
 
         if let Some(lm) = self.last_modified {
             res.headers_mut().typed_insert(LastModified::from(lm));
@@ -104,7 +135,20 @@ where
             res.status_code(StatusCode::PRECONDITION_FAILED);
             return;
         } else if not_modified {
-            res.status_code(StatusCode::NOT_MODIFIED);
+            if retrieval {
+                res.take_body();
+            }
+            res.status_code(if retrieval {
+                StatusCode::NOT_MODIFIED
+            } else {
+                StatusCode::PRECONDITION_FAILED
+            });
+            return;
+        }
+
+        if !send_body {
+            res.status_code(StatusCode::OK);
+            res.headers_mut().typed_insert(ContentLength(self.length));
             return;
         }
 
@@ -112,7 +156,10 @@ where
         let mut length = self.length;
         let mut is_partial = false;
         // check for range header
-        if let Some(range) = req_headers.get(RANGE) {
+        if let Some(range) = req_headers
+            .get(RANGE)
+            .filter(|_| method == Method::GET && range_allowed)
+        {
             let Ok(range) = range.to_str() else {
                 res.status_code(StatusCode::BAD_REQUEST);
                 return;
@@ -128,6 +175,11 @@ where
                 // is not supported here. Per RFC 7233 the server may ignore the Range
                 // header and return the full `200 OK` representation instead.
                 Ok(ranges) if ranges.len() > 1 => {}
+                // RFC 9110 section 14.2 requires ignoring unknown range units.
+                Err(_)
+                    if range
+                        .split_once('=')
+                        .is_some_and(|(unit, _)| !unit.eq_ignore_ascii_case("bytes")) => {}
                 // Empty / unsatisfiable range.
                 _ => {
                     res.headers_mut()
@@ -161,6 +213,13 @@ where
                 .typed_insert(ContentLength(content_length));
             res.stream(ReaderStream::new(self.reader.take(content_length)));
         } else {
+            if let Err(error) = self.reader.seek(SeekFrom::Start(0)).await {
+                tracing::error!(?error, "seek representation start failed");
+                res.render(
+                    StatusError::internal_server_error().brief("seek representation start failed"),
+                );
+                return;
+            }
             res.status_code(StatusCode::OK);
             res.headers_mut().typed_insert(ContentLength(self.length));
             res.stream(ReaderStream::new(self.reader.take(self.length)));
@@ -175,7 +234,7 @@ where
 {
     #[inline]
     async fn write(self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        self.send(req.headers(), res).await;
+        self.send_inner(req.headers(), res, req.method()).await;
     }
 }
 
@@ -207,6 +266,167 @@ fn none_match(etag: Option<&ETag>, req_headers: &HeaderMap) -> bool {
             } else {
                 true
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::test::ResponseExt;
+
+    #[tokio::test]
+    async fn if_range_requires_a_matching_strong_validator() {
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (validator, tag, date, range, expected) in [
+            (
+                None,
+                Some("\"new\""),
+                true,
+                "bytes=4-",
+                StatusCode::PARTIAL_CONTENT,
+            ),
+            (
+                Some("\"new\""),
+                Some("\"new\""),
+                true,
+                "bytes=4-",
+                StatusCode::PARTIAL_CONTENT,
+            ),
+            (
+                Some("\"old\""),
+                Some("\"new\""),
+                true,
+                "bytes=4-",
+                StatusCode::OK,
+            ),
+            (
+                Some("W/\"new\""),
+                Some("\"new\""),
+                true,
+                "bytes=4-",
+                StatusCode::OK,
+            ),
+            (
+                Some("W/\"new\""),
+                Some("W/\"new\""),
+                true,
+                "bytes=4-",
+                StatusCode::OK,
+            ),
+            (Some("\"new\""), None, true, "bytes=4-", StatusCode::OK),
+            (
+                Some("Tue, 14 Nov 2023 22:13:20 GMT"),
+                None,
+                true,
+                "bytes=4-",
+                StatusCode::PARTIAL_CONTENT,
+            ),
+            (
+                Some("Tue, 14 Nov 2023 22:13:19 GMT"),
+                None,
+                true,
+                "bytes=4-",
+                StatusCode::OK,
+            ),
+            (
+                Some("Tue, 14 Nov 2023 22:13:21 GMT"),
+                None,
+                true,
+                "bytes=4-",
+                StatusCode::OK,
+            ),
+            (
+                Some("Tue, 14 Nov 2023 22:13:20 GMT"),
+                Some("\"new\""),
+                false,
+                "bytes=4-",
+                StatusCode::OK,
+            ),
+            (
+                Some("invalid"),
+                Some("\"new\""),
+                true,
+                "bytes=4-",
+                StatusCode::OK,
+            ),
+            (
+                Some("\"old\""),
+                Some("\"new\""),
+                true,
+                "bytes=999-",
+                StatusCode::OK,
+            ),
+            (
+                Some("\"old\""),
+                Some("\"new\""),
+                true,
+                "invalid",
+                StatusCode::OK,
+            ),
+            (
+                Some("\"new\""),
+                Some("\"new\""),
+                true,
+                "bytes=999-",
+                StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, range.parse().unwrap());
+            if let Some(validator) = validator {
+                headers.insert("if-range", validator.parse().unwrap());
+            }
+            let mut reader = ReadSeeker::new(Cursor::new(b"new-content"), 11);
+            if let Some(tag) = tag {
+                reader = reader.etag(tag.parse().unwrap());
+            }
+            if date {
+                reader = reader.last_modified(modified);
+            }
+            let mut response = Response::new();
+            reader.send(&headers, &mut response).await;
+            assert_eq!(
+                response.status_code,
+                Some(expected),
+                "{validator:?}, {tag:?}, {date}, {range}"
+            );
+            if expected == StatusCode::OK {
+                assert!(!response.headers().contains_key("content-range"));
+                assert_eq!(response.headers()["content-length"], "11");
+                assert_eq!(response.take_string().await.unwrap(), "new-content");
+            } else if expected == StatusCode::PARTIAL_CONTENT {
+                assert_eq!(response.headers()["content-range"], "bytes 4-10/11");
+                assert_eq!(response.headers()["content-length"], "7");
+                assert_eq!(response.take_string().await.unwrap(), "content");
+            } else {
+                assert_eq!(response.headers()["content-range"], "bytes */11");
+                assert!(response.body.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn if_range_does_not_override_other_preconditions() {
+        for (condition, tag, expected) in [
+            ("if-none-match", "\"new\"", StatusCode::NOT_MODIFIED),
+            ("if-match", "\"old\"", StatusCode::PRECONDITION_FAILED),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(condition, tag.parse().unwrap());
+            headers.insert("if-range", "\"old\"".parse().unwrap());
+            headers.insert(RANGE, "bytes=999-".parse().unwrap());
+            let mut response = Response::new();
+            ReadSeeker::new(Cursor::new(b"new-content"), 11)
+                .etag("\"new\"".parse().unwrap())
+                .send(&headers, &mut response)
+                .await;
+            assert_eq!(response.status_code, Some(expected));
+            assert!(response.body.is_none());
+            assert!(!response.headers().contains_key("content-range"));
         }
     }
 }

@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use tokio::sync::Notify;
 
+use super::upgrades::UpgradeTask;
+
 const RUNNING: u8 = 0;
 const GRACEFUL_SHUTDOWN: u8 = 1;
 const ABORT: u8 = 2;
@@ -13,6 +15,8 @@ const ABORT: u8 = 2;
 /// A control is shared by every request multiplexed over the same connection.
 /// Shutting down an HTTP/2 or HTTP/3 connection therefore also affects its
 /// other in-flight request streams.
+/// Create a separate control for each physical connection; only clone it for
+/// the driver, streams, and handlers belonging to that same connection.
 #[derive(Clone)]
 pub struct ConnCtrl {
     inner: Arc<Inner>,
@@ -22,6 +26,14 @@ struct Inner {
     state: AtomicU8,
     notify: Notify,
     relax: AtomicBool,
+    // 0: cleartext, 1: TLS without ALPN, 2: HTTP/1.1, 3: HTTP/2, 4: unsupported ALPN.
+    protocol: AtomicU8,
+    upgrades: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<UpgradeTask>>,
+    // Reuse the connection state already exposed on Request. Request dispatch
+    // needs no additional extension insertion, certificate clone, or synchronization.
+    // Boxing keeps connections without TLS from reserving a full TlsInfo.
+    #[cfg(feature = "rustls")]
+    tls_info: std::sync::OnceLock<Box<super::TlsInfo>>,
 }
 
 impl Default for ConnCtrl {
@@ -47,8 +59,83 @@ impl ConnCtrl {
                 state: AtomicU8::new(RUNNING),
                 notify: Notify::new(),
                 relax: AtomicBool::new(false),
+                protocol: AtomicU8::new(0),
+                upgrades: std::sync::OnceLock::new(),
+                #[cfg(feature = "rustls")]
+                tls_info: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Registers an upgraded-protocol task with its transport connection.
+    ///
+    /// Call this before returning the upgrade response. The server retains the
+    /// connection's capacity permit until the task finishes. Graceful shutdown
+    /// drains registered tasks; forceful shutdown, [`abort`](Self::abort), and
+    /// dropping the serving future cancel them. A task registered after its
+    /// connection scope has ended is discarded.
+    ///
+    /// For a control used outside a `Server`, the task is spawned
+    /// on the current Tokio runtime without server lifetime tracking.
+    pub fn spawn_upgrade(&self, task: impl Future<Output = ()> + Send + 'static) {
+        if let Some(upgrades) = self.inner.upgrades.get() {
+            let _ = upgrades.send(Box::pin(task));
+        } else {
+            tokio::spawn(task);
+        }
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn upgrade_scope(&self) -> super::upgrades::UpgradeScope {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            self.inner.upgrades.set(sender).is_ok(),
+            "a connection control cannot belong to multiple server connections"
+        );
+        super::upgrades::UpgradeScope::new(self.clone(), receiver)
+    }
+
+    #[cfg(any(feature = "rustls", feature = "native-tls", feature = "openssl"))]
+    pub(crate) fn set_tls_protocol(&self, protocol: Option<&[u8]>) {
+        let protocol = match protocol {
+            None => 1,
+            Some(b"http/1.1") => 2,
+            Some(b"h2") => 3,
+            Some(_) => 4,
+        };
+        self.inner.protocol.store(protocol, Ordering::Release);
+    }
+
+    pub(crate) fn select_http_version(
+        &self,
+        detected: http::Version,
+    ) -> std::io::Result<http::Version> {
+        use http::Version;
+        let allowed = match self.inner.protocol.load(Ordering::Acquire) {
+            0 => detected != Version::HTTP_2 || cfg!(feature = "http2-cleartext"),
+            1 | 2 => detected != Version::HTTP_2,
+            3 => detected == Version::HTTP_2,
+            _ => false,
+        };
+        if allowed {
+            Ok(detected)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP protocol does not match the transport's negotiated or enabled protocol",
+            ))
+        }
+    }
+
+    #[cfg(feature = "rustls")]
+    pub(crate) fn set_tls_info(&self, info: super::TlsInfo) {
+        self.set_tls_protocol(info.alpn_protocol());
+        let _ = self.inner.tls_info.set(Box::new(info));
+    }
+
+    #[cfg(feature = "rustls")]
+    pub(crate) fn tls_info(&self) -> Option<&super::TlsInfo> {
+        self.inner.tls_info.get().map(Box::as_ref)
     }
 
     /// Stops accepting new requests and lets accepted requests finish.

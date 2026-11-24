@@ -216,7 +216,7 @@ where
         };
         Ok(Accepted {
             coupler: TcpCoupler::new(),
-            stream: HandshakeStream::new(tls_acceptor.accept(stream), fuse_config),
+            stream: super::accept_tls(tls_acceptor.accept(stream), fuse_config, conn_ctrl.clone()),
             fuse_config,
             conn_ctrl,
             local_addr,

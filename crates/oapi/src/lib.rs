@@ -177,15 +177,41 @@ pub trait ToSchema {
 /// }
 /// ```
 pub trait ComposeSchema {
+    /// Declaration identity used by generated recursive composition guards.
+    #[doc(hidden)]
+    fn __compose_declaration_id() -> std::any::TypeId {
+        struct ManualDeclaration;
+        std::any::TypeId::of::<ManualDeclaration>()
+    }
+
     /// Compose a schema using the provided generic parameter schemas.
     ///
     /// The `components` parameter allows registering nested schemas.
     /// The `generics` vector contains pre-resolved schemas for each type parameter,
-    /// in the order they appear in the type definition.
+    /// in the order they appear in the type definition. Missing entries resolve
+    /// using the concrete type parameter's `ComposeSchema` implementation, so an
+    /// empty vector composes the actual type (including aliases and const generics).
     fn compose(
         components: &mut Components,
         generics: Vec<RefOr<schema::Schema>>,
     ) -> RefOr<schema::Schema>;
+
+    /// Compose through a path whose generic arguments may belong to a type alias.
+    ///
+    /// Generated implementations preserve positional overrides when the source
+    /// path proves which declaration is used. Otherwise they match overrides
+    /// by concrete parameter type, falling back to the actual type for ambiguous
+    /// repeated types. This includes opaque imports with conflicting overrides.
+    /// Hand-written implementations retain their actual-type behavior by default.
+    #[doc(hidden)]
+    fn compose_with_bindings(
+        components: &mut Components,
+        _caller_module: &str,
+        _source_path: &[&str],
+        _arguments: Vec<Option<(&'static str, RefOr<schema::Schema>)>>,
+    ) -> RefOr<schema::Schema> {
+        Self::compose(components, Vec::new())
+    }
 }
 
 /// Tracks schema references for generic type resolution.
@@ -261,13 +287,12 @@ impl SchemaReference {
 /// Represents _`nullable`_ type.
 ///
 /// This can be used anywhere where "nothing" needs to be evaluated.
-/// This will serialize to _`null`_ in JSON and [`schema::empty`] is used to create the
-/// [`schema::Schema`] for the type.
+/// This serializes to _`null`_ in JSON and its schema explicitly permits only null.
 pub type TupleUnit = ();
 
 impl ToSchema for TupleUnit {
     fn to_schema(_components: &mut Components) -> RefOr<schema::Schema> {
-        schema::empty().into()
+        schema::Object::with_type(schema::BasicType::Null).into()
     }
 }
 impl ComposeSchema for TupleUnit {
@@ -275,7 +300,7 @@ impl ComposeSchema for TupleUnit {
         _components: &mut Components,
         _generics: Vec<RefOr<schema::Schema>>,
     ) -> RefOr<schema::Schema> {
-        schema::empty().into()
+        schema::Object::with_type(schema::BasicType::Null).into()
     }
 }
 
@@ -316,6 +341,7 @@ pub mod oapi {
 #[doc(hidden)]
 pub mod __private {
     pub use inventory;
+    pub use salvo_oapi_macros::__craft_endpoint;
     pub use serde_json;
 }
 
@@ -356,7 +382,27 @@ impl ComposeSchema for std::net::IpAddr {
 }
 
 #[cfg(feature = "chrono")]
-impl_to_schema_primitive!(chrono::NaiveDate, chrono::Duration, chrono::NaiveDateTime);
+impl_to_schema_primitive!(chrono::NaiveDate, chrono::NaiveDateTime);
+#[cfg(feature = "chrono")]
+impl ToSchema for chrono::Duration {
+    fn to_schema(components: &mut Components) -> RefOr<schema::Schema> {
+        <Self as ComposeSchema>::compose(components, vec![])
+    }
+}
+#[cfg(feature = "chrono")]
+impl ComposeSchema for chrono::Duration {
+    fn compose(
+        components: &mut Components,
+        _generics: Vec<RefOr<schema::Schema>>,
+    ) -> RefOr<schema::Schema> {
+        schema::Array::new()
+            .prefix_items([i64::to_schema(components), i32::to_schema(components)])
+            .items(schema::ArrayItems::False)
+            .min_items(2)
+            .max_items(2)
+            .into()
+    }
+}
 #[cfg(feature = "chrono")]
 impl<T: chrono::TimeZone> ToSchema for chrono::DateTime<T> {
     fn to_schema(_components: &mut Components) -> RefOr<schema::Schema> {
@@ -390,22 +436,30 @@ impl_to_schema_primitive!(
     time::Duration
 );
 #[cfg(feature = "smallvec")]
-impl<T: ToSchema + smallvec::Array> ToSchema for smallvec::SmallVec<T> {
+impl<A: smallvec::Array> ToSchema for smallvec::SmallVec<A>
+where
+    A::Item: ToSchema,
+{
     fn to_schema(components: &mut Components) -> RefOr<schema::Schema> {
-        schema!(#[inline] smallvec::SmallVec<T>).into()
+        schema::Array::new()
+            .items(A::Item::to_schema(components))
+            .into()
     }
 }
 #[cfg(feature = "smallvec")]
-impl<T: ComposeSchema + smallvec::Array> ComposeSchema for smallvec::SmallVec<T> {
+impl<A: smallvec::Array> ComposeSchema for smallvec::SmallVec<A>
+where
+    A::Item: ComposeSchema,
+{
     fn compose(
         components: &mut Components,
         generics: Vec<RefOr<schema::Schema>>,
     ) -> RefOr<schema::Schema> {
-        let t_schema = generics
+        let item = generics
             .first()
             .cloned()
-            .unwrap_or_else(|| T::compose(components, vec![]));
-        schema::Array::new().items(t_schema).into()
+            .unwrap_or_else(|| A::Item::compose(components, vec![]));
+        schema::Array::new().items(item).into()
     }
 }
 #[cfg(feature = "indexmap")]
@@ -424,7 +478,14 @@ impl<K: ComposeSchema, V: ComposeSchema> ComposeSchema for indexmap::IndexMap<K,
             .get(1)
             .cloned()
             .unwrap_or_else(|| V::compose(components, vec![]));
-        schema::Object::new().additional_properties(v_schema).into()
+        let key = generics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| K::compose(components, vec![]));
+        schema::Object::new()
+            .additional_properties(v_schema)
+            .property_names(schema::serialized_map_key_schema(key, components))
+            .into()
     }
 }
 
@@ -648,7 +709,11 @@ impl<T: ComposeSchema, const N: usize> ComposeSchema for [T; N] {
             .first()
             .cloned()
             .unwrap_or_else(|| T::compose(components, vec![]));
-        schema::Array::new().items(t_schema).into()
+        schema::Array::new()
+            .items(t_schema)
+            .min_items(N)
+            .max_items(N)
+            .into()
     }
 }
 
@@ -688,7 +753,7 @@ impl<T: ComposeSchema> ComposeSchema for Option<T> {
             .first()
             .cloned()
             .unwrap_or_else(|| T::compose(components, vec![]));
-        schema::OneOf::new()
+        schema::AnyOf::new()
             .item(t_schema)
             .item(schema::Object::new().schema_type(schema::BasicType::Null))
             .into()
@@ -697,7 +762,7 @@ impl<T: ComposeSchema> ComposeSchema for Option<T> {
 
 impl<T> ToSchema for PhantomData<T> {
     fn to_schema(_components: &mut Components) -> RefOr<schema::Schema> {
-        Schema::Object(Box::default()).into()
+        schema::Object::with_type(schema::BasicType::Null).into()
     }
 }
 impl<T> ComposeSchema for PhantomData<T> {
@@ -705,7 +770,7 @@ impl<T> ComposeSchema for PhantomData<T> {
         _components: &mut Components,
         _generics: Vec<RefOr<schema::Schema>>,
     ) -> RefOr<schema::Schema> {
-        Schema::Object(Box::default()).into()
+        schema::Object::with_type(schema::BasicType::Null).into()
     }
 }
 
@@ -723,7 +788,14 @@ impl<K: ComposeSchema, V: ComposeSchema> ComposeSchema for BTreeMap<K, V> {
             .get(1)
             .cloned()
             .unwrap_or_else(|| V::compose(components, vec![]));
-        schema::Object::new().additional_properties(v_schema).into()
+        let k_schema = generics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| K::compose(components, vec![]));
+        schema::Object::new()
+            .property_names(schema::serialized_map_key_schema(k_schema, components))
+            .additional_properties(v_schema)
+            .into()
     }
 }
 
@@ -741,7 +813,14 @@ impl<K: ComposeSchema, V: ComposeSchema> ComposeSchema for HashMap<K, V> {
             .get(1)
             .cloned()
             .unwrap_or_else(|| V::compose(components, vec![]));
-        schema::Object::new().additional_properties(v_schema).into()
+        let k_schema = generics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| K::compose(components, vec![]));
+        schema::Object::new()
+            .property_names(schema::serialized_map_key_schema(k_schema, components))
+            .additional_properties(v_schema)
+            .into()
     }
 }
 
@@ -751,17 +830,22 @@ impl ToSchema for StatusError {
         let ref_or = crate::RefOr::Ref(crate::Ref::new(format!("#/components/schemas/{name}")));
         if !components.schemas.contains_key(&name) {
             components.schemas.insert(name.clone(), ref_or.clone());
+            // This is the JSON body the default catcher writes for a status error:
+            // the fields are nested in `error`, and `detail` and `cause` are only
+            // present when the error carries them and they are allowed to be shown.
             let schema = Schema::from(
-                Object::new()
-                    .property("code", u16::to_schema(components))
-                    .required("code")
-                    .required("name")
-                    .property("name", String::to_schema(components))
-                    .required("brief")
-                    .property("brief", String::to_schema(components))
-                    .required("detail")
-                    .property("detail", String::to_schema(components))
-                    .property("cause", String::to_schema(components)),
+                Object::new().required("error").property(
+                    "error",
+                    Object::new()
+                        .property("code", u16::to_schema(components))
+                        .required("code")
+                        .required("name")
+                        .property("name", String::to_schema(components))
+                        .required("brief")
+                        .property("brief", String::to_schema(components))
+                        .property("detail", String::to_schema(components))
+                        .property("cause", String::to_schema(components)),
+                ),
             );
             components.schemas.insert(name, schema);
         }
@@ -913,48 +997,55 @@ impl ComposeSchema for salvo_core::Error {
     }
 }
 
-impl<T, E> ToSchema for Result<T, E>
-where
-    T: ToSchema,
-    E: ToSchema,
-{
+// This describes a Result serialized as data; HTTP Result writing is handled
+// separately by EndpointOutRegister and must not affect these serde tags.
+fn result_data_schema(
+    ok: RefOr<schema::Schema>,
+    err: RefOr<schema::Schema>,
+) -> RefOr<schema::Schema> {
+    OneOf::new()
+        .item(
+            schema::Object::new()
+                .property("Ok", ok)
+                .required("Ok")
+                .max_properties(1),
+        )
+        .item(
+            schema::Object::new()
+                .property("Err", err)
+                .required("Err")
+                .max_properties(1),
+        )
+        .into()
+}
+
+impl<T: ToSchema, E: ToSchema> ToSchema for Result<T, E> {
     fn to_schema(components: &mut Components) -> RefOr<schema::Schema> {
-        let name = crate::naming::assign_name::<StatusError>(Default::default());
-        let ref_or = crate::RefOr::Ref(crate::Ref::new(format!("#/components/schemas/{name}")));
-        if !components.schemas.contains_key(&name) {
-            components.schemas.insert(name.clone(), ref_or.clone());
-            let schema = OneOf::new()
-                .item(T::to_schema(components))
-                .item(E::to_schema(components));
-            components.schemas.insert(name, schema);
-        }
-        ref_or
+        // Like Option and other containers, keep the wrapper inline. This also
+        // preserves support for borrowed types without a TypeId/'static bound.
+        result_data_schema(T::to_schema(components), E::to_schema(components))
     }
 }
-impl<T, E> ComposeSchema for Result<T, E>
-where
-    T: ComposeSchema,
-    E: ComposeSchema,
-{
+impl<T: ComposeSchema, E: ComposeSchema> ComposeSchema for Result<T, E> {
     fn compose(
         components: &mut Components,
         generics: Vec<RefOr<schema::Schema>>,
     ) -> RefOr<schema::Schema> {
-        let t_schema = generics
+        let ok = generics
             .first()
             .cloned()
             .unwrap_or_else(|| T::compose(components, vec![]));
-        let e_schema = generics
+        let err = generics
             .get(1)
             .cloned()
             .unwrap_or_else(|| E::compose(components, vec![]));
-        OneOf::new().item(t_schema).item(e_schema).into()
+        result_data_schema(ok, err)
     }
 }
 
 impl ToSchema for serde_json::Value {
     fn to_schema(_components: &mut Components) -> RefOr<schema::Schema> {
-        Schema::Object(Box::default()).into()
+        schema::Object::with_type(schema::SchemaType::AnyValue).into()
     }
 }
 impl ComposeSchema for serde_json::Value {
@@ -962,7 +1053,7 @@ impl ComposeSchema for serde_json::Value {
         _components: &mut Components,
         _generics: Vec<RefOr<schema::Schema>>,
     ) -> RefOr<schema::Schema> {
-        Schema::Object(Box::default()).into()
+        schema::Object::with_type(schema::SchemaType::AnyValue).into()
     }
 }
 
@@ -982,7 +1073,7 @@ impl ComposeSchema for serde_json::Map<String, serde_json::Value> {
 
 impl ToSchema for serde_json::value::RawValue {
     fn to_schema(_components: &mut Components) -> RefOr<schema::Schema> {
-        Schema::Object(Box::default()).into()
+        schema::Object::with_type(schema::SchemaType::AnyValue).into()
     }
 }
 impl ComposeSchema for serde_json::value::RawValue {
@@ -990,7 +1081,7 @@ impl ComposeSchema for serde_json::value::RawValue {
         _components: &mut Components,
         _generics: Vec<RefOr<schema::Schema>>,
     ) -> RefOr<schema::Schema> {
-        Schema::Object(Box::default()).into()
+        schema::Object::with_type(schema::SchemaType::AnyValue).into()
     }
 }
 
@@ -1093,8 +1184,9 @@ impl ComposeSchema for serde_json::value::RawValue {
 /// ```
 /// [derive]: derive.ToParameters.html
 pub trait ToParameters<'de>: Extractible<'de> {
-    /// Provide [`Vec`] of [`Parameter`]s to caller. The result is used in `salvo-oapi-macros`
-    /// library to provide OpenAPI parameter information for the endpoint using the parameters.
+    /// Provide inline parameters or references to the caller. The result is used in
+    /// `salvo-oapi-macros` library to provide OpenAPI parameter information for the endpoint
+    /// using the parameters.
     fn to_parameters(components: &mut Components) -> Parameters;
 }
 
@@ -1132,7 +1224,7 @@ pub trait ToParameter {
 /// }
 /// impl EndpointArgRegister for MyPayload {
 ///     fn register(components: &mut Components, operation: &mut Operation, _arg: &str) {
-///         operation.request_body = Some(Self::to_request_body(components));
+///         operation.request_body = Some(Self::to_request_body(components).into());
 ///     }
 /// }
 /// ```

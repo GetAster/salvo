@@ -2,6 +2,7 @@
 use std::collections::VecDeque;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 #[cfg(feature = "cookie")]
@@ -17,7 +18,45 @@ use crate::fs::NamedFile;
 use crate::fuse::TransProto;
 pub use crate::http::body::{BodySender, BytesFrame, ResBody};
 use crate::http::{StatusCode, StatusError};
-use crate::{BoxedError, Error, Scribe};
+use crate::{BoxedError, Error, Request, Scribe};
+
+type ResponseHook = Box<dyn FnOnce(&Request, &mut Response) + Send + 'static>;
+
+#[derive(Clone, Default)]
+struct ResponseHooks(Arc<Mutex<Vec<ResponseHook>>>);
+
+#[cfg(test)]
+mod finalization_hook_tests {
+    use super::*;
+
+    #[test]
+    fn hooks_run_once_in_order_and_preserve_response_metadata() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut response = Response::new();
+        response.version = Version::HTTP_2;
+        response
+            .headers
+            .insert("x-preserved", HeaderValue::from_static("value"));
+        response.extensions.insert(17_u32);
+        #[cfg(feature = "cookie")]
+        response.cookies.add(Cookie::new("session", "value"));
+        for value in [1, 2] {
+            let order = order.clone();
+            response.after_response_hook(move |_, response| {
+                order.lock().unwrap().push(value);
+                assert_eq!(response.version, Version::HTTP_2);
+                assert_eq!(response.headers["x-preserved"], "value");
+                assert_eq!(response.extensions.get::<u32>(), Some(&17));
+                #[cfg(feature = "cookie")]
+                assert_eq!(response.cookies.get("session").unwrap().value(), "value");
+            });
+        }
+        response.run_after_response_hooks(&Request::new());
+        response.run_after_response_hooks(&Request::new());
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
+        assert_eq!(response.extensions.len(), 1);
+    }
+}
 
 /// Represents an HTTP response.
 ///
@@ -74,7 +113,7 @@ where
                 status,
                 version,
                 headers,
-                // extensions,
+                extensions,
                 ..
             },
             body,
@@ -87,9 +126,9 @@ where
             let mut cookie_jar = CookieJar::new();
             for header in headers.get_all(http::header::SET_COOKIE) {
                 if let Ok(header) = header.to_str()
-                    && let Ok(cookie) = Cookie::parse_encoded(header).map(|c| c.into_owned())
+                    && let Some(cookie) = crate::http::parse_cookie_with_raw_name(header)
                 {
-                    cookie_jar.add(cookie);
+                    cookie_jar.add_original(cookie);
                 }
             }
             cookie_jar
@@ -102,12 +141,47 @@ where
             headers,
             #[cfg(feature = "cookie")]
             cookies,
-            extensions: Extensions::new(),
+            extensions,
         }
     }
 }
 
 impl Response {
+    /// Registers a one-shot response transformation during handler execution.
+    ///
+    /// [`crate::Service`] runs the registered hooks in registration order after
+    /// the error catcher, before removing forbidden response bodies and notifying
+    /// response observers. Hooks run synchronously and cannot invoke the catcher
+    /// again; a hook that changes an error must supply its final body itself.
+    /// Hooks registered by another hook are not run during that finalization.
+    /// Converting a response without passing it through `Service` does not run
+    /// these hooks. Dropping the response cancels pending hooks.
+    pub fn after_response_hook<F>(&mut self, hook: F)
+    where
+        F: FnOnce(&Request, &mut Response) + Send + 'static,
+    {
+        if self.extensions.get::<ResponseHooks>().is_none() {
+            self.extensions.insert(ResponseHooks::default());
+        }
+        if let Some(hooks) = self.extensions.get::<ResponseHooks>() {
+            hooks
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(Box::new(hook));
+        }
+    }
+
+    pub(crate) fn run_after_response_hooks(&mut self, req: &Request) {
+        if let Some(hooks) = self.extensions.remove::<ResponseHooks>() {
+            let pending =
+                std::mem::take(&mut *hooks.0.lock().unwrap_or_else(|error| error.into_inner()));
+            for hook in pending {
+                hook(req, self);
+            }
+        }
+    }
+
     /// Creates a new blank `Response` with the provided cookie jar.
     #[inline]
     #[must_use]
@@ -256,12 +330,70 @@ impl Response {
         })
     }
 
-    /// Append every cookie in `cookies.delta()` to `headers` as a `Set-Cookie` header,
-    /// then drain the cookie jar so subsequent calls do not re-emit the same cookies.
+    /// Serialize pending cookie changes, replacing only matching name/domain/path
+    /// fields, then drain the jar so subsequent calls do not re-emit the changes.
     #[cfg(feature = "cookie")]
-    fn flush_cookies_into(headers: &mut HeaderMap, cookies: &mut CookieJar) {
+    pub(crate) fn flush_cookies_into(headers: &mut HeaderMap, cookies: &mut CookieJar) {
         for cookie in cookies.delta() {
-            if let Ok(hv) = cookie.encoded().to_string().parse() {
+            let mut serialized = cookie.encoded().to_string();
+            // Legal cookie names are wire identifiers. In particular `%` is a
+            // valid token character, not an instruction to decode or re-encode
+            // a name copied from the request jar. Values still use the cookie
+            // encoder, and invalid application names retain legacy escaping.
+            if let Some((encoded_name, tail)) = serialized.split_once('=')
+                && encoded_name != cookie.name()
+                && http::header::HeaderName::from_bytes(cookie.name().as_bytes()).is_ok()
+            {
+                serialized = format!("{}={tail}", cookie.name());
+            }
+            let wire_name = serialized
+                .split_once('=')
+                .map_or(cookie.name(), |(name, _)| name);
+            // A legacy invalid name and its encoded spelling address one wire
+            // cookie. Prefer the explicit legal spelling if both were mutated,
+            // rather than allowing CookieJar's iteration order to choose.
+            if wire_name != cookie.name()
+                && cookies.delta().any(|candidate| {
+                    candidate.name() == wire_name
+                        && candidate.path() == cookie.path()
+                        && match (candidate.domain(), cookie.domain()) {
+                            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                })
+            {
+                continue;
+            }
+            if let Ok(hv) = serialized.parse::<HeaderValue>() {
+                // Replace only the same name/domain/path identity. Other paths,
+                // opaque fields, and unrelated cookies retain their original bytes.
+                if headers.contains_key(http::header::SET_COOKIE) {
+                    let retained: Vec<_> = headers
+                        .get_all(http::header::SET_COOKIE)
+                        .iter()
+                        .filter(|header| {
+                            let previous = header
+                                .to_str()
+                                .ok()
+                                .and_then(|value| Cookie::parse(value).ok());
+                            !previous.is_some_and(|previous| {
+                                previous.name() == wire_name
+                                    && previous.path() == cookie.path()
+                                    && match (previous.domain(), cookie.domain()) {
+                                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                                        (None, None) => true,
+                                        _ => false,
+                                    }
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    headers.remove(http::header::SET_COOKIE);
+                    for header in retained {
+                        headers.append(http::header::SET_COOKIE, header);
+                    }
+                }
                 headers.append(http::header::SET_COOKIE, hv);
             }
         }
@@ -282,6 +414,7 @@ impl Response {
             #[cfg(not(feature = "cookie"))]
             headers,
             body,
+            version,
             extensions,
             ..
         } = self;
@@ -298,6 +431,7 @@ impl Response {
         *res.extensions_mut() = extensions;
         *res.headers_mut() = headers;
         *res.status_mut() = status_code;
+        *res.version_mut() = version;
 
         res
     }
@@ -312,6 +446,7 @@ impl Response {
         Self::flush_cookies_into(&mut self.headers, &mut self.cookies);
 
         let mut res = hyper::Response::new(std::mem::take(&mut self.body));
+        *res.version_mut() = self.version;
         *res.extensions_mut() = std::mem::take(&mut self.extensions);
         *res.headers_mut() = std::mem::take(&mut self.headers);
         if let Some(status) = self.status_code {
@@ -347,6 +482,24 @@ impl Response {
         self.body = body.into();
     }
 
+    /// Returns whether the cookie jar contains additions or removals that will
+    /// become `Set-Cookie` headers when this response is serialized.
+    ///
+    /// This does not inspect headers added directly to the response. It returns
+    /// `false` when the `cookie` feature is disabled.
+    #[inline]
+    #[must_use]
+    pub fn has_cookie_changes(&self) -> bool {
+        #[cfg(feature = "cookie")]
+        {
+            self.cookies.delta().next().is_some()
+        }
+        #[cfg(not(feature = "cookie"))]
+        {
+            false
+        }
+    }
+
     cfg_feature! {
         #![feature = "cookie"]
         /// Get cookies reference.
@@ -368,6 +521,12 @@ impl Response {
             self.cookies.get(name.as_ref())
         }
         /// Adds a cookie to the response.
+        ///
+        /// Valid cookie token names are sent verbatim, including percent signs;
+        /// values are percent-encoded. Use the original wire name when updating
+        /// a request cookie. Invalid application names retain legacy escaping.
+        /// An invalid name and its encoded spelling address the same wire
+        /// cookie; if both change in the same scope, the legal spelling wins.
         #[inline]
         pub fn add_cookie(&mut self, cookie: Cookie<'static>) -> &mut Self {
             self.cookies.add(cookie);
@@ -375,6 +534,7 @@ impl Response {
         }
 
         /// Removes a cookie from the response by name.
+        /// The name is the original wire identifier, without percent-decoding.
         ///
         /// Use [`Self::remove_cookie_with`] when the removal cookie must include
         /// the same path or domain as the cookie that was initially set.
@@ -648,6 +808,28 @@ mod test {
     use futures_util::stream::{StreamExt, iter};
 
     use super::*;
+
+    #[test]
+    fn unchanged_response_has_no_cookie_changes() {
+        assert!(!Response::new().has_cookie_changes());
+    }
+
+    #[cfg(feature = "cookie")]
+    #[test]
+    fn cookie_changes_track_additions_removals_and_serialization() {
+        let mut cookies = CookieJar::new();
+        cookies.add_original(Cookie::new("session", "original"));
+        let mut res = Response::with_cookies(cookies);
+        assert!(!res.has_cookie_changes());
+
+        res.add_cookie(Cookie::new("session", "updated"));
+        assert!(res.has_cookie_changes());
+        let _ = res.strip_to_hyper();
+        assert!(!res.has_cookie_changes());
+
+        res.remove_cookie("session");
+        assert!(res.has_cookie_changes());
+    }
 
     #[test]
     fn test_body_empty() {

@@ -1,0 +1,118 @@
+name: Dependency security
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.cargo/audit.toml'
+      - '.github/DEPENDENCY_SECURITY.md'
+      - '.github/scripts/audit_lockfile.py'
+      - '.github/scripts/test_audit_policy.py'
+      - '.github/workflows/security.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.cargo/audit.toml'
+      - '.github/DEPENDENCY_SECURITY.md'
+      - '.github/scripts/audit_lockfile.py'
+      - '.github/scripts/test_audit_policy.py'
+      - '.github/workflows/security.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  downstream-default-jwt:
+    name: Audit isolated default JWT dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@28bfb437c78d9b7ea8650351357e3eb8c0be2672 # cargo-audit
+        with:
+          tool: cargo-audit
+      - name: Verify the default JWT backend without feature unification
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture=$(mktemp -d)
+          mkdir "$fixture/src"
+          printf 'fn main() {}\n' > "$fixture/src/main.rs"
+          printf '[package]\nname = "downstream-default-jwt"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n[dependencies]\nsalvo-jwt-auth = { path = "%s/crates/jwt-auth" }\n' "$GITHUB_WORKSPACE" > "$fixture/Cargo.toml"
+          cargo generate-lockfile --manifest-path "$fixture/Cargo.toml"
+          python3 .github/scripts/audit_lockfile.py --file "$fixture/Cargo.lock" --evidence-dir audit-evidence/default-jwt
+      - name: Upload isolated JWT audit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: audit-default-jwt
+          path: audit-evidence/
+          if-no-files-found: warn
+
+  downstream-tls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Verify the rustls minimum without workspace dev dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture=$(mktemp -d)
+          mkdir "$fixture/src"
+          printf 'fn main() {}\n' > "$fixture/src/main.rs"
+          printf '[package]\nname = "downstream-tls"\nversion = "0.0.0"\nedition = "2024"\n[workspace]\n[dependencies]\nsalvo_core = { path = "%s/crates/core", default-features = false, features = ["rustls", "ring"] }\n' "$GITHUB_WORKSPACE" > "$fixture/Cargo.toml"
+          cargo generate-lockfile --manifest-path "$fixture/Cargo.toml"
+          if cargo update --manifest-path "$fixture/Cargo.toml" -p rustls --precise 0.23.40 > "$fixture/downgrade.log" 2>&1; then
+            echo 'A downstream TLS application unexpectedly accepted vulnerable rustls'
+            exit 1
+          fi
+          cat "$fixture/downgrade.log"
+          grep -F 'rustls = "^0.23.46"' "$fixture/downgrade.log"
+          cargo check --manifest-path "$fixture/Cargo.toml" --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: ['.', 'examples', 'fuzz']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@28bfb437c78d9b7ea8650351357e3eb8c0be2672 # cargo-audit
+        with:
+          tool: cargo-audit
+      - name: Verify audit findings remain non-blocking
+        run: python3 .github/scripts/test_audit_policy.py
+      - name: Remind maintainers to review the rsa advisory exception
+        run: |
+          python3 - <<'PY'
+          import datetime
+          if datetime.datetime.now(datetime.timezone.utc).date() > datetime.date(2027, 1, 23):
+              print('::warning file=.cargo/audit.toml::Review the rsa advisory exception; the review date has passed.')
+          PY
+      - name: Resolve dependencies
+        run: cargo generate-lockfile --manifest-path '${{ matrix.workspace }}/Cargo.toml'
+      - name: Audit dependencies (warnings only)
+        run: python3 .github/scripts/audit_lockfile.py --file '${{ matrix.workspace }}/Cargo.lock' --evidence-dir audit-evidence
+      - name: Upload dependency audit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: audit-workspace-${{ strategy.job-index }}
+          path: audit-evidence/
+          if-no-files-found: warn

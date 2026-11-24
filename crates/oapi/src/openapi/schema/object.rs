@@ -19,12 +19,20 @@ use crate::{Array, Deprecated, PropMap, RefOr, Schema, SchemaFormat, SchemaType,
 pub struct Object {
     /// Type of [`Object`] e.g. [`BasicType::Object`][crate::BasicType] for `object` and
     /// [`BasicType::String`][crate::BasicType] for `string` types.
-    #[serde(rename = "type", skip_serializing_if = "SchemaType::is_any_value")]
+    #[serde(
+        rename = "type",
+        default = "SchemaType::any",
+        skip_serializing_if = "SchemaType::is_any_value"
+    )]
     pub schema_type: SchemaType,
 
     /// Changes the [`Object`] name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// A human-readable title for the schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 
     /// Additional format for detailing the schema type.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,7 +43,12 @@ pub struct Object {
     pub description: Option<String>,
 
     /// Default value which is provided when user has not provided the input in Swagger UI.
-    #[serde(rename = "default", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::openapi::deserialize_json_value",
+        rename = "default",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_value: Option<Value>,
 
     /// Enum variants of fields that can be represented as `unit` type `enums`
@@ -160,6 +173,13 @@ pub struct Object {
 }
 
 impl Object {
+    /// Add or change the human-readable schema title.
+    #[must_use]
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
     /// Initialize a new [`Object`] with default [`SchemaType`]. This effectively same as calling
     /// `Object::with_type(SchemaType::Object)`.
     #[must_use]

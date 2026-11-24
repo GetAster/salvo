@@ -6,6 +6,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// This type preserves the distinction between integers and floating-point numbers,
 /// ensuring that integer values like `1` serialize as `1` rather than `1.0` in JSON output.
 ///
+/// Non-finite floating-point values are passed to the selected serializer.
+/// For example, `serde_json` encodes them as `null`, which this type rejects when
+/// deserializing. Non-finite values therefore do not round-trip through JSON.
+///
 /// # Examples
 ///
 /// ```
@@ -19,9 +23,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[derive(Clone, Debug)]
 pub enum Number {
     /// Signed integer value e.g. `1` or `-2`.
-    Int(isize),
+    Int(i64),
     /// Unsigned integer value e.g. `0`.
-    UInt(usize),
+    UInt(u64),
     /// Floating point number e.g. `1.34`.
     Float(f64),
 }
@@ -51,16 +55,16 @@ impl Serialize for Number {
         S: Serializer,
     {
         match self {
-            Self::Int(value) => serializer.serialize_i64(*value as i64),
-            Self::UInt(value) => serializer.serialize_u64(*value as u64),
+            Self::Int(value) => serializer.serialize_i64(*value),
+            Self::UInt(value) => serializer.serialize_u64(*value),
             Self::Float(value) => {
-                // Serialize whole floats as integers to avoid trailing `.0`
-                if value.fract() == 0.0 && value.is_finite() {
-                    if *value < 0.0 {
-                        serializer.serialize_i64(*value as i64)
-                    } else {
-                        serializer.serialize_u64(*value as u64)
-                    }
+                // Preserve whole floats without `.0` only when the conversion
+                // is exact. u64::MAX rounds up to 2^64 as f64, so its upper
+                // bound must be exclusive to avoid a saturating cast.
+                if value.fract() == 0.0 && *value < 0.0 && *value >= i64::MIN as f64 {
+                    serializer.serialize_i64(*value as i64)
+                } else if value.fract() == 0.0 && *value >= 0.0 && *value < u64::MAX as f64 {
+                    serializer.serialize_u64(*value as u64)
                 } else {
                     serializer.serialize_f64(*value)
                 }
@@ -82,14 +86,14 @@ impl<'de> Visitor<'de> for NumberVisitor {
     where
         E: de::Error,
     {
-        Ok(Number::Int(v as isize))
+        Ok(Number::Int(v))
     }
 
     fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
     where
         E: de::Error,
     {
-        Ok(Number::UInt(v as usize))
+        Ok(Number::UInt(v))
     }
 
     fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
@@ -124,9 +128,9 @@ macro_rules! impl_from_for_number {
 #[rustfmt::skip]
 impl_from_for_number!(
     f32 => Float as f64, f64 => Float,
-    i8 => Int as isize, i16 => Int as isize, i32 => Int as isize, i64 => Int as isize,
-    u8 => UInt as usize, u16 => UInt as usize, u32 => UInt as usize, u64 => UInt as usize,
-    isize => Int, usize => UInt
+    i8 => Int as i64, i16 => Int as i64, i32 => Int as i64, i64 => Int as i64,
+    u8 => UInt as u64, u16 => UInt as u64, u32 => UInt as u64, u64 => UInt as u64,
+    isize => Int as i64, usize => UInt as u64
 );
 
 #[cfg(test)]
@@ -168,6 +172,53 @@ mod tests {
     fn test_serialize_negative_whole_float() {
         let n = Number::Float(-3.0);
         assert_eq!(serde_json::to_string(&n).unwrap(), "-3");
+    }
+
+    #[test]
+    fn whole_floats_outside_integer_range_preserve_their_value() {
+        for value in [1e20, 1e30, -1e30, f64::MAX, -f64::MAX] {
+            let encoded = serde_json::to_string(&Number::Float(value)).unwrap();
+            let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert!(decoded.is_f64(), "{value}: {encoded}");
+            assert_eq!(decoded.as_f64(), Some(value), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn large_finite_floats_round_trip_as_numbers() {
+        for value in [1e20, 1e30, -1e30] {
+            let encoded = serde_json::to_string(&Number::Float(value)).unwrap();
+            let decoded: Number = serde_json::from_str(&encoded).unwrap();
+            assert!(matches!(decoded, Number::Float(restored) if restored == value));
+        }
+    }
+
+    #[test]
+    fn non_finite_json_serialization_is_not_a_number_round_trip() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let encoded = serde_json::to_string(&Number::Float(value)).unwrap();
+            assert_eq!(encoded, "null");
+            assert!(serde_json::from_str::<Number>(&encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn whole_float_integer_boundaries_do_not_saturate() {
+        let min = i64::MIN as f64;
+        let unsigned_end = u64::MAX as f64; // Rounds to 2^64, outside u64.
+        for (value, floating) in [
+            (min, false),
+            (f64::from_bits(min.to_bits() + 1), true),
+            (-(min), false),
+            (f64::from_bits(unsigned_end.to_bits() - 1), false),
+            (unsigned_end, true),
+            (f64::from_bits(unsigned_end.to_bits() + 1), true),
+        ] {
+            let encoded = serde_json::to_string(&Number::Float(value)).unwrap();
+            let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.is_f64(), floating, "{value}: {encoded}");
+            assert_eq!(decoded.as_f64(), Some(value), "{encoded}");
+        }
     }
 
     #[test]

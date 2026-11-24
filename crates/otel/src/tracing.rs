@@ -1,10 +1,10 @@
+use std::collections::HashSet;
 use std::fmt::{self, Debug, Formatter};
 
 use opentelemetry::trace::{FutureExt, Span, SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_http::HeaderExtractor;
 use opentelemetry_semantic_conventions::attribute;
-use salvo_core::http::headers::{HeaderMap, HeaderName, HeaderValue};
 use salvo_core::prelude::*;
 
 use crate::semconv::{self, KnownMethods, OTHER};
@@ -17,24 +17,28 @@ const OTHER_METHOD_SPAN_NAME: &str = "HTTP";
 ///
 /// The span is named `{method} {route}` — `GET /users/{id}` — falling back to
 /// the method alone when no route matched, and carries `http.request.method`,
-/// `url.path`, `url.query`, `url.scheme`, `http.route`, `client.address`,
+/// `url.path`, `url.scheme`, `http.route`, `client.address`,
 /// `client.port`, `network.protocol.version`, `http.response.status_code`,
 /// `http.response.body.size` and, for a server error, `error.type`.
 ///
-/// The request target is reported split into `url.path` and `url.query` rather
-/// than as one `url.full`, and the query has the values of well-known
-/// credential-bearing keys (`sig`, `Signature`, `AWSAccessKeyId`,
-/// `X-Goog-Signature`) replaced with `REDACTED`, as the conventions require.
+/// Query strings are omitted by default. Use [`Self::query_fields`] to
+/// explicitly allow non-sensitive query fields in `url.query`. The full URL
+/// is never recorded.
 ///
 /// `http.route` requires the `matched-path` feature, which is enabled by
 /// default. Through the `salvo` crate, enable its own `matched-path` feature
 /// (also on by default) to turn this one on. A request that matched no route
 /// carries no `http.route` and is named for its method alone.
 ///
+/// Response attributes and the span end are recorded after Service finishes
+/// middleware and catchers, before network transmission. Streaming and transport
+/// completion are not included. Direct Handler calls finish after `call_next`.
+///
 /// [HTTP semantic conventions]: https://opentelemetry.io/docs/specs/semconv/http/http-spans/
 pub struct Tracing<T> {
     tracer: T,
     known_methods: Option<KnownMethods>,
+    query_fields: HashSet<String>,
 }
 
 impl<T> Tracing<T> {
@@ -43,7 +47,33 @@ impl<T> Tracing<T> {
         Self {
             tracer,
             known_methods: None,
+            query_fields: HashSet::new(),
         }
+    }
+
+    /// Records only these non-sensitive query fields in `url.query`.
+    ///
+    /// Query strings are omitted by default. This replaces the previous allowlist;
+    /// an empty list disables query recording. Names are matched case-sensitively
+    /// after percent decoding and converting `+` to a space. Unlisted fields are
+    /// omitted entirely, and repeated listed fields retain their order and encoding.
+    /// The signature fields `sig`, `Signature`, `AWSAccessKeyId`, and
+    /// `X-Goog-Signature` remain redacted even if explicitly listed.
+    ///
+    /// Only list fields whose values are safe to export. For example, use
+    /// `.query_fields(["page", "sort"])`; never list tokens, passwords,
+    /// OAuth authorization codes, or application-specific credentials.
+    #[must_use]
+    pub fn query_fields<I, S>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.query_fields = fields
+            .into_iter()
+            .map(|field| field.as_ref().to_owned())
+            .collect();
+        self
     }
 
     /// Replaces the set of methods reported verbatim in `http.request.method`.
@@ -92,27 +122,10 @@ where
         res: &mut Response,
         ctrl: &mut FlowCtrl,
     ) {
-        // TODO: Will remove after opentelemetry_http updated
-        let mut headers = HeaderMap::with_capacity(req.headers().len());
-        for (name, value) in req.headers() {
-            // The names/values come from a `HeaderMap`, so they were already
-            // valid for `HeaderName`/`HeaderValue`. Skip silently in the
-            // unlikely event that round-tripping through bytes fails — losing
-            // a propagated header is preferable to panicking the request task.
-            let Ok(name) = HeaderName::from_bytes(name.as_ref()) else {
-                continue;
-            };
-            let Ok(value) = HeaderValue::from_bytes(value.as_ref()) else {
-                continue;
-            };
-            // Use `append` so multi-value headers (e.g. `baggage`) keep all
-            // their values; `insert` would collapse them to the last one and
-            // produce an incomplete parent context for `HeaderExtractor`.
-            headers.append(name, value);
-        }
-
         let parent_cx = global::get_text_map_propagator(|propagator| {
-            propagator.extract(&HeaderExtractor(&headers))
+            // Both crates now use http 1.x. Borrow the original map, including
+            // repeated baggage values, without copying unrelated credentials.
+            propagator.extract(&HeaderExtractor(req.headers()))
         });
 
         let mut attributes = Vec::with_capacity(10);
@@ -139,11 +152,11 @@ where
             attribute::URL_PATH,
             req.uri().path().to_owned(),
         ));
-        if let Some(query) = req.uri().query() {
-            attributes.push(KeyValue::new(
-                attribute::URL_QUERY,
-                semconv::redact_query(query).into_owned(),
-            ));
+        if !self.query_fields.is_empty()
+            && let Some(query) = req.uri().query()
+            && let Some(query) = semconv::allowed_query(query, &self.query_fields)
+        {
+            attributes.push(KeyValue::new(attribute::URL_QUERY, query));
         }
         attributes.push(KeyValue::new(
             attribute::URL_SCHEME,
@@ -184,10 +197,11 @@ where
 
         span.add_event("request.started".to_owned(), vec![]);
 
-        async move {
-            ctrl.call_next(req, depot, res).await;
-            let cx = Context::current();
-            let span = cx.span();
+        let cx = Context::current_with_span(span);
+        let final_cx = cx.clone();
+        let request_method = req.method().clone();
+        let observe = move |res: &Response| {
+            let span = final_cx.span();
 
             let status = res.status_code.unwrap_or_else(|| {
                 tracing::info!("[otel::Tracing] Treat status_code=none as 200(OK)");
@@ -203,7 +217,7 @@ where
                 attribute::HTTP_RESPONSE_STATUS_CODE,
                 i64::from(status.as_u16()),
             ));
-            if let Some(size) = semconv::final_body_size(req, res, status) {
+            if let Some(size) = semconv::final_body_size(&request_method, res, status) {
                 span.set_attribute(KeyValue::new(
                     attribute::HTTP_RESPONSE_BODY_SIZE,
                     size as i64,
@@ -219,8 +233,16 @@ where
                 // The HTTP status code already describes the failure.
                 span.set_status(Status::error(""));
             }
+            span.end();
+        };
+        let fallback = req.try_on_response(observe).err();
+        async move {
+            ctrl.call_next(req, depot, res).await;
+            if let Some(observe) = fallback {
+                observe(res);
+            }
         }
-        .with_context(Context::current_with_span(span))
+        .with_context(cx)
         .await
     }
 }

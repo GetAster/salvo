@@ -8,6 +8,10 @@ use crate::extract::{Extractible, Metadata};
 use crate::http::{ParseError, Request};
 
 /// Extracts a parameter from a request header.
+///
+/// Sequence types use comma-separated elements, combining repeated header lines
+/// in their original order. Scalar strings retain commas. This matches the
+/// default OpenAPI `Simple` encoding for header parameters.
 pub struct HeaderParam<T, const REQUIRED: bool = true>(Option<T>);
 impl<T> HeaderParam<T, true> {
     /// Consumes self and returns the value of the parameter.
@@ -111,12 +115,17 @@ where
         _depot: &'ex mut Depot,
         arg: &str,
     ) -> Result<Self, ParseError> {
-        let value = req.header(arg).ok_or_else(|| {
+        if !req.headers().contains_key(arg) {
+            return Err(ParseError::other(format!(
+                "header parameter {arg} not found"
+            )));
+        }
+        let value = req.header::<T>(arg).ok_or_else(|| {
             ParseError::other(format!(
                 "header parameter {arg} not found or convert to type failed"
             ))
         })?;
-        Ok(Self(value))
+        Ok(Self(Some(value)))
     }
 }
 
@@ -138,7 +147,11 @@ where
         _depot: &'ex mut Depot,
         arg: &str,
     ) -> Result<Self, ParseError> {
-        Ok(Self(req.header(arg)))
+        Ok(Self(if req.headers().contains_key(arg) {
+            req.header(arg)
+        } else {
+            None
+        }))
     }
 }
 
@@ -231,15 +244,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic]
-    async fn test_required_header_param_extract_with_value_panic() {
+    async fn test_required_header_param_extract_missing_value_returns_error() {
         let req = TestClient::get("http://127.0.0.1:5801").build_hyper();
         let schema = req.uri().scheme().cloned().unwrap();
         let mut req = Request::from_hyper(req, schema);
         let mut depot = Depot::new();
         let result =
             HeaderParam::<String, true>::extract_with_arg(&mut req, &mut depot, "param").await;
-        assert_eq!(result.unwrap().0.unwrap(), "param");
+        assert!(result.is_err());
     }
 
     #[test]

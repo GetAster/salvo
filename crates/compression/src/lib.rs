@@ -5,6 +5,11 @@
 //!
 //! This middleware automatically compresses HTTP responses using various algorithms,
 //! reducing bandwidth usage and improving load times for clients.
+//! Responses with status `206 Partial Content` or a `Content-Range` header are
+//! preserved because their byte offsets refer to the original representation.
+//! Strong ETags are weakened when compression changes the representation bytes.
+//! Requests and responses with `Cache-Control: no-transform` are preserved,
+//! including when this middleware wraps a proxy forwarding an origin response.
 //!
 //! # Supported Algorithms
 //!
@@ -62,9 +67,15 @@
 //!
 //! Small responses may not benefit from compression. Use `.min_length(bytes)`
 //! to skip compression for responses smaller than the specified size.
+//! This is an optimization, not permission to send an explicitly rejected
+//! identity representation. If identity is forbidden, eligible small bodies
+//! are encoded; when no acceptable representation can be supplied the response
+//! is `406 Not Acceptable`. Transformed digest fields are removed, including
+//! their trailer declarations, because they describe different bytes.
 //!
 //! Read more: <https://salvo.rs>
 
+use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 use std::sync::LazyLock;
@@ -72,7 +83,8 @@ use std::sync::LazyLock;
 use indexmap::IndexMap;
 use salvo_core::http::body::ResBody;
 use salvo_core::http::header::{
-    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue,
+    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    ETAG, HeaderValue,
 };
 use salvo_core::http::headers::{ContentLength, HeaderMapExt};
 use salvo_core::http::{self, Method, Mime, StatusCode, append_vary_header, mime};
@@ -371,8 +383,11 @@ impl Compression {
     fn negotiate(
         &self,
         req: &Request,
-        res: &Response,
+        res: &mut Response,
     ) -> Option<(CompressionAlgo, CompressionLevel)> {
+        if self.algos.is_empty() {
+            return None;
+        }
         if !self.content_types.is_empty() {
             let content_type = res
                 .headers()
@@ -393,19 +408,40 @@ impl Compression {
                 return None;
             }
         }
-        let header = req
+        // Identity is also a negotiated representation. Mark it before looking
+        // at the request's preferences so caches do not reuse it across encodings.
+        append_vary_header(res.headers_mut(), "accept-encoding");
+        self.negotiate_encoding(req)
+    }
+
+    fn negotiate_encoding(&self, req: &Request) -> Option<(CompressionAlgo, CompressionLevel)> {
+        // List-valued fields can be split across multiple field lines. Keep
+        // the single-field path borrowed and combine all preferences before
+        // sorting, rather than negotiating from only the first field.
+        let mut header = Cow::Borrowed("");
+        for value in req
             .headers()
-            .get(ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok())?;
+            .get_all(ACCEPT_ENCODING)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+        {
+            if header.is_empty() {
+                header = Cow::Borrowed(value);
+            } else {
+                let combined = header.to_mut();
+                combined.push(',');
+                combined.push_str(value);
+            }
+        }
 
-        let accept_list = http::parse_accept_encoding(header);
+        let accept_list = http::parse_accept_encoding_with_quality(&header);
 
-        // `parse_accept_encoding` sorts entries by descending q-value, so the
+        // Encoding preferences are sorted by descending q-value, so the
         // first wildcard token is also the one with the highest q. Mirror the
         // original `.find(...)` semantics rather than overwriting `wildcard_q`
         // on every iteration — see https://github.com/salvo-rs/salvo/pull/1489
         // for the multi-wildcard regression this guards against.
-        let wildcard_q: Option<u8> = accept_list
+        let wildcard_q: Option<u16> = accept_list
             .iter()
             .find(|(name, _)| name == "*")
             .map(|(_, q)| *q);
@@ -414,8 +450,8 @@ impl Compression {
         // that do not name a known compression algorithm. The lookups below
         // (`is_accepted` / `is_rejected` / client-preference) then never have
         // to call `.parse::<CompressionAlgo>()` again. Entries keep the order
-        // produced by `parse_accept_encoding` (descending q-value).
-        let parsed: smallvec::SmallVec<[(CompressionAlgo, u8); 4]> = accept_list
+        // produced by the parser (descending q-value).
+        let parsed: smallvec::SmallVec<[(CompressionAlgo, u16); 4]> = accept_list
             .iter()
             .filter(|(name, _)| name != "*")
             .filter_map(|(name, q)| name.parse::<CompressionAlgo>().ok().map(|algo| (algo, *q)))
@@ -435,44 +471,113 @@ impl Compression {
                 })
                 .map(|(algo, level)| (*algo, *level))
         } else {
-            // Client preference: pick the highest q-value algo the server supports.
-            let result = parsed
+            // Compare explicitly listed algorithms with those accepted by `*`.
+            // A wildcard only matches algorithms not explicitly listed, even
+            // when the explicit quality is lower than the wildcard's quality.
+            let explicit = parsed
                 .iter()
                 .filter(|(_, q)| *q > 0)
-                .find_map(|(algo, _)| self.algos.get(algo).map(|level| (*algo, *level)));
-
-            if result.is_some() {
-                return result;
-            }
-
-            // Wildcard `*`: use the server's top algo that is not explicitly rejected.
-            if wildcard_q.is_some_and(|q| q > 0) {
+                .find_map(|(algo, q)| self.algos.get(algo).map(|level| (*algo, *level, *q)));
+            let wildcard = wildcard_q.filter(|q| *q > 0).and_then(|q| {
                 self.algos
                     .iter()
-                    .find(|(algo, _)| !is_rejected(algo))
-                    .map(|(algo, level)| (*algo, *level))
-            } else {
-                None
-            }
+                    .find(|(algo, _)| !parsed.iter().any(|(listed, _)| listed == *algo))
+                    .map(|(algo, level)| (*algo, *level, q))
+            });
+            // Preserve the explicit client order on equal qualities, and the
+            // server order among algorithms covered only by the wildcard.
+            let selected = match (explicit, wildcard) {
+                (Some(explicit), Some(wildcard)) if wildcard.2 > explicit.2 => Some(wildcard),
+                (Some(explicit), _) => Some(explicit),
+                (None, wildcard) => wildcard,
+            };
+            // An explicitly preferred identity representation must participate in
+            // client-priority negotiation too. Preserve codec preference on ties.
+            let identity_q = accept_list
+                .iter()
+                .find(|(name, _)| name == "identity")
+                .map(|(_, q)| *q);
+            selected
+                .filter(|(_, _, q)| !identity_q.is_some_and(|identity| identity > *q))
+                .map(|(algo, level, _)| (algo, level))
         }
     }
 }
 
-#[async_trait]
-impl Handler for Compression {
-    async fn handle(
-        &self,
-        req: &mut Request,
-        depot: &mut Depot,
-        res: &mut Response,
-        ctrl: &mut FlowCtrl,
-    ) {
-        ctrl.call_next(req, depot, res).await;
-        if ctrl.is_ceased() || res.headers().contains_key(CONTENT_ENCODING) {
+impl Compression {
+    fn compress_response(&self, req: &Request, res: &mut Response, ceased: bool, finalized: bool) {
+        // Informational, 204 and 205 responses have no representation body to
+        // negotiate. In particular identity;q=0 must not turn them into 406.
+        if res.status_code.is_some_and(|status| {
+            status.is_informational()
+                || matches!(status, StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT)
+        }) {
+            return;
+        }
+        // Even an identity response below the size threshold (or protected by
+        // no-transform/range) can become encoded or 406 when identity is rejected.
+        // Mark that dependency before any identity-preserving early return.
+        if !ceased
+            && !res.headers().contains_key(CONTENT_ENCODING)
+            && res.status_code != Some(StatusCode::NOT_MODIFIED)
+        {
+            append_vary_header(res.headers_mut(), "accept-encoding");
+        }
+        // A range describes bytes of the selected representation. Re-encoding its
+        // body would invalidate those offsets, including representation headers
+        // synthesized for HEAD. Leave the body and headers together untouched.
+        if ceased
+            || no_transform(req.headers())
+            || no_transform(res.headers())
+            || res.headers().contains_key(CONTENT_ENCODING)
+            || res.headers().contains_key(CONTENT_RANGE)
+            || res.status_code == Some(StatusCode::PARTIAL_CONTENT)
+        {
+            if !ceased
+                && !res.headers().contains_key(CONTENT_ENCODING)
+                && !matches!(
+                    res.status_code,
+                    Some(
+                        StatusCode::SWITCHING_PROTOCOLS
+                            | StatusCode::NO_CONTENT
+                            | StatusCode::NOT_MODIFIED
+                    )
+                )
+                && !identity_acceptable(req)
+            {
+                self.reject_encoding(res, finalized);
+            }
             return;
         }
 
         if let Some(StatusCode::SWITCHING_PROTOCOLS | StatusCode::NO_CONTENT) = res.status_code {
+            return;
+        }
+
+        let force_encoding = !identity_acceptable(req);
+        if force_encoding
+            && res.status_code != Some(StatusCode::NOT_MODIFIED)
+            && self.negotiate(req, res).is_none()
+        {
+            self.reject_encoding(res, finalized);
+            return;
+        }
+
+        if res.status_code == Some(StatusCode::NOT_MODIFIED) {
+            // A 304 can update a previously compressed cache entry even though
+            // it has no body or content type to negotiate here. Do not upgrade
+            // that entry's weak validator back to the original strong one.
+            let encoding = if res.headers().contains_key(CONTENT_TYPE) {
+                self.negotiate(req, res)
+            } else {
+                self.negotiate_encoding(req)
+            };
+            if encoding.is_some() && (force_encoding || !self.content_length_is_below_minimum(res))
+            {
+                weaken_etag(res);
+                strip_digests(res.headers_mut());
+            }
+            append_vary_header(res.headers_mut(), "accept-encoding");
             return;
         }
 
@@ -484,10 +589,10 @@ impl Handler for Compression {
                 if req.method() != Method::HEAD {
                     return;
                 }
-                if res.headers().typed_get::<ContentLength>().is_none() {
+                if !force_encoding && res.headers().typed_get::<ContentLength>().is_none() {
                     return;
                 }
-                if self.content_length_is_below_minimum(res) {
+                if !force_encoding && self.content_length_is_below_minimum(res) {
                     return;
                 }
                 if let Some((algo, _level)) = self.negotiate(req, res) {
@@ -497,7 +602,7 @@ impl Handler for Compression {
                 }
             }
             ResBody::Once(bytes) => {
-                if self.min_length > 0 && bytes.len() < self.min_length {
+                if !force_encoding && self.min_length > 0 && bytes.len() < self.min_length {
                     res.body(ResBody::Once(bytes));
                     return;
                 }
@@ -510,7 +615,7 @@ impl Handler for Compression {
                 }
             }
             ResBody::Chunks(chunks) => {
-                if self.min_length > 0 {
+                if !force_encoding && self.min_length > 0 {
                     let len: usize = chunks.iter().map(|c| c.len()).sum();
                     if len < self.min_length {
                         res.body(ResBody::Chunks(chunks));
@@ -526,7 +631,7 @@ impl Handler for Compression {
                 }
             }
             ResBody::Hyper(body) => {
-                if self.content_length_is_below_minimum(res) {
+                if !force_encoding && self.content_length_is_below_minimum(res) {
                     res.body(ResBody::Hyper(body));
                     return;
                 }
@@ -540,7 +645,7 @@ impl Handler for Compression {
             }
             ResBody::Stream(body) => {
                 let body = body.into_inner();
-                if self.content_length_is_below_minimum(res) {
+                if !force_encoding && self.content_length_is_below_minimum(res) {
                     res.body(ResBody::stream(body));
                     return;
                 }
@@ -552,13 +657,181 @@ impl Handler for Compression {
                     return;
                 }
             }
+            body @ (ResBody::Boxed(_) | ResBody::Channel(_)) => {
+                if !force_encoding && self.content_length_is_below_minimum(res) {
+                    res.body(body);
+                    return;
+                }
+                if let Some((algo, level)) = self.negotiate(req, res) {
+                    res.stream(EncodeStream::new(algo, level, body));
+                    res.headers_mut().insert(CONTENT_ENCODING, algo.into());
+                } else {
+                    res.body(body);
+                    return;
+                }
+            }
             body => {
                 res.body(body);
                 return;
             }
         }
         res.headers_mut().remove(CONTENT_LENGTH);
+        strip_digests(res.headers_mut());
+        weaken_etag(res);
+    }
+
+    fn defer_compression(&self, res: &mut Response) {
+        let compression = self.clone();
+        res.after_response_hook(move |req, res| {
+            // A catcher may deliberately leave an error bodyless. HEAD can also
+            // reach this stage without rendering an error representation.
+            if res.body.is_none() || res.body.is_error() {
+                return;
+            }
+            compression.compress_response(req, res, false, true);
+        });
+    }
+
+    fn reject_encoding(&self, res: &mut Response, finalized: bool) {
+        strip_digests(res.headers_mut());
+        res.render(salvo_core::http::StatusError::not_acceptable());
         append_vary_header(res.headers_mut(), "accept-encoding");
+        if finalized {
+            // The catcher already ran. Do not recursively render another error
+            // page using the identity representation the client prohibited.
+            res.body(ResBody::None);
+            for name in [
+                CONTENT_LENGTH,
+                CONTENT_TYPE,
+                CONTENT_ENCODING,
+                CONTENT_RANGE,
+                ETAG,
+            ] {
+                res.headers_mut().remove(name);
+            }
+        } else {
+            self.defer_compression(res);
+        }
+    }
+}
+
+#[async_trait]
+impl Handler for Compression {
+    async fn handle(
+        &self,
+        req: &mut Request,
+        depot: &mut Depot,
+        res: &mut Response,
+        ctrl: &mut FlowCtrl,
+    ) {
+        ctrl.call_next(req, depot, res).await;
+        if !ctrl.is_ceased()
+            && (res.body.is_error()
+                || (res.body.is_none()
+                    && res.status_code.is_some_and(|status| {
+                        status.is_client_error() || status.is_server_error()
+                    })))
+        {
+            self.defer_compression(res);
+        } else {
+            self.compress_response(req, res, ctrl.is_ceased(), false);
+        }
+    }
+}
+
+fn identity_acceptable(req: &Request) -> bool {
+    let mut preferences = Vec::new();
+    for value in req.headers().get_all(ACCEPT_ENCODING) {
+        if let Ok(value) = value.to_str() {
+            preferences.extend(http::parse_accept_encoding_with_quality(value));
+        }
+    }
+    let quality = |name| {
+        preferences
+            .iter()
+            .filter(|(coding, _)| coding == name)
+            .map(|(_, quality)| *quality)
+            .max()
+    };
+    quality("identity").map_or(quality("*") != Some(0), |quality| quality > 0)
+}
+
+fn strip_digests(headers: &mut http::HeaderMap) {
+    const DIGESTS: [&str; 4] = ["content-digest", "repr-digest", "content-md5", "digest"];
+    for name in DIGESTS {
+        headers.remove(name);
+    }
+    let names: Vec<_> = headers
+        .get_all("trailer")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| {
+            !DIGESTS
+                .iter()
+                .any(|digest| name.eq_ignore_ascii_case(digest))
+        })
+        .filter(|name| !name.is_empty())
+        .collect();
+    let declaration = names.join(", ");
+    headers.remove("trailer");
+    if !declaration.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&declaration) {
+            headers.insert("trailer", value);
+        }
+    }
+}
+
+fn no_transform(headers: &http::HeaderMap) -> bool {
+    headers.get_all(CACHE_CONTROL).iter().any(|value| {
+        // Extension directive values can contain commas and escaped quotes.
+        // Quoted strings also permit obs-text, so scan bytes rather than reject
+        // an entire field value because an extension is not ASCII text.
+        // Only a directive name outside a quoted value can prohibit a transform.
+        let mut quoted = false;
+        let mut escaped = false;
+        value
+            .as_bytes()
+            .split(|&byte| {
+                if escaped {
+                    escaped = false;
+                } else if quoted && byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = !quoted;
+                } else if !quoted && byte == b',' {
+                    return true;
+                }
+                false
+            })
+            .any(|mut directive| {
+                // HTTP optional whitespace consists only of SP and HTAB.
+                while matches!(directive.first(), Some(b' ' | b'\t')) {
+                    directive = &directive[1..];
+                }
+                while matches!(directive.last(), Some(b' ' | b'\t')) {
+                    directive = &directive[..directive.len() - 1];
+                }
+                directive.eq_ignore_ascii_case(b"no-transform")
+            })
+    })
+}
+
+fn weaken_etag(res: &mut Response) {
+    // Compression preserves semantic equivalence, but not byte equality.
+    // An encoded response must not authorize If-Range against the original
+    // representation's strong validator.
+    if let Some(etag) = res.headers_mut().get_mut(ETAG)
+        && !etag.as_bytes().starts_with(b"W/")
+    {
+        let mut weak = Vec::with_capacity(etag.as_bytes().len() + 2);
+        weak.extend_from_slice(b"W/");
+        weak.extend_from_slice(etag.as_bytes());
+        let sensitive = etag.is_sensitive();
+        *etag = HeaderValue::from_bytes(&weak)
+            .expect("prefixing a valid header value with W/ remains valid");
+        etag.set_sensitive(sensitive);
     }
 }
 
@@ -569,6 +842,431 @@ mod tests {
     use salvo_core::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[cfg(all(feature = "gzip", feature = "brotli"))]
+    #[tokio::test]
+    async fn encoding_negotiation_preserves_three_decimal_quality_values() {
+        #[handler]
+        async fn hello(res: &mut Response) {
+            res.render("a response whose representation is selected by Accept-Encoding");
+        }
+        let compression = Compression::new()
+            .disable_all()
+            .enable_gzip(CompressionLevel::Default)
+            .enable_brotli(CompressionLevel::Default)
+            .min_length(0);
+        let service = Service::new(Router::with_hoop(compression).get(hello));
+        for (accept, expected) in [
+            ("gzip;q=0.001, identity;q=0", Some("gzip")),
+            ("gzip;q=0.101, br;q=0.109", Some("br")),
+            ("gzip;q=0.101, *;q=0.109", Some("br")),
+            ("gzip;q=0.109, *;q=0.101", Some("gzip")),
+            ("gzip;q=0, br;q=0", None),
+            ("gzip;q=1, br;q=0.999", Some("gzip")),
+        ] {
+            let response = TestClient::get("http://localhost/")
+                .add_header(ACCEPT_ENCODING, accept, true)
+                .send(&service)
+                .await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_ENCODING)
+                    .map(|value| value.to_str().unwrap()),
+                expected,
+                "{accept}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "gzip", feature = "brotli"))]
+    #[tokio::test]
+    async fn repeated_accept_encoding_fields_match_the_combined_value() {
+        #[handler]
+        async fn hello(res: &mut Response) {
+            res.render("a response whose representation is selected by Accept-Encoding");
+        }
+        let service = Service::new(Router::with_hoop(Compression::new().min_length(0)).get(hello));
+        for (first, second, expected) in [
+            ("gzip;q=0.2", "br;q=1", "br"),
+            ("unknown", "gzip", "gzip"),
+            ("", "gzip", "gzip"),
+            ("gzip;q=0", "br", "br"),
+        ] {
+            let combined = TestClient::get("http://localhost/")
+                .add_header(ACCEPT_ENCODING, format!("{first},{second}"), true)
+                .send(&service)
+                .await;
+            let split = TestClient::get("http://localhost/")
+                .add_header(ACCEPT_ENCODING, first, false)
+                .add_header(ACCEPT_ENCODING, second, false)
+                .send(&service)
+                .await;
+            assert_eq!(combined.headers().get(CONTENT_ENCODING).unwrap(), expected);
+            assert_eq!(
+                split.headers().get(CONTENT_ENCODING),
+                combined.headers().get(CONTENT_ENCODING),
+                "split fields {first:?} and {second:?} must preserve negotiation"
+            );
+        }
+    }
+
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn encoded_file_validators_cannot_resume_identity_bytes() {
+        use salvo_core::fs::NamedFile;
+
+        #[handler]
+        async fn serve(req: &mut Request, res: &mut Response) {
+            let file = NamedFile::builder(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+                .content_type(mime::TEXT_PLAIN)
+                .preload_threshold(req.query::<u64>("preload").unwrap())
+                .build()
+                .await
+                .unwrap();
+            if req.method() == Method::HEAD {
+                file.send_head(req.headers(), res).await;
+            } else {
+                file.send(req.headers(), res).await;
+            }
+        }
+        let service = Service::new(Router::with_hoop(Compression::new().min_length(1)).goal(serve));
+        for preload in [0, u64::MAX] {
+            let url = format!("http://localhost/?preload={preload}");
+            let identity = TestClient::get(&url).send(&service).await;
+            let strong = identity.headers()[ETAG].to_str().unwrap();
+            assert!(!strong.starts_with("W/"));
+            let weak = format!("W/{strong}");
+            for head in [false, true] {
+                let request = if head {
+                    TestClient::head(&url)
+                } else {
+                    TestClient::get(&url)
+                };
+                let response = request
+                    .add_header(ACCEPT_ENCODING, "gzip", true)
+                    .send(&service)
+                    .await;
+                assert_eq!(response.headers()[ETAG], weak);
+                assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
+            }
+            let mut resumed = TestClient::get(&url)
+                .add_header(ACCEPT_ENCODING, "gzip", true)
+                .add_header("range", "bytes=20-", true)
+                .add_header("if-range", &weak, true)
+                .send(&service)
+                .await;
+            assert_eq!(resumed.status_code, Some(StatusCode::OK));
+            assert!(!resumed.headers().contains_key(CONTENT_RANGE));
+            assert_eq!(resumed.headers()[CONTENT_ENCODING], "gzip");
+            assert_eq!(
+                resumed.take_string().await.unwrap(),
+                include_str!("../Cargo.toml")
+            );
+
+            let cached = TestClient::get(&url)
+                .add_header(ACCEPT_ENCODING, "gzip", true)
+                .add_header("if-none-match", &weak, true)
+                .send(&service)
+                .await;
+            assert_eq!(cached.status_code, Some(StatusCode::NOT_MODIFIED));
+            assert_eq!(cached.headers()[ETAG], weak);
+
+            for encoding in ["identity", "gzip;q=0", "unsupported"] {
+                let cached = TestClient::get(&url)
+                    .add_header(ACCEPT_ENCODING, encoding, true)
+                    .add_header("if-none-match", strong, true)
+                    .send(&service)
+                    .await;
+                assert_eq!(cached.status_code, Some(StatusCode::NOT_MODIFIED));
+                assert_eq!(cached.headers()[ETAG], strong);
+            }
+            let cached = TestClient::get(&url)
+                .add_header("if-none-match", strong, true)
+                .send(&service)
+                .await;
+            assert_eq!(cached.status_code, Some(StatusCode::NOT_MODIFIED));
+            assert_eq!(cached.headers()[ETAG], strong);
+
+            let partial = TestClient::get(&url)
+                .add_header("range", "bytes=0-19", true)
+                .add_header("if-range", strong, true)
+                .send(&service)
+                .await;
+            assert_eq!(partial.status_code, Some(StatusCode::PARTIAL_CONTENT));
+            assert_eq!(partial.headers()[ETAG], strong);
+        }
+    }
+
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn existing_weak_etag_is_not_weakened_twice() {
+        #[handler]
+        async fn weak(res: &mut Response) {
+            res.add_header(ETAG, "W/\"version\"", true).unwrap();
+            res.render("hello");
+        }
+        let response = TestClient::get("http://localhost/")
+            .add_header(ACCEPT_ENCODING, "gzip", true)
+            .send(Router::with_hoop(Compression::new().min_length(1)).get(weak))
+            .await;
+        assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
+        assert_eq!(response.headers()[ETAG], "W/\"version\"");
+    }
+
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn not_modified_without_content_type_preserves_weak_cache_validation() {
+        #[handler]
+        async fn unchanged(req: &mut Request, res: &mut Response) {
+            res.status_code(StatusCode::NOT_MODIFIED);
+            res.add_header(ETAG, "\"version\"", true).unwrap();
+            if req.query::<String>("kind").as_deref() == Some("small") {
+                res.add_header(CONTENT_LENGTH, "1", true).unwrap();
+            }
+            if req.query::<String>("kind").as_deref() == Some("binary") {
+                res.add_header(CONTENT_TYPE, "application/octet-stream", true)
+                    .unwrap();
+            }
+        }
+        let service = Service::new(Router::with_hoop(Compression::new()).goal(unchanged));
+        let response = TestClient::get("http://localhost/")
+            .add_header(ACCEPT_ENCODING, "gzip", true)
+            .add_header("if-none-match", "W/\"version\"", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
+        assert_eq!(response.headers()[ETAG], "W/\"version\"");
+        assert_eq!(response.headers()[VARY], "accept-encoding");
+        assert!(!response.headers().contains_key(CONTENT_ENCODING));
+        for path in ["small", "binary"] {
+            let response = TestClient::get(format!("http://localhost/?kind={path}"))
+                .add_header(ACCEPT_ENCODING, "gzip", true)
+                .send(&service)
+                .await;
+            assert_eq!(response.headers()[ETAG], "\"version\"");
+        }
+    }
+
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn named_file_ranges_preserve_representation_bytes() {
+        use salvo_core::fs::NamedFile;
+
+        #[handler]
+        async fn serve_file(req: &mut Request, res: &mut Response) {
+            let file = NamedFile::builder(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+                .content_type(mime::TEXT_PLAIN)
+                .preload_threshold(req.query::<u64>("preload").unwrap())
+                .build()
+                .await
+                .unwrap();
+            if req.method() == Method::HEAD {
+                file.send_head(req.headers(), res).await;
+            } else {
+                file.send(req.headers(), res).await;
+            }
+        }
+
+        let service =
+            Service::new(Router::with_hoop(Compression::new().min_length(1)).goal(serve_file));
+        let original = include_bytes!("../Cargo.toml");
+        // Cover the preloaded and streaming NamedFile paths.
+        for preload in [0, u64::MAX] {
+            let url = format!("http://localhost/?preload={preload}");
+            for (head, encoding) in [(false, "gzip"), (true, "identity"), (true, "gzip")] {
+                let request = if head {
+                    TestClient::head(&url)
+                } else {
+                    TestClient::get(&url)
+                };
+                let mut response = request
+                    .add_header(ACCEPT_ENCODING, encoding, true)
+                    .add_header("range", "bytes=16-79", true)
+                    .send(&service)
+                    .await;
+                if head {
+                    // HEAD ignores Range and describes the full representation.
+                    assert_eq!(response.status_code, Some(StatusCode::OK));
+                    assert!(!response.headers().contains_key(CONTENT_RANGE));
+                    if encoding == "identity" {
+                        assert_eq!(
+                            response.headers()[CONTENT_LENGTH],
+                            original.len().to_string()
+                        );
+                    } else {
+                        // The compressed representation length is unknown without
+                        // reading and compressing a body, which HEAD must not do.
+                        assert!(!response.headers().contains_key(CONTENT_LENGTH));
+                    }
+                } else {
+                    assert_eq!(response.status_code, Some(StatusCode::PARTIAL_CONTENT));
+                    assert_eq!(
+                        response.headers()[CONTENT_RANGE],
+                        format!("bytes 16-79/{}", original.len())
+                    );
+                    assert_eq!(response.headers()[CONTENT_LENGTH], "64");
+                }
+                if head && encoding == "gzip" {
+                    assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
+                } else {
+                    assert!(!response.headers().contains_key(CONTENT_ENCODING));
+                }
+                let bytes = response.take_bytes(None).await.unwrap();
+                assert_eq!(&bytes[..], if head { &[][..] } else { &original[16..80] });
+            }
+
+            let mut full = TestClient::get(&url)
+                .add_header(ACCEPT_ENCODING, "gzip", true)
+                .send(&service)
+                .await;
+            assert_eq!(full.status_code, Some(StatusCode::OK));
+            assert_eq!(full.headers()[CONTENT_ENCODING], "gzip");
+            assert_eq!(full.take_string().await.unwrap().as_bytes(), original);
+        }
+    }
+
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn partial_status_or_content_range_prevents_compression() {
+        #[handler]
+        async fn partial_response(req: &mut Request, res: &mut Response) {
+            res.status_code(if req.query::<bool>("partial").unwrap() {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            });
+            if req.query::<bool>("range").unwrap() {
+                res.add_header("content-range", "bytes 0-4/10", true)
+                    .unwrap();
+            }
+            res.add_header(CONTENT_TYPE, "text/plain", true).unwrap();
+            res.add_header(CONTENT_LENGTH, "5", true).unwrap();
+            res.add_header(VARY, "origin", true).unwrap();
+            if req.method() != Method::HEAD {
+                res.render("hello");
+            }
+        }
+
+        let service = Service::new(
+            Router::with_hoop(Compression::new().min_length(1)).goal(partial_response),
+        );
+        for (partial, range) in [(true, false), (false, true)] {
+            let url = format!("http://localhost/?partial={partial}&range={range}");
+            for head in [false, true] {
+                let request = if head {
+                    TestClient::head(&url)
+                } else {
+                    TestClient::get(&url)
+                };
+                let mut response = request
+                    .add_header(ACCEPT_ENCODING, "gzip", true)
+                    .send(&service)
+                    .await;
+                assert!(!response.headers().contains_key(CONTENT_ENCODING));
+                assert_eq!(response.headers()[CONTENT_LENGTH], "5");
+                assert_eq!(response.headers()[VARY], "origin");
+                assert_eq!(
+                    response.take_bytes(None).await.unwrap().as_ref(),
+                    if head { &b""[..] } else { &b"hello"[..] }
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn existing_content_encoding_is_preserved() {
+        #[handler]
+        async fn encoded(req: &mut Request, res: &mut Response) {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(b"hello").unwrap();
+            let bytes = encoder.finish().unwrap();
+            res.status_code(StatusCode::OK);
+            res.add_header(CONTENT_TYPE, "text/plain", true).unwrap();
+            res.add_header(CONTENT_ENCODING, "gzip", true).unwrap();
+            res.add_header(CONTENT_LENGTH, bytes.len().to_string(), true)
+                .unwrap();
+            if req.method() != Method::HEAD {
+                res.write_body(bytes).unwrap();
+            }
+        }
+
+        let service =
+            Service::new(Router::with_hoop(Compression::new().min_length(1)).goal(encoded));
+        for head in [false, true] {
+            let request = if head {
+                TestClient::head("http://localhost/")
+            } else {
+                TestClient::get("http://localhost/")
+            };
+            let mut response = request
+                .add_header(ACCEPT_ENCODING, "gzip", true)
+                .send(&service)
+                .await;
+            assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
+            assert!(response.headers().contains_key(CONTENT_LENGTH));
+            assert!(!response.headers().contains_key(VARY));
+            if head {
+                assert!(response.take_bytes(None).await.unwrap().is_empty());
+            } else {
+                assert_eq!(response.take_string().await.unwrap(), "hello");
+            }
+        }
+    }
+
+    #[cfg(feature = "gzip")]
+    #[tokio::test]
+    async fn compression_preserves_trailers_after_final_data() {
+        use std::io::Read;
+        use std::pin::Pin;
+
+        use salvo_core::http::HeaderMap;
+        use salvo_core::http::body::{Body, BytesFrame, Frame};
+
+        #[handler]
+        async fn with_trailers(res: &mut Response) {
+            res.add_header("content-type", "text/plain", true).unwrap();
+            res.add_header("trailer", "x-checksum", true).unwrap();
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-checksum", "complete".parse().unwrap());
+            let frames = vec![
+                Ok::<_, std::io::Error>(BytesFrame::data(vec![b'a'; 32 * 1024])),
+                Ok(BytesFrame(Frame::trailers(trailers))),
+            ];
+            res.stream(futures_util::stream::iter(frames));
+        }
+
+        let router = Router::with_hoop(super::Compression::new().min_length(1)).get(with_trailers);
+        let mut response = TestClient::get("http://localhost/")
+            .add_header("accept-encoding", "gzip", true)
+            .send(router)
+            .await;
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+        assert_eq!(response.headers()["trailer"], "x-checksum");
+        let mut body = response.take_body();
+        let mut compressed = Vec::new();
+        let mut trailers = None;
+        while let Some(frame) =
+            futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+        {
+            match frame.unwrap().into_data() {
+                Ok(data) => {
+                    assert!(trailers.is_none());
+                    compressed.extend_from_slice(&data);
+                }
+                Err(frame) => trailers = Some(frame.into_trailers().unwrap()),
+            }
+        }
+        assert_eq!(trailers.unwrap()["x-checksum"], "complete");
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, vec![b'a'; 32 * 1024]);
+    }
 
     #[handler]
     async fn hello() -> &'static str {
@@ -763,6 +1461,36 @@ mod tests {
             .send(router)
             .await;
         assert_eq!(res.headers().get(CONTENT_ENCODING).unwrap(), "br");
+    }
+
+    #[tokio::test]
+    async fn test_accept_encoding_is_case_insensitive() {
+        // Content codings and the `q` parameter name are case-insensitive.
+        let comp_handler = Compression::new()
+            .disable_all()
+            .enable_gzip(CompressionLevel::Default)
+            .enable_brotli(CompressionLevel::Default)
+            .min_length(1);
+        let router = Router::with_hoop(comp_handler).push(Router::with_path("hello").get(hello));
+        let service = Service::new(router);
+
+        for (accept_encoding, expected) in [
+            ("GZIP", "gzip"),
+            ("gzip;Q=0, br", "br"),
+            ("*, GZIP;q=0", "br"),
+        ] {
+            let res = TestClient::get("http://127.0.0.1:5801/hello")
+                .add_header(ACCEPT_ENCODING, accept_encoding, true)
+                .send(&service)
+                .await;
+            assert_eq!(
+                res.headers()
+                    .get(CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+                Some(expected),
+                "{accept_encoding}"
+            );
+        }
     }
 
     #[tokio::test]

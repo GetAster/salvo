@@ -46,7 +46,8 @@ use std::fmt::{self, Debug, Formatter};
 use hyper::upgrade::OnUpgrade;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use salvo_core::http::header::{
-    AUTHORIZATION, CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue, UPGRADE,
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue,
+    SET_COOKIE, UPGRADE, VARY,
 };
 use salvo_core::http::uri::Uri;
 use salvo_core::http::{ReqBody, ResBody, StatusCode};
@@ -102,6 +103,7 @@ const PATH_ENCODE_SET: &AsciiSet = &QUERY_ENCODE_SET
     .add(b'`')
     .add(b'{')
     .add(b'}');
+const SEGMENT_ENCODE_SET: &AsciiSet = &PATH_ENCODE_SET.add(b'%').add(b'/').add(b'\\');
 
 /// Encode URL path. This can be used when building a custom URL path getter.
 ///
@@ -213,8 +215,21 @@ pub type HostHeaderGetter =
 ///
 /// This getter gets the last param as the rest URL path from the request.
 /// In most cases you should use a wildcard param, like `{**rest}`, `{*+rest}`.
+///
+/// Re-encodes each decoded routing segment independently. An encoded separator
+/// remains data in one segment, and a literal percent sign becomes `%25` rather
+/// than starting a second decoding pass. The original request URI is unchanged.
 pub fn default_url_path_getter(req: &Request, _depot: &Depot) -> Option<String> {
-    req.params().tail().map(str::to_owned)
+    use std::fmt::Write as _;
+    let segments = req.params().tail_segments()?;
+    let mut path = String::new();
+    for (index, segment) in segments.enumerate() {
+        if index > 0 {
+            path.push('/');
+        }
+        let _ = write!(path, "{}", utf8_percent_encode(segment, SEGMENT_ENCODE_SET));
+    }
+    Some(path)
 }
 
 fn contains_ambiguous_path_escape(path: &str) -> bool {
@@ -226,7 +241,21 @@ fn contains_ambiguous_path_escape(path: &str) -> bool {
                 (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
         {
             let decoded = high << 4 | low;
-            if matches!(decoded, b'.' | b'/' | b'\\' | b'%') {
+            // An escaped percent sign is only ambiguous when a second decode
+            // would read it as the start of another escape.
+            if decoded == b'%' {
+                if index + 4 < bytes.len()
+                    && hex_value(bytes[index + 3]).is_some()
+                    && hex_value(bytes[index + 4]).is_some()
+                {
+                    return true;
+                }
+            // An escaped unreserved character is equivalent to the character
+            // itself (RFC 3986 section 2.3), so an upstream that decodes again
+            // sees a different path than the one Salvo routed.
+            } else if matches!(decoded, 0 | b'.' | b'/' | b'\\' | b'-' | b'_' | b'~')
+                || decoded.is_ascii_alphanumeric()
+            {
                 return true;
             }
             index += 3;
@@ -409,6 +438,10 @@ where
     }
 
     /// Set URL path getter.
+    ///
+    /// The proxy percent-encodes the returned path but leaves `%` alone, so escapes in it are
+    /// forwarded as they are. Return a literal percent sign as `%25`, as
+    /// [`default_url_path_getter`] does.
     #[inline]
     #[must_use]
     pub fn url_path_getter<G>(mut self, url_path_getter: G) -> Self
@@ -444,9 +477,11 @@ where
     /// Enable or disable strict path normalization.
     ///
     /// When enabled, the proxy rejects literal parent-directory (`..`) path components and paths
-    /// that still contain percent-encoded `.`, `/`, `\`, or `%` characters after Salvo routing has
-    /// extracted the path tail. This is useful when the proxy is used as a security boundary and
-    /// the upstream server may perform another decode or normalization pass.
+    /// that still contain percent-encoded `.`, `/`, `\`, or unreserved characters (letters,
+    /// digits, `-`, `_`, `~`), or a percent sign followed by two hex digits, after Salvo routing
+    /// has extracted the path tail. This is useful when
+    /// the proxy is used as a security boundary and the upstream server may perform another decode
+    /// or normalization pass.
     #[inline]
     #[must_use]
     pub fn strict_path_normalization(mut self, enable: bool) -> Self {
@@ -480,6 +515,7 @@ where
     ///
     /// When enabled, the proxy overwrites any inbound `X-Forwarded-For` value with the direct
     /// client IP from the connection instead of trusting a client-supplied forwarding chain.
+    /// If the peer has no IP address (for example, a Unix socket), the header is omitted.
     #[inline]
     #[must_use]
     pub fn client_ip_forwarding(mut self, enable: bool) -> Self {
@@ -527,8 +563,11 @@ where
             tracing::debug!("url_path_getter returned None; forwarding to upstream root path");
             String::new()
         });
+        if path.contains('\0') {
+            return Err(Error::other("NUL in proxy path"));
+        }
         if self.strict_path_normalization_enabled {
-            if contains_ambiguous_path_escape(&path) {
+            if path.contains('\\') || contains_ambiguous_path_escape(&path) {
                 return Err(Error::other("ambiguous percent-encoded path"));
             }
             if contains_parent_dir_component(&path) {
@@ -560,9 +599,13 @@ where
             .method(req.method())
             .uri(&forward_url);
         let connection_headers = connection_header_names(req.headers());
-        let upgrade_type = get_upgrade_type(req.headers()).map(str::to_owned);
+        let upgrade_type = get_upgrade_type(req.headers());
         for (key, value) in req.headers() {
-            if key == HOST || is_hop_by_hop_header(key, &connection_headers) {
+            if key == HOST
+                || key == CONTENT_LENGTH
+                || is_hop_by_hop_header(key, &connection_headers)
+                || (self.client_ip_forwarding_enabled && key == X_FORWARDED_FOR_HEADER_NAME)
+            {
                 continue;
             }
             if self.strip_authorization_header_enabled && key == AUTHORIZATION {
@@ -571,6 +614,9 @@ where
             request_builder = request_builder.header(key, value);
         }
         if let Some(upgrade_type) = upgrade_type {
+            if let Some(conn_ctrl) = req.extensions().get::<salvo_core::conn::ConnCtrl>() {
+                request_builder = request_builder.extension(conn_ctrl.clone());
+            }
             request_builder =
                 request_builder.header(CONNECTION, HeaderValue::from_static("upgrade"));
             match HeaderValue::from_str(&upgrade_type) {
@@ -609,7 +655,13 @@ where
             }
         }
 
-        request_builder.body(req.take_body()).map_err(Error::other)
+        let body = req.take_body_for_forwarding()?;
+        // Middleware may have consumed or replaced the body. Never reuse the
+        // inbound length; let the client frame streams with an unknown length.
+        if let Some(length) = hyper::body::Body::size_hint(&body).exact() {
+            request_builder = request_builder.header(CONTENT_LENGTH, length);
+        }
+        request_builder.body(body).map_err(Error::other)
     }
 }
 
@@ -650,16 +702,45 @@ where
                         res.body(body);
                     }
                     Err(e) => {
-                        tracing::error!( error = ?e, uri = ?req.uri(), "get response data failed: {}", e);
+                        // A client error can embed the entire upstream URL too.
+                        // Keep diagnostics structured without logging URL credentials.
+                        tracing::error!(
+                            method = %req.method(),
+                            path = req.uri().path(),
+                            error_type = std::any::type_name_of_val(&e),
+                            "upstream request failed"
+                        );
                         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
                     }
                 }
             }
             Err(e) => {
-                tracing::error!(error = ?e, "build proxied request failed");
+                tracing::error!(
+                    method = %req.method(),
+                    path = req.uri().path(),
+                    error_type = std::any::type_name_of_val(&e),
+                    "build proxied request failed"
+                );
                 res.status_code(StatusCode::BAD_REQUEST);
             }
         }
+    }
+}
+
+#[cfg(any(
+    feature = "hyper-client",
+    feature = "reqwest-client",
+    all(unix, feature = "unix-sock-client")
+))]
+fn spawn_upgrade(
+    conn_ctrl: Option<salvo_core::conn::ConnCtrl>,
+    task: impl Future<Output = ()> + Send + 'static,
+) {
+    if let Some(conn_ctrl) = conn_ctrl {
+        conn_ctrl.relax_timeouts();
+        conn_ctrl.spawn_upgrade(task);
+    } else {
+        tokio::spawn(task);
     }
 }
 
@@ -681,9 +762,29 @@ fn is_hop_by_hop_header(name: &HeaderName, connection_headers: &[HeaderName]) ->
 }
 
 fn append_end_to_end_headers(destination: &mut HeaderMap, source: &HeaderMap, status: StatusCode) {
+    // The upstream body replaces any prepared body. Its representation metadata
+    // is authoritative, even when an old field is absent from the new response.
+    for name in [
+        "content-type",
+        "content-length",
+        "content-encoding",
+        "content-range",
+        "content-language",
+        "content-location",
+        "content-disposition",
+        "content-md5",
+        "content-digest",
+        "repr-digest",
+        "digest",
+        "etag",
+        "last-modified",
+        "accept-ranges",
+    ] {
+        destination.remove(name);
+    }
     let connection_headers = connection_header_names(source);
     let upgrade_type = if status == StatusCode::SWITCHING_PROTOCOLS {
-        get_upgrade_type(source).map(str::to_owned)
+        get_upgrade_type(source)
     } else {
         None
     };
@@ -691,15 +792,21 @@ fn append_end_to_end_headers(destination: &mut HeaderMap, source: &HeaderMap, st
         if is_hop_by_hop_header(name, &connection_headers) {
             continue;
         }
+        // Set-Cookie remains additive and Vary preserves outer negotiation.
+        // Other upstream fields replace prepared values instead of creating
+        // conflicting singleton fields such as Content-Length or Location.
+        if name != SET_COOKIE && name != VARY {
+            destination.remove(name);
+        }
         for value in source.get_all(name) {
             destination.append(name, value.to_owned());
         }
     }
     if let Some(upgrade_type) = upgrade_type {
-        destination.append(CONNECTION, HeaderValue::from_static("upgrade"));
+        destination.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         match HeaderValue::from_str(&upgrade_type) {
             Ok(upgrade_type) => {
-                destination.append(UPGRADE, upgrade_type);
+                destination.insert(UPGRADE, upgrade_type);
             }
             Err(e) => {
                 tracing::error!(error = ?e, "invalid upgrade header value");
@@ -709,34 +816,63 @@ fn append_end_to_end_headers(destination: &mut HeaderMap, source: &HeaderMap, st
 }
 
 #[inline]
-fn get_upgrade_type(headers: &HeaderMap) -> Option<&str> {
-    if connection_header_names(headers).contains(&UPGRADE)
-        && let Some(upgrade_value) = headers.get(&UPGRADE)
-    {
-        tracing::debug!(
-            "found upgrade header with value: {:?}",
-            upgrade_value.to_str()
-        );
-        return upgrade_value.to_str().ok();
+fn get_upgrade_type(headers: &HeaderMap) -> Option<String> {
+    if !connection_header_names(headers).contains(&UPGRADE) {
+        return None;
     }
-
-    None
+    let values = headers
+        .get_all(UPGRADE)
+        .iter()
+        .map(HeaderValue::to_str)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(", "))
+    }
 }
 
-/// Compare two `Upgrade` token candidates from request and response.
+/// Validate the upstream's selected protocols against the client's offers.
 ///
-/// Per RFC 7230 §6.7 the upgrade token is case-insensitive (`websocket`,
-/// `WebSocket`, `WEBSOCKET` are equivalent), so this helper compares with
-/// `eq_ignore_ascii_case`. Two missing tokens compare equal (the previous
-/// case-sensitive check matched too) so callers behave the same when neither
-/// side advertises an upgrade.
+/// RFC 9110 §7.8 permits multiple offers and a selection of one or more of
+/// them. Protocol names compare case-insensitively, while versions are opaque.
 #[inline]
 pub(crate) fn upgrade_types_match(request: Option<&str>, response: Option<&str>) -> bool {
-    match (request, response) {
-        (Some(req), Some(resp)) => req.eq_ignore_ascii_case(resp),
-        (None, None) => true,
-        _ => false,
+    let (Some(request), Some(response)) = (request, response) else {
+        return false;
+    };
+    let (Some(offered), Some(selected)) = (upgrade_protocols(request), upgrade_protocols(response))
+    else {
+        return false;
+    };
+    !offered.is_empty()
+        && !selected.is_empty()
+        && selected.iter().all(|(name, version)| {
+            offered.iter().any(|(offered_name, offered_version)| {
+                name.eq_ignore_ascii_case(offered_name) && version == offered_version
+            })
+        })
+}
+
+fn upgrade_protocols(value: &str) -> Option<Vec<(&str, Option<&str>)>> {
+    fn is_token(value: &str) -> bool {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
     }
+    value
+        .split(',')
+        .map(|item| item.trim_matches([' ', '\t']))
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            let (name, version) = item
+                .split_once('/')
+                .map_or((item, None), |(name, version)| (name, Some(version)));
+            (is_token(name) && version.is_none_or(is_token)).then_some((name, version))
+        })
+        .collect()
 }
 
 // Unit tests for Proxy
@@ -754,6 +890,87 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::Role;
 
     use super::*;
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn upstream_failure_logs_omit_request_and_error_url_secrets() {
+        struct FailedClient;
+        impl Client for FailedClient {
+            type Error = std::io::Error;
+            async fn execute(
+                &self,
+                req: HyperRequest,
+                _: Option<OnUpgrade>,
+            ) -> Result<HyperResponse, Self::Error> {
+                Err(std::io::Error::other(format!(
+                    "failed to connect to {}",
+                    req.uri()
+                )))
+            }
+        }
+
+        let mut req = salvo_core::test::TestClient::get(
+            "https://local.example/download?token=proxy-secret-marker",
+        )
+        .build();
+        let mut res = Response::new();
+        Proxy::new("https://upstream.example", FailedClient)
+            .handle(
+                &mut req,
+                &mut Depot::new(),
+                &mut res,
+                &mut FlowCtrl::new(vec![]),
+            )
+            .await;
+        assert_eq!(res.status_code, Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!logs_contain("proxy-secret-marker"));
+        assert!(logs_contain("upstream request failed"));
+        assert!(logs_contain("/download"));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn upstream_selection_failure_logs_omit_url_secrets() {
+        struct FailedUpstreams;
+        impl Upstreams for FailedUpstreams {
+            type Error = std::io::Error;
+            async fn elect(&self, req: &Request, _: &Depot) -> Result<&str, Self::Error> {
+                Err(std::io::Error::other(format!(
+                    "no upstream for {}",
+                    req.uri()
+                )))
+            }
+        }
+        struct NeverCalled;
+        impl Client for NeverCalled {
+            type Error = Infallible;
+            async fn execute(
+                &self,
+                _: HyperRequest,
+                _: Option<OnUpgrade>,
+            ) -> Result<HyperResponse, Self::Error> {
+                unreachable!("failed upstream selection must not execute a request")
+            }
+        }
+
+        let mut req = salvo_core::test::TestClient::get(
+            "https://local.example/selection?token=selection-secret-marker",
+        )
+        .build();
+        let mut res = Response::new();
+        Proxy::new(FailedUpstreams, NeverCalled)
+            .handle(
+                &mut req,
+                &mut Depot::new(),
+                &mut res,
+                &mut FlowCtrl::new(vec![]),
+            )
+            .await;
+        assert_eq!(res.status_code, Some(StatusCode::BAD_REQUEST));
+        assert!(!logs_contain("selection-secret-marker"));
+        assert!(logs_contain("build proxied request failed"));
+        assert!(logs_contain("/selection"));
+    }
 
     #[handler]
     async fn websocket_echo(req: &mut Request, res: &mut Response) -> Result<(), StatusError> {
@@ -797,11 +1014,40 @@ mod tests {
         assert!(upgrade_types_match(Some("WebSocket"), Some("websocket")));
         assert!(upgrade_types_match(Some("WEBSOCKET"), Some("WebSocket")));
         assert!(upgrade_types_match(Some("h2c"), Some("h2c")));
-        assert!(upgrade_types_match(None, None));
+        assert!(!upgrade_types_match(None, None));
 
         assert!(!upgrade_types_match(Some("websocket"), Some("h2c")));
         assert!(!upgrade_types_match(Some("websocket"), None));
         assert!(!upgrade_types_match(None, Some("websocket")));
+    }
+
+    #[test]
+    fn test_upgrade_selection_validates_protocol_lists_and_versions() {
+        assert!(upgrade_types_match(
+            Some("other, Chat/1, Extra"),
+            Some("cHaT/1, extra")
+        ));
+        assert!(upgrade_types_match(Some(",\tChat/1, "), Some("Chat/1, ")));
+        for response in [
+            "",
+            " ",
+            "Other",
+            "Chat/2",
+            "Chat/1, other",
+            "Chat/",
+            "Chat/1/2",
+            "Chat/ 1",
+        ] {
+            assert!(
+                !upgrade_types_match(Some("Chat/1"), Some(response)),
+                "{response}"
+            );
+        }
+        assert!(!upgrade_types_match(
+            Some("Chat/Version"),
+            Some("Chat/version")
+        ));
+        assert!(!upgrade_types_match(Some("Chat /1"), Some("Chat/1")));
     }
 
     #[test]
@@ -839,6 +1085,16 @@ mod tests {
         assert!(contains_ambiguous_path_escape("api%2Fadmin"));
         assert!(contains_ambiguous_path_escape("api%5cadmin"));
         assert!(contains_ambiguous_path_escape("%252e%252e/admin"));
+        assert!(contains_ambiguous_path_escape("%72eport_note/secret.txt"));
+        assert!(contains_ambiguous_path_escape("files/a%41.txt"));
+        assert!(contains_ambiguous_path_escape("files/a%7Eb"));
+        assert!(contains_ambiguous_path_escape("files/a%2541.txt"));
+        assert!(contains_ambiguous_path_escape("files/a%2525"));
+        assert!(!contains_ambiguous_path_escape("files/50%off"));
+        assert!(!contains_ambiguous_path_escape("files/50%25off"));
+        assert!(!contains_ambiguous_path_escape("files/100%25"));
+        assert!(!contains_ambiguous_path_escape("files/100%254"));
+        assert!(!contains_ambiguous_path_escape("files/a%3Fb%23c"));
         assert!(!contains_ambiguous_path_escape("guide.v1/index.html"));
         assert!(!contains_ambiguous_path_escape("files/%20space"));
     }
@@ -859,7 +1115,7 @@ mod tests {
         headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
         let upgrade_type = get_upgrade_type(&headers);
-        assert_eq!(upgrade_type, Some("websocket"));
+        assert_eq!(upgrade_type.as_deref(), Some("websocket"));
     }
 
     #[test]
@@ -871,7 +1127,7 @@ mod tests {
 
         let upgrade_type = get_upgrade_type(&headers);
 
-        assert_eq!(upgrade_type, Some("websocket"));
+        assert_eq!(upgrade_type.as_deref(), Some("websocket"));
     }
 
     #[test]
@@ -952,6 +1208,7 @@ mod tests {
     async fn test_build_proxied_request_strips_hop_by_hop_headers() {
         let proxy = Proxy::new(vec!["http://example.com"], HyperClient::default());
         let mut request = Request::new();
+        request.replace_body(ReqBody::from(""));
         let depot = Depot::new();
 
         request
@@ -1074,6 +1331,162 @@ mod tests {
             proxied.headers().get(AUTHORIZATION),
             Some(&HeaderValue::from_static("Bearer secret"))
         );
+    }
+
+    async fn collect_request_body(mut body: ReqBody) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.next().await {
+            if let Ok(data) = frame.unwrap().into_data() {
+                bytes.extend_from_slice(&data);
+            }
+        }
+        bytes
+    }
+
+    #[tokio::test]
+    async fn cached_payload_is_forwarded_with_its_actual_length() {
+        let proxy = Proxy::new("http://example.com", HyperClient::default());
+        for parse_form in [false, true] {
+            let mut request = salvo_core::test::TestClient::post("http://localhost/")
+                .add_header("content-type", "application/x-www-form-urlencoded", true)
+                .add_header("content-length", "999", true)
+                .body("field=original")
+                .build();
+            assert_eq!(request.payload().await.unwrap(), "field=original");
+            if parse_form {
+                assert_eq!(
+                    request
+                        .form_data()
+                        .await
+                        .unwrap()
+                        .fields
+                        .get("field")
+                        .unwrap(),
+                    "original"
+                );
+            }
+            let proxied = proxy
+                .build_proxied_request(&mut request, &Depot::new())
+                .await
+                .unwrap();
+            assert_eq!(proxied.headers()[CONTENT_LENGTH], "14");
+            assert_eq!(
+                collect_request_body(proxied.into_body()).await,
+                b"field=original"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replaced_body_discards_stale_and_duplicate_lengths() {
+        let proxy = Proxy::new("http://example.com", HyperClient::default());
+        let mut request = salvo_core::test::TestClient::post("http://localhost/")
+            .add_header("content-length", "100", true)
+            .body("original")
+            .build();
+        request.payload().await.unwrap();
+        request.replace_body(ReqBody::from("new"));
+        request
+            .headers_mut()
+            .append(CONTENT_LENGTH, HeaderValue::from_static("200"));
+        let proxied = proxy
+            .build_proxied_request(&mut request, &Depot::new())
+            .await
+            .unwrap();
+        assert_eq!(proxied.headers().get_all(CONTENT_LENGTH).iter().count(), 1);
+        assert_eq!(proxied.headers()[CONTENT_LENGTH], "3");
+        assert_eq!(collect_request_body(proxied.into_body()).await, b"new");
+    }
+
+    #[tokio::test]
+    async fn consumed_uncached_bodies_are_rejected() {
+        let proxy = Proxy::new("http://example.com", HyperClient::default());
+        // Form parsing alone retains no raw bytes, including for requests
+        // without a length header (such as HTTP/2 or chunked requests).
+        let mut form = salvo_core::test::TestClient::post("http://localhost/")
+            .add_header("content-type", "multipart/form-data; boundary=b", true)
+            .body("--b\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n--b--\r\n")
+            .build();
+        form.form_data().await.unwrap();
+        form.headers_mut().remove(CONTENT_LENGTH);
+        assert!(form.payload().await.is_err());
+        assert!(
+            proxy
+                .build_proxied_request(&mut form, &Depot::new())
+                .await
+                .is_err()
+        );
+
+        for framing in ["content-length", "transfer-encoding"] {
+            let mut request = salvo_core::test::TestClient::post("http://localhost/")
+                .body("discarded")
+                .build();
+            request.take_body();
+            request.headers_mut().insert(
+                HeaderName::from_static(framing),
+                HeaderValue::from_static(if framing == "content-length" {
+                    "9"
+                } else {
+                    "chunked"
+                }),
+            );
+            assert!(
+                proxy
+                    .build_proxied_request(&mut request, &Depot::new())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_length_body_stays_streamed_without_inbound_framing() {
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+
+        use hyper::body::{Body, Frame};
+
+        struct UnknownLengthBody(ResBody);
+        impl Body for UnknownLengthBody {
+            type Data = <ResBody as Body>::Data;
+            type Error = BoxedError;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                Pin::new(&mut self.0).poll_frame(cx).map_err(Into::into)
+            }
+        }
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let stream_polled = polled.clone();
+        let stream = futures_util::stream::once(async move {
+            stream_polled.store(true, Ordering::SeqCst);
+            Ok::<_, std::io::Error>("streamed")
+        });
+        let mut request = salvo_core::test::TestClient::post("http://localhost/")
+            .add_header("content-length", "999", true)
+            .add_header("transfer-encoding", "chunked", true)
+            .build();
+        request.replace_body(ReqBody::Boxed {
+            inner: Box::pin(UnknownLengthBody(ResBody::stream(stream))),
+            fuse_config: None,
+        });
+        let proxy = Proxy::new("http://example.com", HyperClient::default());
+        let proxied = proxy
+            .build_proxied_request(&mut request, &Depot::new())
+            .await
+            .unwrap();
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "request construction must not buffer the stream"
+        );
+        assert!(!proxied.headers().contains_key(CONTENT_LENGTH));
+        assert!(!proxied.headers().contains_key("transfer-encoding"));
+        assert_eq!(collect_request_body(proxied.into_body()).await, b"streamed");
     }
 
     #[tokio::test]
@@ -1281,7 +1694,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
     }
 
     #[tokio::test]
-    async fn test_build_proxied_request_normalizes_safe_tail() {
+    async fn test_build_proxied_request_does_not_turn_backslashes_into_separators() {
         let mut request = Request::new();
         request
             .params_mut()
@@ -1289,13 +1702,20 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let depot = Depot::new();
         let proxy = Proxy::new(vec!["http://example.com/api"], HyperClient::default());
 
+        assert!(
+            proxy
+                .build_proxied_request(&mut request, &depot)
+                .await
+                .is_err()
+        );
+        let proxy = proxy.strict_path_normalization(false);
         let proxied_request = proxy
             .build_proxied_request(&mut request, &depot)
             .await
             .unwrap();
         assert_eq!(
             proxied_request.uri().to_string(),
-            "http://example.com/api/guide/index.html"
+            "http://example.com/api/guide%5Cindex.html"
         );
     }
 
@@ -1330,9 +1750,11 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .build_proxied_request(&mut request, &depot)
             .await
             .unwrap();
+        // The routed tail holds these characters literally, so the upstream
+        // must receive them as escaped percent signs to see the same path.
         assert_eq!(
             proxied_request.uri().to_string(),
-            "http://example.com/api/%2e%2e/secrets/.env"
+            "http://example.com/api/%252e%252e/secrets/.env"
         );
     }
 
@@ -1343,6 +1765,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             "api%2fadmin",
             "api%5cadmin",
             "%252e%252e/secrets/.env",
+            "%72eport_note/secret.txt",
         ] {
             let mut request = Request::new();
             request.params_mut().insert("**rest", path.to_owned());

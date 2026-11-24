@@ -1,0 +1,19 @@
+name: Release preflight contract
+permissions:
+  contents: read
+on:
+  pull_request:
+    paths: ['.github/scripts/*release_preflight.py', '.github/workflows/release*.yml']
+  push:
+    branches: [main]
+    paths: ['.github/scripts/*release_preflight.py', '.github/workflows/release*.yml']
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 .github/scripts/test_release_preflight.py

@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug, Formatter};
 use std::io::Result as IoResult;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use certon::crypto::KeyType;
@@ -18,7 +18,8 @@ use salvo_core::{Result as CoreResult, Router, cfg_feature};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::crypto::CryptoProvider;
-use tokio_rustls::rustls::server::ServerConfig;
+use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert, ServerConfig};
+use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::server::TlsStream;
 
 use super::config::{AcmeConfig, AcmeConfigBuilder};
@@ -34,13 +35,159 @@ cfg_feature! {
 /// ACME TLS-ALPN-01 protocol name.
 const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
+fn configure_contacts(
+    builder: certon::acme_issuer::AcmeIssuerBuilder,
+    contacts: &[String],
+) -> certon::acme_issuer::AcmeIssuerBuilder {
+    if contacts.is_empty() {
+        return builder;
+    }
+    let contacts: Vec<_> = contacts
+        .iter()
+        .map(|contact| {
+            let contact = contact.trim();
+            if contact
+                .get(..7)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
+            {
+                format!("mailto:{}", &contact[7..])
+            } else {
+                format!("mailto:{contact}")
+            }
+        })
+        .collect();
+    // Certon uses email for account identity, but accepts the complete ACME
+    // contact URI list through its account customization callback.
+    builder
+        .email(contacts[0].strip_prefix("mailto:").unwrap_or(&contacts[0]))
+        .new_account_func(Arc::new(move |account| account.contact = contacts.clone()))
+}
+
+struct AcmeMaintenance {
+    manager: Arc<certon::CertManager>,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for AcmeMaintenance {
+    fn drop(&mut self) {
+        self.manager.cache.stop();
+        for task in self
+            .tasks
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
+    }
+}
+
+struct ManagedResolver {
+    resolver: Arc<CertResolver>,
+    // ServerConfig clones (including QUIC) share the same lifecycle owner.
+    _maintenance: Arc<AcmeMaintenance>,
+}
+
+impl Debug for ManagedResolver {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ManagedResolver").finish_non_exhaustive()
+    }
+}
+
+impl ResolvesServerCert for ManagedResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.resolver.resolve(hello)
+    }
+}
+
+impl AcmeMaintenance {
+    fn start(&self, before_expired: Duration, check_duration: Duration) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.push(certon::start_maintenance(&self.manager));
+        tasks.push(tokio::spawn(maintain_absolute_window(
+            Arc::downgrade(&self.manager),
+            before_expired,
+            check_duration,
+        )));
+    }
+}
+
+fn within_renewal_window(cert: &certon::Certificate, before_expired: Duration) -> bool {
+    let expires: std::time::SystemTime = cert.not_after.into();
+    let begins: std::time::SystemTime = cert.not_before.into();
+    // A window longer than a short certificate's lifetime must not cause
+    // perpetual immediate issuance after replacement.
+    let window = before_expired.min(expires.duration_since(begins).unwrap_or_default() / 2);
+    expires
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default()
+        <= window
+}
+
+async fn maintain_absolute_window(
+    manager: Weak<certon::CertManager>,
+    before_expired: Duration,
+    check_duration: Duration,
+) {
+    let check_duration = if check_duration.is_zero()
+        || tokio::time::Instant::now()
+            .checked_add(check_duration)
+            .is_none()
+    {
+        Duration::from_secs(10 * 60)
+    } else {
+        check_duration
+    };
+    let mut interval = tokio::time::interval(check_duration);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let Some(manager) = manager.upgrade() else {
+            return;
+        };
+        // The absolute renewal window supplements upstream ARI and
+        // emergency/revocation maintenance without retaining this owner.
+        for cert in manager.cache.get_managed_certificates().await {
+            if !within_renewal_window(&cert, before_expired) {
+                continue;
+            }
+            let Some(domain) = cert.names.first() else {
+                continue;
+            };
+            if let Err(error) = renew_in_absolute_window(&manager, domain, before_expired).await {
+                tracing::warn!(domain, error = ?error, "absolute-window certificate renewal failed");
+            }
+        }
+    }
+}
+
+async fn renew_in_absolute_window(
+    manager: &certon::CertManager,
+    domain: &str,
+    before_expired: Duration,
+) -> certon::Result<()> {
+    // Serialize Salvo's forced-window checks across listeners sharing storage.
+    // Refresh after taking the lock so a previous listener's replacement does
+    // not result in another forced renewal from a stale local cache snapshot.
+    let lock = certon::storage::acquire(
+        manager.storage.clone(),
+        &format!("salvo_absolute_renewal:{domain}"),
+    )
+    .await?;
+    let cert = manager.cache_certificate(domain).await?;
+    if within_renewal_window(&cert, before_expired) {
+        manager.renew(domain, true).await?;
+    }
+    lock.release().await
+}
+
 /// Returns the [`CryptoProvider`] used to build the ACME `ServerConfig`.
 ///
 /// Reuses the process level provider when the application installed one, otherwise builds one
 /// from this crate's `aws-lc-rs` / `ring` features without installing it globally. Passing the
 /// provider explicitly keeps rustls from panicking when feature unification makes both backends
 /// available at once. `ring` wins when both are on, matching this crate's default.
-fn default_crypto_provider() -> Arc<CryptoProvider> {
+pub(crate) fn default_crypto_provider() -> Arc<CryptoProvider> {
     if let Some(provider) = CryptoProvider::get_default() {
         return Arc::clone(provider);
     }
@@ -85,6 +232,31 @@ impl<T> AcmeListenerBuilder<T> {
             config_builder: AcmeConfig::builder(),
             check_duration: Duration::from_secs(10 * 60),
         }
+    }
+
+    /// Applies a complete public ACME configuration, including custom solvers
+    /// and renewal/account settings. It is validated when this listener binds.
+    #[must_use]
+    pub fn config(mut self, config: AcmeConfig) -> Self {
+        self.config_builder = config;
+        self
+    }
+
+    /// Sets the absolute time before certificate expiry to start renewal.
+    /// The window is capped at half the certificate lifetime.
+    /// Authority ARI, revocation and emergency renewal can run earlier.
+    #[must_use]
+    pub fn before_expired(mut self, duration: Duration) -> Self {
+        self.config_builder = self.config_builder.before_expired(duration);
+        self
+    }
+
+    /// Sets the interval between checks of the absolute renewal window.
+    /// Defaults to ten minutes. Zero or an overflowing interval uses the default.
+    #[must_use]
+    pub fn check_duration(mut self, duration: Duration) -> Self {
+        self.check_duration = duration;
+        self
     }
 
     /// Sets the directory.
@@ -150,6 +322,9 @@ impl<T> AcmeListenerBuilder<T> {
     }
 
     /// Create a handler for HTTP-01 challenge.
+    ///
+    /// Serve `router` on port 80 before awaiting this listener's bind. Initial
+    /// certificate issuance waits for the CA to read that challenge route.
     #[must_use]
     pub fn http01_challenge(self, router: &mut Router) -> Self {
         let config_builder = self.config_builder.http01_challenge();
@@ -195,7 +370,7 @@ impl<T> AcmeListenerBuilder<T> {
 
     /// Sets the cache path for caching certificates.
     ///
-    /// This is not a necessary option. If you do not configure the cache path,
+    /// This is not a necessary option. Without a cache path or custom storage,
     /// the obtained certificate will be stored in memory and will need to be
     /// obtained again when the server is restarted next time.
     #[inline]
@@ -285,43 +460,59 @@ impl<T> AcmeListenerBuilder<T> {
     }
 
     /// Build a certon CertManager from our AcmeConfig.
-    async fn build_certon_manager(config: &AcmeConfig) -> CoreResult<certon::CertManager> {
+    async fn build_certon_manager(
+        config: &AcmeConfig,
+        cache: Arc<certon::CertCache>,
+        cert_resolver: Arc<CertResolver>,
+    ) -> CoreResult<certon::CertManager> {
         // Determine storage backend.
         let storage: Arc<dyn Storage> = if let Some(ref s) = config.storage {
             s.clone()
         } else if let Some(ref path) = config.cache_path {
             Arc::new(FileStorage::new(path))
         } else {
-            Arc::new(FileStorage::default())
+            Arc::new(super::memory_storage::MemoryStorage::default())
         };
 
         // Build the ACME issuer via builder pattern.
-        let mut acme_builder = AcmeIssuer::builder()
-            .ca(&config.directory_url)
-            .agreed(config.agree_to_tos)
-            .storage(storage.clone());
-
-        // Configure contacts.
-        if !config.contacts.is_empty() {
-            acme_builder = acme_builder.email(config.contacts.join(","));
-        }
+        let mut acme_builder = configure_contacts(
+            AcmeIssuer::builder()
+                .ca(&config.directory_url)
+                .agreed(config.agree_to_tos)
+                .storage(storage.clone()),
+            &config.contacts,
+        );
 
         // Configure challenge solver based on challenge type.
         match config.challenge_type {
             ChallengeType::Http01 => {
-                if let Some(ref solver) = config.http01_solver {
-                    acme_builder = acme_builder.http01_solver(solver.clone());
-                }
-                // If no custom solver, the Http01Handler serves challenges
-                // through salvo's router — certon's global active_challenges
-                // map is used as fallback.
+                let solver = config.http01_solver.clone().unwrap_or_else(|| {
+                    Arc::new(super::solvers::TrackedSolver(Arc::new(
+                        super::solvers::Http01Solver {
+                            keys: config.keys_for_http01.clone().expect("HTTP-01 map exists"),
+                        },
+                    )))
+                });
+                acme_builder = acme_builder
+                    .disable_tlsalpn_challenge(true)
+                    .http01_solver(solver);
             }
             ChallengeType::TlsAlpn01 => {
-                if let Some(ref solver) = config.tls_alpn01_solver {
-                    acme_builder = acme_builder.tlsalpn01_solver(solver.clone());
-                }
+                let solver = config.tls_alpn01_solver.clone().unwrap_or_else(|| {
+                    Arc::new(super::solvers::TrackedSolver(Arc::new(
+                        super::solvers::TlsAlpn01Solver {
+                            resolver: cert_resolver,
+                        },
+                    )))
+                });
+                acme_builder = acme_builder
+                    .disable_http_challenge(true)
+                    .tlsalpn01_solver(solver);
             }
             ChallengeType::Dns01 => {
+                acme_builder = acme_builder
+                    .disable_http_challenge(true)
+                    .disable_tlsalpn_challenge(true);
                 if let Some(ref solver) = config.dns01_solver {
                     acme_builder = acme_builder.dns01_solver(solver.clone());
                 }
@@ -355,11 +546,15 @@ impl<T> AcmeListenerBuilder<T> {
         }
 
         // Add the default ACME issuer.
-        issuers.push(Arc::new(acme_issuer));
+        issuers.push(Arc::new(super::solvers::AcmeIssuer(acme_issuer)));
 
         let mut certon_builder = certon::CertManager::builder()
             .storage(storage)
+            .cache(cache)
             .issuers(issuers)
+            // Absolute before_expired checks below own ordinary renewals.
+            // Keep upstream ARI/emergency/revocation safeguards enabled.
+            .renewal_window_ratio(f64::MIN_POSITIVE)
             .key_type(config.key_type)
             .ocsp(config.ocsp.clone());
 
@@ -373,27 +568,53 @@ impl<T> AcmeListenerBuilder<T> {
     /// Build the rustls ServerConfig backed by certon's CertResolver.
     async fn build_server_config(
         config: &AcmeConfig,
-    ) -> CoreResult<(ServerConfig, Arc<CertResolver>, certon::CertManager)> {
-        let certon_manager: certon::CertManager = Self::build_certon_manager(config).await?;
-
-        // Attempt to load/obtain certificates for configured domains.
-        if let Err(e) = certon_manager.manage(&config.domains).await {
-            tracing::warn!(error = ?e, "initial certificate management failed; will retry in background");
-        }
-
+    ) -> CoreResult<(ServerConfig, Arc<AcmeMaintenance>)> {
         // Build the cert resolver backed by certon's cache.
+        let cache = certon::CertCache::new(Default::default());
+        let manager_slot: Arc<OnceLock<Weak<certon::CertManager>>> = Arc::new(OnceLock::new());
         let cert_resolver = if let Some(ref on_demand) = config.on_demand {
-            CertResolver::with_on_demand(certon_manager.cache.clone(), on_demand.clone())
+            let configured = if on_demand.obtain_func.is_some() {
+                on_demand.clone()
+            } else {
+                let slot = manager_slot.clone();
+                Arc::new(OnDemandConfig {
+                    decision_func: on_demand.decision_func.clone(),
+                    host_allowlist: on_demand.host_allowlist.clone(),
+                    rate_limit: on_demand.rate_limit.clone(),
+                    obtain_func: Some(Arc::new(move |domain| {
+                        let manager = slot.get().and_then(Weak::upgrade);
+                        Box::pin(async move {
+                            let manager = manager.ok_or_else(|| {
+                                certon::Error::Config("ACME listener has stopped".into())
+                            })?;
+                            manager.obtain(&domain).await?;
+                            manager.cache_certificate(&domain).await?;
+                            Ok(())
+                        })
+                    })),
+                })
+            };
+            CertResolver::with_on_demand(cache.clone(), configured)
         } else {
-            CertResolver::new(certon_manager.cache.clone())
+            CertResolver::new(cache.clone())
         };
         let cert_resolver = Arc::new(cert_resolver);
+        let certon_manager =
+            Arc::new(Self::build_certon_manager(config, cache, cert_resolver.clone()).await?);
+        let _ = manager_slot.set(Arc::downgrade(&certon_manager));
+        let maintenance = Arc::new(AcmeMaintenance {
+            manager: certon_manager,
+            tasks: Mutex::new(Vec::new()),
+        });
 
         let mut server_config = ServerConfig::builder_with_provider(default_crypto_provider())
             .with_safe_default_protocol_versions()
             .map_err(salvo_core::Error::other)?
             .with_no_client_auth()
-            .with_cert_resolver(cert_resolver.clone());
+            .with_cert_resolver(Arc::new(ManagedResolver {
+                resolver: cert_resolver,
+                _maintenance: maintenance.clone(),
+            }));
 
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
@@ -403,7 +624,7 @@ impl<T> AcmeListenerBuilder<T> {
                 .push(ACME_TLS_ALPN_NAME.to_vec());
         }
 
-        Ok((server_config, cert_resolver, certon_manager))
+        Ok((server_config, maintenance))
     }
 }
 
@@ -419,21 +640,70 @@ where
         let Self {
             inner,
             config_builder,
-            ..
+            check_duration,
         } = self;
 
         let acme_config = config_builder.build()?;
-        let (server_config, _cert_resolver, certon_manager) =
-            Self::build_server_config(&acme_config).await?;
+        let mut inner = inner.try_bind().await?;
+        let (server_config, maintenance) = Self::build_server_config(&acme_config).await?;
+        let certon_manager = &maintenance.manager;
         let server_config = Arc::new(server_config);
         let tls_acceptor = TlsAcceptor::from(server_config.clone());
-        let inner = inner.try_bind().await?;
 
-        // Start certon's background maintenance for renewal + OCSP. Dropping the
-        // returned `JoinHandle` *detaches* the spawned task rather than cancelling
-        // it (per certon's docs), so the renewal/OCSP loop keeps running for the
-        // lifetime of the process even though we don't hold the handle.
-        let _maintenance_handle = certon::start_maintenance(&certon_manager);
+        // Certificate issuance remains synchronous. While the CA validates a
+        // TLS-ALPN-01 challenge, complete handshakes on the bound listener using
+        // the same resolver that will serve renewals after startup.
+        {
+            let mut handshakes = tokio::task::JoinSet::new();
+            let mut accept_retry_at = None;
+            let management = certon_manager.manage(&acme_config.domains);
+            tokio::pin!(management);
+            loop {
+                tokio::select! {
+                    result = &mut management => {
+                        if let Err(error) = result {
+                            tracing::warn!(error = ?error, "initial certificate management failed");
+                        }
+                        break;
+                    }
+                    accepted = async {
+                        if let Some(deadline) = accept_retry_at {
+                            tokio::time::sleep_until(deadline).await;
+                        }
+                        inner.accept(None).await
+                    }, if acme_config.challenge_type == ChallengeType::TlsAlpn01 && handshakes.len() < 64 => {
+                        let accepted = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(error) => {
+                                tracing::error!(error = ?error, "accept connection failed during initial certificate management");
+                                // Match the server's accept-error backoff. Keep the
+                                // delay in this select branch so certificate loading
+                                // or issuance can still finish while accept waits.
+                                accept_retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(10));
+                                continue;
+                            }
+                        };
+                        accept_retry_at = None;
+                        let tls_acceptor = tls_acceptor.clone();
+                        handshakes.spawn(async move {
+                            let _ = tokio::time::timeout(Duration::from_secs(10), tls_acceptor.accept(accepted.stream)).await;
+                        });
+                    }
+                    Some(_) = handshakes.join_next(), if !handshakes.is_empty() => {}
+                }
+            }
+            handshakes.abort_all();
+            while handshakes.join_next().await.is_some() {}
+        }
+        // Certon's obtain path persists new certificates, but unlike its load
+        // path does not put them in the resolver's cache.
+        for domain in &acme_config.domains {
+            if let Err(error) = certon_manager.cache_certificate(domain).await {
+                tracing::warn!(domain, error = ?error, "certificate unavailable after initial management");
+            }
+        }
+
+        maintenance.start(acme_config.before_expired, check_duration);
 
         let acceptor = AcmeAcceptor::new(acme_config, server_config, inner, tls_acceptor);
         Ok(acceptor)
@@ -584,12 +854,47 @@ where
         } = self.inner.accept(fuse_policy).await?;
         Ok(Accepted {
             coupler: TcpCoupler::new(),
-            stream: HandshakeStream::new(self.tls_acceptor.accept(stream), fuse_config),
+            stream: salvo_core::conn::rustls::accept_tls(
+                self.tls_acceptor.accept(stream),
+                fuse_config,
+                conn_ctrl.clone(),
+            ),
             fuse_config,
             conn_ctrl,
             local_addr,
             remote_addr,
             http_scheme: Scheme::HTTPS,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_contacts_are_separate_normalized_uris() {
+        let issuer = configure_contacts(
+            AcmeIssuer::builder().storage(Arc::new(
+                super::super::memory_storage::MemoryStorage::default(),
+            )),
+            &[
+                " first@example.com ".into(),
+                "MAILTO:second@example.com".into(),
+                "mailto:third@example.com".into(),
+            ],
+        )
+        .build();
+        assert_eq!(issuer.email, "first@example.com");
+        let mut account = certon::account::new_account(&issuer.email, KeyType::EcdsaP256).unwrap();
+        issuer.new_account_func.unwrap()(&mut account);
+        assert_eq!(
+            account.contact,
+            [
+                "mailto:first@example.com",
+                "mailto:second@example.com",
+                "mailto:third@example.com"
+            ]
+        );
     }
 }

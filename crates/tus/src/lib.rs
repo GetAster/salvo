@@ -43,6 +43,14 @@
 //! | DELETE | `/uploads/{id}` | Cancels an upload |
 //! | GET | `/uploads/{id}` | Downloads the uploaded file |
 //!
+//! Downloads can read incomplete uploads, but expose only the committed offset
+//! reported by HEAD. Length, ranges and validators describe that same prefix.
+//! A streaming download holds a shared upload lock until its body reaches EOF or
+//! is dropped; PATCH and DELETE wait for it, preventing a changing file from
+//! invalidating the response. Applications should bound slow download lifetimes
+//! through their transport policy. Deployments sharing a store across processes
+//! must supply a locker shared by those processes.
+//!
 //! # Lifecycle Hooks
 //!
 //! React to upload events:
@@ -86,6 +94,7 @@ use crate::options::{MaxSize, TusOptions, UploadFinishPatch, UploadPatch};
 use crate::utils::normalize_path;
 
 mod handlers;
+mod method_override;
 
 /// Error types returned by the tus implementation.
 pub mod error;
@@ -270,10 +279,31 @@ impl Tus {
         }
     }
 
+    /// Creates a service from the complete public configuration.
+    #[must_use]
+    pub fn with_options(mut options: TusOptions) -> Self {
+        options.path = normalize_path(&options.path);
+        Self {
+            options,
+            store: Arc::new(DiskStore::new()),
+        }
+    }
+
+    /// Returns the configuration used by this service.
+    #[must_use]
+    pub fn options(&self) -> &TusOptions {
+        &self.options
+    }
+
+    /// Changes configuration before mounting the router.
+    pub fn options_mut(&mut self) -> &mut TusOptions {
+        &mut self.options
+    }
+
     /// Sets the route path where tus endpoints are mounted.
     #[must_use]
     pub fn path(mut self, path: impl Into<String>) -> Self {
-        self.options.path = path.into();
+        self.options.path = normalize_path(&path.into());
         self
     }
 
@@ -391,8 +421,14 @@ impl Tus {
     }
 
     /// Builds the Salvo router that serves the configured tus endpoints.
-    pub fn into_router(self) -> Router {
-        let base_path = normalize_path(&self.options.path);
+    ///
+    /// `X-HTTP-Method-Override` is resolved when a tus endpoint is selected,
+    /// before any service or router hoops run. Those hoops and lifecycle hooks
+    /// see the effective method. Filters outside this router still see the
+    /// original wire method; use hoops for access control by effective method.
+    pub fn into_router(mut self) -> Router {
+        self.options.path = normalize_path(&self.options.path);
+        let base_path = self.options.path.clone();
         if !self.options.relative_location && self.options.canonical_origin.is_none() {
             tracing::warn!(
                 "Tus is configured with relative_location(false) but no canonical_origin; \
@@ -411,6 +447,7 @@ impl Tus {
             .push(handlers::patch_handler())
             .push(handlers::delete_handler())
             .push(handlers::get_handler())
+            .push(method_override::invalid_override_router())
     }
 }
 
@@ -477,6 +514,16 @@ impl Tus {
     }
 
     /// Sets the hook invoked when an upload completes.
+    ///
+    /// The hook runs for creation requests that complete an upload and for a
+    /// PATCH that transitions an unfinished upload to completion. An empty
+    /// PATCH on an already completed upload does not repeat the hook. A hook
+    /// error does not undo stored bytes. Failure, request cancellation or process
+    /// termination after the upload commits does not guarantee another hook
+    /// invocation, even if the client retries PATCH. This hook is not a durable
+    /// delivery queue. Applications requiring reliable completion processing
+    /// should persist an idempotent task or outbox record and reconcile completed
+    /// uploads to recover notifications lost before that record was persisted.
     #[must_use]
     pub fn on_upload_finish<F, Fut>(mut self, f: F) -> Self
     where

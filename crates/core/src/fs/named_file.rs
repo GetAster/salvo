@@ -7,9 +7,9 @@ use std::ops::{Deref, DerefMut};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use enumflags2::{BitFlags, bitflags};
 use headers::*;
 use mime::Mime;
@@ -21,11 +21,11 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use super::{ChunkedFile, ChunkedState};
 use crate::http::body::ResBody;
 use crate::http::header::{
-    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE, IF_NONE_MATCH, RANGE,
+    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_TYPE, IF_MATCH, IF_NONE_MATCH, IF_RANGE, RANGE,
     X_CONTENT_TYPE_OPTIONS,
 };
 use crate::http::mime::{detect_text_mime, fill_mime_charset_if_need, is_charset_required_mime};
-use crate::http::{HttpRange, Request, Response, StatusCode, StatusError};
+use crate::http::{HttpRange, Method, Request, Response, StatusCode, StatusError};
 use crate::{Depot, Error, Result, Writer, async_trait};
 
 const CHUNK_SIZE: u64 = 1024 * 1024;
@@ -140,13 +140,14 @@ pub struct NamedFile {
     file: File,
     modified: Option<SystemTime>,
     buffer_size: u64,
+    #[cfg(unix)]
     metadata: Metadata,
     flags: BitFlags<Flag>,
     content_type: mime::Mime,
     content_disposition: Option<HeaderValue>,
     content_encoding: Option<HeaderValue>,
-    /// Pre-read content for small files, avoiding ChunkedFile + spawn_blocking overhead.
-    preread: Option<Bytes>,
+    preload_threshold: u64,
+    length: u64,
 }
 
 /// Builder for constructing [`NamedFile`] instances with custom configuration.
@@ -177,6 +178,7 @@ pub struct NamedFile {
 #[derive(Clone, Debug)]
 pub struct NamedFileBuilder {
     path: PathBuf,
+    file: Option<Arc<Mutex<Option<std::fs::File>>>>,
     attached_name: Option<String>,
     disposition_name: Option<String>,
     disposition_type: Option<String>,
@@ -184,9 +186,27 @@ pub struct NamedFileBuilder {
     content_encoding: Option<String>,
     buffer_size: Option<u64>,
     preload_threshold: Option<u64>,
+    max_length: Option<u64>,
     flags: BitFlags<Flag>,
 }
 impl NamedFileBuilder {
+    /// Uses an already-open file instead of opening the builder's path.
+    ///
+    /// The path remains the logical name used for MIME inference and
+    /// `Content-Disposition`. Metadata and response bytes come from this handle,
+    /// which is rewound to the start during [`Self::build`]. Callers must prevent
+    /// concurrent modification of the file or its position through other handles.
+    ///
+    /// The supplied handle is consumed by the first build attempt. Cloned
+    /// builders share this single-use handle, so subsequent attempts return an
+    /// error instead of opening the path or sharing the handle's position.
+    #[inline]
+    #[must_use]
+    pub fn file(mut self, file: std::fs::File) -> Self {
+        self.file = Some(Arc::new(Mutex::new(Some(file))));
+        self
+    }
+
     /// Sets attached filename and returns `Self`.
     #[inline]
     #[must_use]
@@ -256,13 +276,25 @@ impl NamedFileBuilder {
 
     /// Sets small-file preload threshold and returns `Self`.
     ///
-    /// Files whose size is less than or equal to this threshold are read during build and sent from
-    /// memory. Larger files are streamed in chunks using [`Self::buffer_size`]. Set this to `0` to
-    /// disable preloading for non-empty files.
+    /// Full responses whose size is less than or equal to this threshold are read only after
+    /// conditional and range checks, then sent from memory. Larger files are streamed using
+    /// [`Self::buffer_size`]. Set this to `0` to disable preloading for non-empty files.
     #[inline]
     #[must_use]
     pub fn preload_threshold(mut self, threshold: u64) -> Self {
         self.preload_threshold = Some(threshold);
+        self
+    }
+
+    /// Limits the served representation to at most this many bytes from the file start.
+    ///
+    /// The length is captured at build time as the smaller of this limit and the physical
+    /// file length. Content detection, validators, byte ranges and response bodies all use
+    /// that representation. Callers must prevent concurrent modification of those bytes.
+    #[inline]
+    #[must_use]
+    pub fn max_length(mut self, length: u64) -> Self {
+        self.max_length = Some(length);
         self
     }
 
@@ -311,7 +343,7 @@ impl NamedFileBuilder {
 
     /// Build a new `NamedFile` and send it.
     pub async fn send(self, req_headers: &HeaderMap, res: &mut Response) {
-        if !self.path.exists() {
+        if self.file.is_none() && !self.path.exists() {
             res.render(StatusError::not_found());
         } else {
             match self.build().await {
@@ -325,10 +357,12 @@ impl NamedFileBuilder {
     pub async fn build(self) -> Result<NamedFile> {
         let Self {
             path,
+            file,
             content_type,
             content_encoding,
             buffer_size,
             preload_threshold,
+            max_length,
             disposition_type,
             attached_name,
             disposition_name,
@@ -369,39 +403,33 @@ impl NamedFileBuilder {
 
         let needs_detection_sample = needs_charset || needs_detect;
 
-        // Single spawn_blocking: open + metadata + optional preread/detection sample.
-        // This replaces 3-7 separate spawn_blocking calls with just 1.
+        // Open and inspect only. Defer body reads until conditional/range checks finish.
         struct FileInfo {
             file: std::fs::File,
             metadata: Metadata,
-            preread: Option<Vec<u8>>,
+            length: u64,
             detection_sample: Option<Vec<u8>>,
         }
         let blocking_path = path.clone();
         let info = tokio::task::spawn_blocking(move || -> std::io::Result<FileInfo> {
-            let mut file = std::fs::File::open(&blocking_path)?;
-            let metadata = file.metadata()?;
-            let file_size = metadata.len();
-
-            // For small files (size <= preload_threshold), read the entire content now.
-            // This avoids ChunkedFile's spawn_blocking + into_std overhead later.
-            let preread = if file_size <= preload_threshold {
-                let mut buf = vec![0u8; file_size as usize];
-                file.read_exact(&mut buf)?;
-                Some(buf)
-            } else {
-                None
+            let mut file = match file {
+                Some(file) => file
+                    .lock()
+                    .map_err(|_| std::io::Error::other("supplied file handle lock poisoned"))?
+                    .take()
+                    .ok_or_else(|| {
+                        std::io::Error::other("supplied file handle has already been consumed")
+                    })?,
+                None => std::fs::File::open(&blocking_path)?,
             };
-
+            file.seek(SeekFrom::Start(0))?;
+            let metadata = file.metadata()?;
+            let length = metadata.len().min(max_length.unwrap_or(u64::MAX));
             let detection_sample = if needs_detection_sample {
-                if let Some(preread) = &preread {
-                    Some(preread[..cmp::min(1024, preread.len())].to_vec())
-                } else {
-                    let mut sample = vec![0u8; cmp::min(1024, file_size) as usize];
-                    file.read_exact(&mut sample)?;
-                    file.seek(SeekFrom::Start(0))?;
-                    Some(sample)
-                }
+                let mut sample = vec![0u8; cmp::min(1024, length) as usize];
+                file.read_exact(&mut sample)?;
+                file.seek(SeekFrom::Start(0))?;
+                Some(sample)
             } else {
                 None
             };
@@ -409,7 +437,7 @@ impl NamedFileBuilder {
             Ok(FileInfo {
                 file,
                 metadata,
-                preread,
+                length,
                 detection_sample,
             })
         })
@@ -419,7 +447,7 @@ impl NamedFileBuilder {
 
         let file = File::from_std(info.file);
 
-        // Resolve content type, using preread bytes for charset detection if needed.
+        // Resolve content type using the bounded detection sample if needed.
         let content_type = if let Some(mut mime) = inferred_mime {
             if needs_charset {
                 let sample = info.detection_sample.as_deref().unwrap_or(&[]);
@@ -432,8 +460,6 @@ impl NamedFileBuilder {
         } else {
             mime::APPLICATION_OCTET_STREAM
         };
-
-        let preread = info.preread.map(Bytes::from);
 
         let content_encoding = match content_encoding {
             Some(content_encoding) => Some(
@@ -460,11 +486,13 @@ impl NamedFileBuilder {
             content_type,
             content_disposition,
             modified: info.metadata.modified().ok(),
+            #[cfg(unix)]
             metadata: info.metadata,
             content_encoding,
             buffer_size: buf_size,
             flags,
-            preread,
+            preload_threshold,
+            length: info.length,
         })
     }
 }
@@ -608,6 +636,7 @@ impl NamedFile {
     pub fn builder(path: impl Into<PathBuf>) -> NamedFileBuilder {
         NamedFileBuilder {
             path: path.into(),
+            file: None,
             attached_name: None,
             disposition_name: None,
             disposition_type: None,
@@ -615,6 +644,7 @@ impl NamedFile {
             content_encoding: None,
             buffer_size: None,
             preload_threshold: None,
+            max_length: None,
             flags: BitFlags::default(),
         }
     }
@@ -742,7 +772,7 @@ impl NamedFile {
             let etag_str = format!(
                 "\"{:x}-{:x}-{:x}-{:x}\"",
                 ino,
-                self.metadata.len(),
+                self.length,
                 dur.as_secs(),
                 dur.subsec_nanos()
             );
@@ -796,20 +826,36 @@ impl NamedFile {
             self.flags.remove(Flag::LastModified);
         }
     }
-    /// Consume self and send content to [`Response`].
+    /// Consume self and send content to [`Response`] with GET semantics.
+    ///
+    /// Use [`Self::send_with_method`] when the actual request method is available.
     pub async fn send(self, req_headers: &HeaderMap, res: &mut Response) {
-        self.send_inner(req_headers, res, true).await;
+        self.send_with_method(&Method::GET, req_headers, res).await;
     }
 
     /// Consume self and send only the headers to [`Response`].
     ///
-    /// This follows the same conditional and range handling as [`Self::send`], but does not attach
-    /// a response body.
+    /// This follows the same conditional handling as [`Self::send`], but ignores `Range` and
+    /// does not attach a response body, as required for a HEAD request.
     pub async fn send_head(self, req_headers: &HeaderMap, res: &mut Response) {
-        self.send_inner(req_headers, res, false).await;
+        self.send_with_method(&Method::HEAD, req_headers, res).await;
     }
 
-    async fn send_inner(mut self, req_headers: &HeaderMap, res: &mut Response, send_body: bool) {
+    /// Send content using the request method for conditional and range handling.
+    ///
+    /// Only GET applies byte ranges. A matching `If-None-Match` returns 304 for
+    /// GET/HEAD and 412 for other methods; `If-Modified-Since` only applies to GET/HEAD.
+    pub async fn send_with_method(
+        mut self,
+        method: &Method,
+        req_headers: &HeaderMap,
+        res: &mut Response,
+    ) {
+        let send_body = method != Method::HEAD;
+        let retrieval = method == Method::GET || method == Method::HEAD;
+        if !send_body {
+            res.take_body();
+        }
         let etag = if self.flags.contains(Flag::Etag) {
             self.etag()
         } else {
@@ -824,6 +870,10 @@ impl NamedFile {
         // check preconditions
         let precondition_failed = if !any_match(etag.as_ref(), req_headers) {
             true
+        } else if req_headers.contains_key(IF_MATCH) {
+            // If-Match takes precedence over If-Unmodified-Since (RFC 9110,
+            // section 13.1.4), including the wildcard existence precondition.
+            false
         } else if let (Some(last_modified), Some(since)) =
             (&last_modified, req_headers.typed_get::<IfUnmodifiedSince>())
         {
@@ -836,7 +886,7 @@ impl NamedFile {
         // check last modified
         let not_modified = if !none_match(etag.as_ref(), req_headers) {
             true
-        } else if req_headers.contains_key(IF_NONE_MATCH) {
+        } else if req_headers.contains_key(IF_NONE_MATCH) || !retrieval {
             false
         } else if let (Some(last_modified), Some(since)) =
             (&last_modified, req_headers.typed_get::<IfModifiedSince>())
@@ -846,6 +896,18 @@ impl NamedFile {
         } else {
             false
         };
+
+        // If-Range uses strong entity-tag comparison or an exact HTTP-date
+        // match. A failed (or invalid) validator ignores Range, even when the
+        // requested range would otherwise be unsatisfiable.
+        let range_allowed = !req_headers.contains_key(IF_RANGE)
+            || req_headers.typed_get::<IfRange>().is_some_and(|if_range| {
+                etag.as_ref()
+                    .is_some_and(|etag| if_range == IfRange::etag(etag.clone()))
+                    || last_modified
+                        .and_then(|mtime| self.encodable_last_modified(mtime))
+                        .is_some_and(|mtime| if_range == IfRange::date(mtime))
+            });
 
         // A caller may have already chosen the response's Content-Type. Default
         // the disposition from the type the client will actually receive, not
@@ -897,11 +959,7 @@ impl NamedFile {
         }
         res.headers_mut().typed_insert(AcceptRanges::bytes());
 
-        let mut length = self.metadata.len();
-        if let Some(content_encoding) = &self.content_encoding {
-            res.headers_mut()
-                .insert(CONTENT_ENCODING, content_encoding.clone());
-        }
+        let mut length = self.length;
         // Conditional request handling must precede Range processing: per RFC 7232
         // a `304 Not Modified` / `412 Precondition Failed` takes priority over the
         // `206`/`416` produced by a Range request.
@@ -909,16 +967,42 @@ impl NamedFile {
             res.status_code(StatusCode::PRECONDITION_FAILED);
             return;
         } else if not_modified {
-            res.status_code(StatusCode::NOT_MODIFIED);
+            if retrieval {
+                res.take_body();
+            }
+            if retrieval && let Some(content_encoding) = &self.content_encoding {
+                res.headers_mut()
+                    .insert(CONTENT_ENCODING, content_encoding.clone());
+            }
+            res.status_code(if retrieval {
+                StatusCode::NOT_MODIFIED
+            } else {
+                StatusCode::PRECONDITION_FAILED
+            });
             return;
         }
 
-        let file_size = self.metadata.len();
+        // Range only applies to GET. HEAD describes the entire representation,
+        // even if the requested range is malformed or unsatisfiable.
+        if !send_body {
+            if let Some(content_encoding) = &self.content_encoding {
+                res.headers_mut()
+                    .insert(CONTENT_ENCODING, content_encoding.clone());
+            }
+            res.status_code(StatusCode::OK);
+            res.headers_mut().typed_insert(ContentLength(length));
+            return;
+        }
+
+        let file_size = self.length;
         let mut offset = 0;
         let mut is_partial = false;
 
         // check for range header
-        if let Some(range) = req_headers.get(RANGE) {
+        if let Some(range) = req_headers
+            .get(RANGE)
+            .filter(|_| method == Method::GET && range_allowed)
+        {
             let Ok(range) = range.to_str() else {
                 res.status_code(StatusCode::BAD_REQUEST);
                 return;
@@ -934,6 +1018,11 @@ impl NamedFile {
                 // is not supported here. Per RFC 7233 the server may ignore the Range
                 // header and return the full `200 OK` representation instead.
                 Ok(ranges) if ranges.len() > 1 => {}
+                // RFC 9110 section 14.2 requires ignoring unknown range units.
+                Err(_)
+                    if range
+                        .split_once('=')
+                        .is_some_and(|(unit, _)| !unit.eq_ignore_ascii_case("bytes")) => {}
                 // Empty / unsatisfiable range.
                 _ => {
                     res.headers_mut()
@@ -944,6 +1033,12 @@ impl NamedFile {
             }
         }
 
+        // Only label responses that describe or carry this file representation.
+        // Error bodies may be generated by the catcher or supplied by the application.
+        if let Some(content_encoding) = &self.content_encoding {
+            res.headers_mut()
+                .insert(CONTENT_ENCODING, content_encoding.clone());
+        }
         if is_partial {
             // Range request
             res.status_code(StatusCode::PARTIAL_CONTENT);
@@ -960,37 +1055,41 @@ impl NamedFile {
             }
             res.headers_mut().typed_insert(ContentLength(total_size));
 
-            if !send_body {
-                return;
-            }
-
-            // Fast path: slice from preread bytes if available
-            if let Some(preread) = self.preread.take() {
-                let end = cmp::min(offset.saturating_add(total_size) as usize, preread.len());
-                let start = cmp::min(offset as usize, end);
-                res.replace_body(ResBody::Once(preread.slice(start..end)));
-            } else {
-                let reader = ChunkedFile {
-                    offset,
-                    total_size,
-                    read_size: 0,
-                    state: ChunkedState::File(Some(self.file.into_std().await)),
-                    buffer_size: self.buffer_size,
-                };
-                res.stream(reader);
-            }
+            let reader = ChunkedFile {
+                offset,
+                total_size,
+                read_size: 0,
+                state: ChunkedState::File(Some(self.file.into_std().await)),
+                buffer_size: self.buffer_size,
+            };
+            res.stream(reader);
         } else {
             // Full file response
             res.status_code(StatusCode::OK);
             res.headers_mut().typed_insert(ContentLength(length));
 
-            if !send_body {
-                return;
-            }
-
-            // Fast path: send preread bytes directly — zero spawn_blocking calls
-            if let Some(preread) = self.preread.take() {
-                res.replace_body(ResBody::Once(preread));
+            if length <= self.preload_threshold {
+                let mut file = self.file.into_std().await;
+                let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+                    let size = usize::try_from(length).map_err(std::io::Error::other)?;
+                    let mut bytes = vec![0; size];
+                    file.seek(SeekFrom::Start(0))?;
+                    file.read_exact(&mut bytes)?;
+                    Ok(bytes)
+                })
+                .await;
+                match read {
+                    Ok(Ok(bytes)) => {
+                        res.replace_body(ResBody::Once(bytes.into()));
+                    }
+                    error => {
+                        tracing::error!(error = ?error, "read file body failed");
+                        res.headers_mut()
+                            .remove(crate::http::header::CONTENT_LENGTH);
+                        res.headers_mut().remove(CONTENT_ENCODING);
+                        res.render(StatusError::internal_server_error());
+                    }
+                }
             } else {
                 let reader = ChunkedFile {
                     offset,
@@ -1008,7 +1107,8 @@ impl NamedFile {
 #[async_trait]
 impl Writer for NamedFile {
     async fn write(self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
-        self.send(req.headers(), res).await;
+        self.send_with_method(req.method(), req.headers(), res)
+            .await;
     }
 }
 
@@ -1074,6 +1174,247 @@ fn none_match(etag: Option<&ETag>, req_headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn supplied_file_uses_handle_bytes_and_logical_name() {
+        use crate::test::ResponseExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let physical_path = temp_dir.path().join("physical-file");
+        let contents = b"authorized file contents";
+        std::fs::write(&physical_path, contents).unwrap();
+
+        // Exercise both MIME sampling and extension-only inference, with both
+        // preloaded and streamed response bodies.
+        for (extension, expected_type) in
+            [("txt", "text/plain"), ("bin", "application/octet-stream")]
+        {
+            for preload in [0, 64] {
+                let logical_path = temp_dir.path().join(format!("download.{extension}"));
+                assert!(!logical_path.exists());
+                let mut handle = std::fs::File::open(&physical_path).unwrap();
+                handle.seek(SeekFrom::Start(7)).unwrap();
+                let mut file = NamedFile::builder(&logical_path)
+                    .file(handle)
+                    .disposition_type("attachment")
+                    .preload_threshold(preload)
+                    .build()
+                    .await
+                    .unwrap();
+
+                assert_eq!(file.path(), logical_path.as_path());
+                assert_eq!(file.content_type().essence_str(), expected_type);
+                assert_eq!(file.file.stream_position().await.unwrap(), 0);
+
+                let mut response = Response::new();
+                file.send(&HeaderMap::new(), &mut response).await;
+                assert_eq!(response.status_code, Some(StatusCode::OK));
+                assert_eq!(
+                    response.headers()["content-length"],
+                    contents.len().to_string()
+                );
+                assert_eq!(
+                    response.headers()[CONTENT_DISPOSITION],
+                    format!("attachment; filename=\"download.{extension}\"")
+                );
+                assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), contents);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_send_uses_supplied_file_for_missing_logical_path() {
+        use crate::test::ResponseExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let physical_path = temp_dir.path().join("physical-file");
+        std::fs::write(&physical_path, b"authorized file contents").unwrap();
+        let logical_path = temp_dir.path().join("missing.txt");
+        let mut handle = std::fs::File::open(&physical_path).unwrap();
+        handle.seek(SeekFrom::Start(7)).unwrap();
+        let mut response = Response::new();
+        NamedFile::builder(logical_path)
+            .file(handle)
+            .send(&HeaderMap::new(), &mut response)
+            .await;
+
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert_eq!(
+            response.take_bytes(None).await.unwrap().as_ref(),
+            b"authorized file contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloned_builders_consume_supplied_file_only_once() {
+        use crate::test::ResponseExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let physical_path = temp_dir.path().join("physical-file");
+        std::fs::write(&physical_path, b"authorized file contents").unwrap();
+        let builder = NamedFile::builder(temp_dir.path().join("missing.txt"))
+            .file(std::fs::File::open(physical_path).unwrap());
+        let cloned_builder = builder.clone();
+        let file = builder.build().await.unwrap();
+        let error = cloned_builder.build().await.unwrap_err();
+        assert!(error.to_string().contains("already been consumed"));
+
+        let mut response = Response::new();
+        file.send(&HeaderMap::new(), &mut response).await;
+        assert_eq!(
+            response.take_bytes(None).await.unwrap().as_ref(),
+            b"authorized file contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn if_match_takes_precedence_over_if_unmodified_since() {
+        use crate::http::header::IF_UNMODIFIED_SINCE;
+        use crate::test::ResponseExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("preconditions.txt");
+        std::fs::write(&path, b"content").unwrap();
+        for (if_match, expected) in [
+            (Some("matching"), StatusCode::OK),
+            (Some("*"), StatusCode::OK),
+            (Some("\"outdated\""), StatusCode::PRECONDITION_FAILED),
+            (Some("weak"), StatusCode::PRECONDITION_FAILED),
+            (None, StatusCode::PRECONDITION_FAILED),
+        ] {
+            for head in [false, true] {
+                let mut file = NamedFile::open(&path).await.unwrap();
+                // Deterministic times, independent of filesystem timestamps.
+                file.modified = Some(UNIX_EPOCH + Duration::from_secs(100));
+                let mut headers = HeaderMap::new();
+                if let Some(value) = if_match {
+                    // Derive the matching validator after setting the timestamp.
+                    if value == "matching" || value == "weak" {
+                        let mut current = HeaderMap::new();
+                        current.typed_insert(file.etag().unwrap());
+                        let value = current[crate::http::header::ETAG].to_str().unwrap();
+                        headers.insert(
+                            IF_MATCH,
+                            if if_match == Some("matching") {
+                                value.parse().unwrap()
+                            } else {
+                                format!("W/{value}").parse().unwrap()
+                            },
+                        );
+                    } else {
+                        headers.insert(IF_MATCH, value.parse().unwrap());
+                    }
+                }
+                headers.insert(
+                    IF_UNMODIFIED_SINCE,
+                    "Thu, 01 Jan 1970 00:00:00 GMT".parse().unwrap(),
+                );
+                let mut res = Response::new();
+                if head {
+                    file.send_head(&headers, &mut res).await;
+                } else {
+                    file.send(&headers, &mut res).await;
+                }
+                assert_eq!(res.status_code, Some(expected));
+                let body = res.take_bytes(None).await.unwrap();
+                if !head && expected == StatusCode::OK {
+                    assert_eq!(body.as_ref(), b"content");
+                } else {
+                    assert!(body.is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn if_range_requires_a_matching_validator() {
+        use crate::test::ResponseExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("range.txt");
+        std::fs::write(&path, b"new-content").unwrap();
+        let file = NamedFile::open(&path).await.unwrap();
+        let etag = file.etag().unwrap();
+        let mut etag_headers = HeaderMap::new();
+        etag_headers.typed_insert(etag.clone());
+        let weak_etag = format!("W/{}", etag_headers["etag"].to_str().unwrap())
+            .parse()
+            .unwrap();
+        let modified = file.last_modified().unwrap();
+        let valid_date = IfRange::date(modified);
+        for (validator, expected_status, expected_body) in [
+            (
+                IfRange::etag("\"old-etag\"".parse().unwrap()),
+                StatusCode::OK,
+                "new-content",
+            ),
+            (
+                IfRange::etag(etag.clone()),
+                StatusCode::PARTIAL_CONTENT,
+                "content",
+            ),
+            (IfRange::etag(weak_etag), StatusCode::OK, "new-content"),
+            (
+                IfRange::date(modified - Duration::from_secs(60)),
+                StatusCode::OK,
+                "new-content",
+            ),
+            (
+                IfRange::date(modified + Duration::from_secs(60)),
+                StatusCode::OK,
+                "new-content",
+            ),
+            (valid_date, StatusCode::PARTIAL_CONTENT, "content"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, HeaderValue::from_static("bytes=4-"));
+            headers.typed_insert(validator);
+            let mut response = Response::new();
+            NamedFile::open(&path)
+                .await
+                .unwrap()
+                .send(&headers, &mut response)
+                .await;
+            assert_eq!(response.status_code, Some(expected_status));
+            assert_eq!(response.take_string().await.unwrap(), expected_body);
+        }
+
+        // A failed validator must bypass even an unsatisfiable Range.
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=100-"));
+        headers.typed_insert(IfRange::etag("\"old-etag\"".parse().unwrap()));
+        let mut response = Response::new();
+        NamedFile::open(&path)
+            .await
+            .unwrap()
+            .send_head(&headers, &mut response)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert!(response.body.is_none());
+
+        headers.insert(RANGE, HeaderValue::from_static("bytes=4-"));
+        headers.insert(IF_RANGE, HeaderValue::from_static("invalid-validator"));
+        let mut response = Response::new();
+        NamedFile::open(&path)
+            .await
+            .unwrap()
+            .send(&headers, &mut response)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert_eq!(response.take_string().await.unwrap(), "new-content");
+
+        headers.typed_insert(IfRange::etag(etag));
+        let named = NamedFile::builder(&path)
+            .use_etag(false)
+            .use_last_modified(false)
+            .build()
+            .await
+            .unwrap();
+        let mut response = Response::new();
+        named.send(&headers, &mut response).await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert_eq!(response.take_string().await.unwrap(), "new-content");
+    }
 
     #[test]
     fn content_disposition_escapes_quoted_filename() {
@@ -1385,7 +1726,7 @@ mod tests {
             .expect("build named file");
 
         assert_eq!(named.buffer_size, PRELOAD_THRESHOLD * 2);
-        assert!(named.preread.is_none());
+        assert_eq!(named.preload_threshold, PRELOAD_THRESHOLD);
     }
 
     #[tokio::test]
@@ -1403,10 +1744,104 @@ mod tests {
             .await
             .expect("build named file");
 
-        assert_eq!(
-            named.preread.as_ref().map(Bytes::len),
-            Some((PRELOAD_THRESHOLD + 1) as usize)
+        assert_eq!(named.preload_threshold, PRELOAD_THRESHOLD + 1);
+        let mut res = Response::new();
+        named.send(&HeaderMap::new(), &mut res).await;
+        assert!(
+            matches!(res.body, ResBody::Once(bytes) if bytes.len() == (PRELOAD_THRESHOLD + 1) as usize)
         );
+    }
+
+    #[tokio::test]
+    async fn conditional_responses_do_not_read_file_bodies() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("data.bin");
+        for status in [StatusCode::NOT_MODIFIED, StatusCode::PRECONDITION_FAILED] {
+            std::fs::write(&path, vec![42; 900 * 1024]).unwrap();
+            let mut named = NamedFile::builder(&path)
+                .content_type(mime::APPLICATION_OCTET_STREAM)
+                .build()
+                .await
+                .unwrap();
+            // A build must inspect metadata only when no content sample is needed.
+            assert_eq!(named.file.stream_position().await.unwrap(), 0);
+            let mut headers = HeaderMap::new();
+            if status == StatusCode::NOT_MODIFIED {
+                headers.typed_insert(IfNoneMatch::from(named.etag().unwrap()));
+            } else {
+                headers.insert(IF_MATCH, HeaderValue::from_static("\"does-not-match\""));
+            }
+            // Any late body read would now fail with UnexpectedEof.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            let mut res = Response::new();
+            named.send(&headers, &mut res).await;
+            assert_eq!(res.status_code, Some(status));
+            assert!(matches!(res.body, ResBody::None));
+        }
+    }
+
+    #[tokio::test]
+    async fn max_length_bounds_full_range_and_validators() {
+        use crate::test::ResponseExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("data.txt");
+        std::fs::write(&path, b"committedUNCOMMITTED").unwrap();
+        let mut full = Response::new();
+        let named = NamedFile::builder(&path)
+            .max_length(9)
+            .build()
+            .await
+            .unwrap();
+        let bounded_etag = named.etag();
+        let complete = NamedFile::open(&path).await.unwrap();
+        assert_ne!(bounded_etag, complete.etag());
+        named.send(&HeaderMap::new(), &mut full).await;
+        assert_eq!(full.headers()[crate::http::header::CONTENT_LENGTH], "9");
+        assert_eq!(full.take_string().await.unwrap(), "committed");
+        let named = NamedFile::builder(&path)
+            .max_length(9)
+            .preload_threshold(0)
+            .build()
+            .await
+            .unwrap();
+        let mut streamed = Response::new();
+        named.send(&HeaderMap::new(), &mut streamed).await;
+        assert_eq!(streamed.take_string().await.unwrap(), "committed");
+        for (range, status, body) in [
+            ("bytes=7-20", StatusCode::PARTIAL_CONTENT, "ed"),
+            ("bytes=9-", StatusCode::RANGE_NOT_SATISFIABLE, ""),
+        ] {
+            let named = NamedFile::builder(&path)
+                .max_length(9)
+                .build()
+                .await
+                .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, HeaderValue::from_static(range));
+            let mut res = Response::new();
+            named.send(&headers, &mut res).await;
+            assert_eq!(res.status_code, Some(status));
+            if status == StatusCode::PARTIAL_CONTENT {
+                assert_eq!(res.take_string().await.unwrap(), body);
+            } else {
+                assert_eq!(
+                    res.headers()[crate::http::header::CONTENT_RANGE],
+                    "bytes */9"
+                );
+            }
+        }
+        let named = NamedFile::builder(&path)
+            .max_length(0)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(named.length, 0);
+        assert_eq!(named.content_type().type_(), mime::TEXT);
     }
 
     #[tokio::test]
@@ -1423,7 +1858,7 @@ mod tests {
 
         assert_eq!(named.content_type().type_(), mime::TEXT);
         assert_eq!(named.content_type().subtype(), mime::PLAIN);
-        assert!(named.preread.is_none());
+        assert_eq!(named.preload_threshold, 0);
     }
 
     #[tokio::test]
@@ -1447,7 +1882,7 @@ mod tests {
                 .map(|v| v.as_str()),
             Some("utf-8")
         );
-        assert!(named.preread.is_none());
+        assert_eq!(named.preload_threshold, 0);
     }
 
     #[tokio::test]

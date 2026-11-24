@@ -18,6 +18,10 @@ use crate::{BoxedError, Client, HyperRequest, HyperResponse, Proxy, Upstreams};
 ///
 /// This client provides proxy capabilities using the Hyper HTTP client library.
 /// It's lightweight and tightly integrated with the Tokio runtime.
+///
+/// With only `hyper-client` enabled, use [`Self::new`] with a custom connector.
+/// The default HTTPS connector requires `ring`, `aws-lc-rs`, or a process-level
+/// rustls crypto provider installed by the application.
 #[derive(Clone, Debug)]
 pub struct HyperClient<C> {
     inner: HyperUtilClient<C, ReqBody>,
@@ -36,18 +40,22 @@ pub struct HyperClient<C> {
 /// which still has to install ring as the process default for `reqwest`'s sake: were the two to
 /// disagree, which provider this function returns would depend on whether a `ReqwestClient` had
 /// been built first.
-fn default_crypto_provider() -> Arc<CryptoProvider> {
+fn default_crypto_provider() -> io::Result<Arc<CryptoProvider>> {
     if let Some(provider) = CryptoProvider::get_default() {
-        return Arc::clone(provider);
+        return Ok(Arc::clone(provider));
     }
 
     #[cfg(feature = "ring")]
     {
-        Arc::new(rustls::crypto::ring::default_provider())
+        Ok(Arc::new(rustls::crypto::ring::default_provider()))
     }
-    #[cfg(not(feature = "ring"))]
+    #[cfg(all(not(feature = "ring"), feature = "aws-lc-rs"))]
     {
-        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+        Ok(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+    }
+    #[cfg(not(any(feature = "ring", feature = "aws-lc-rs")))]
+    {
+        Err(io::Error::other("install a rustls CryptoProvider or enable a proxy crypto backend before constructing the default HTTPS client"))
     }
 }
 
@@ -72,14 +80,14 @@ impl Default for HyperClient<HttpsConnector<HttpConnector>> {
         let https = build_default_https_connector_with(
             || {
                 Ok(HttpsConnectorBuilder::new()
-                    .with_provider_and_native_roots(default_crypto_provider())?
+                    .with_provider_and_native_roots(default_crypto_provider()?)?
                     .https_or_http()
                     .enable_all_versions()
                     .build())
             },
             || {
                 Ok(HttpsConnectorBuilder::new()
-                    .with_provider_and_webpki_roots(default_crypto_provider())
+                    .with_provider_and_webpki_roots(default_crypto_provider()?)
                     .map_err(io::Error::other)?
                     .https_or_http()
                     .enable_all_versions()
@@ -125,8 +133,8 @@ where
         proxied_request: HyperRequest,
         request_upgraded: Option<OnUpgrade>,
     ) -> Result<HyperResponse, Self::Error> {
-        let request_upgrade_type =
-            crate::get_upgrade_type(proxied_request.headers()).map(|s| s.to_owned());
+        let request_upgrade_type = crate::get_upgrade_type(proxied_request.headers());
+        let conn_ctrl = proxied_request.extensions().get::<salvo_core::conn::ConnCtrl>().cloned();
 
         let mut response = self
             .inner
@@ -136,12 +144,13 @@ where
 
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             let response_upgrade_type = crate::get_upgrade_type(response.headers());
-            // RFC 7230 §6.7 makes Upgrade tokens case-insensitive (`websocket`,
-            // `WebSocket`, ... are all the same protocol). Compare without allocating.
-            if crate::upgrade_types_match(request_upgrade_type.as_deref(), response_upgrade_type) {
+            if crate::upgrade_types_match(
+                request_upgrade_type.as_deref(),
+                response_upgrade_type.as_deref(),
+            ) {
                 let response_upgraded = hyper::upgrade::on(&mut response).await?;
                 if let Some(request_upgraded) = request_upgraded {
-                    tokio::spawn(async move {
+                    crate::spawn_upgrade(conn_ctrl, async move {
                         match request_upgraded.await {
                             Ok(request_upgraded) => {
                                 let mut request_upgraded = TokioIo::new(request_upgraded);
@@ -188,7 +197,7 @@ mod tests {
             || Err(io::Error::other("missing native roots")),
             || {
                 Ok(HttpsConnectorBuilder::new()
-                    .with_provider_and_webpki_roots(default_crypto_provider())
+                    .with_provider_and_webpki_roots(default_crypto_provider()?)
                     .map_err(io::Error::other)?
                     .https_or_http()
                     .enable_all_versions()
@@ -212,18 +221,61 @@ mod tests {
 
     #[tokio::test]
     async fn test_hyper_client() {
-        let router = Router::new().push(
-            Router::with_path("rust/{**rest}")
-                .goal(Proxy::new(vec!["https://salvo.rs"], HyperClient::default())),
-        );
+        struct UpstreamTask(tokio::task::JoinHandle<()>);
+        impl Drop for UpstreamTask {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
 
-        let content = TestClient::get("http://127.0.0.1:5801/rust/guide/index.html")
-            .send(router)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut upstream = UpstreamTask(tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |req: hyper::Request<hyper::body::Incoming>| async move {
+                    assert_eq!(req.method(), hyper::Method::GET);
+                    assert_eq!(req.uri().path(), "/guide/index.html");
+                    assert_eq!(req.uri().query(), Some("lang=en"));
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(StatusCode::CREATED)
+                            .header("content-type", "text/plain")
+                            .header("x-test-upstream", "local-hyper")
+                            .body(ResBody::from("controlled hyper upstream body"))
+                            .unwrap(),
+                    )
+                },
+            );
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        }));
+        let router = Router::new().push(Router::with_path("rust/{**rest}").goal(Proxy::new(
+            vec![format!("http://{address}")],
+            HyperClient::default(),
+        )));
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut response =
+                TestClient::get("http://local.example/rust/guide/index.html?lang=en")
+                    .send(router)
+                    .await;
+            assert_eq!(response.status_code, Some(StatusCode::CREATED));
+            assert_eq!(response.headers()["x-test-upstream"], "local-hyper");
+            assert_eq!(
+                response.take_string().await.unwrap(),
+                "controlled hyper upstream body"
+            );
+        })
+        .await
+        .expect("local proxy round trip timed out");
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut upstream.0)
             .await
-            .take_string()
-            .await
+            .expect("local upstream did not finish")
             .unwrap();
-        assert!(content.contains("Salvo"));
     }
 
     #[test]
@@ -233,4 +285,3 @@ mod tests {
         assert_eq!(handler.upstreams_mut().len(), 1);
     }
 }
-

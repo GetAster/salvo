@@ -145,14 +145,15 @@ impl Metadata {
 
     /// Check is this type has body required.
     pub(crate) fn has_body_required(&self) -> bool {
-        if self
-            .default_sources
-            .iter()
-            .any(|s| s.from == SourceFrom::Body)
-        {
-            return true;
-        }
-        self.fields.iter().any(|f| f.has_body_required())
+        self.fields.iter().any(|field| {
+            field.has_body_required()
+                || (field.sources.is_empty()
+                    && !field.flatten
+                    && self
+                        .default_sources
+                        .iter()
+                        .any(|source| source.from == SourceFrom::Body))
+        })
     }
 }
 
@@ -160,10 +161,14 @@ impl Metadata {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Field {
+    /// Separator between serialized sequence elements, before query decoding.
+    pub value_delimiter: Option<char>,
     /// The field's declared name in the struct definition.
     pub decl_name: &'static str,
     /// Whether the field is flattened; this field will be extracted from the request.
     pub flatten: bool,
+    /// Whether serde supplies a default when this tuple field is absent.
+    pub defaulted: bool,
     /// Field sources.
     pub sources: Vec<Source>,
     /// Field aliases.
@@ -186,8 +191,10 @@ impl Field {
     #[must_use]
     pub fn with_sources(decl_name: &'static str, sources: Vec<Source>) -> Self {
         Self {
+            value_delimiter: None,
             decl_name,
             flatten: false,
+            defaulted: false,
             sources,
             aliases: vec![],
             rename: None,
@@ -196,10 +203,24 @@ impl Field {
         }
     }
 
+    /// Set the separator used for a serialized sequence of field values.
+    #[must_use]
+    pub fn value_delimiter(mut self, delimiter: Option<char>) -> Self {
+        self.value_delimiter = delimiter;
+        self
+    }
+
     /// Sets the flatten to the given value.
     #[must_use]
     pub fn flatten(mut self, flatten: bool) -> Self {
         self.flatten = flatten;
+        self
+    }
+
+    /// Set whether an absent tuple field should use its serde default.
+    #[must_use]
+    pub fn defaulted(mut self, defaulted: bool) -> Self {
+        self.defaulted = defaulted;
         self
     }
 
@@ -248,6 +269,9 @@ impl Field {
     /// Check is this field has body required.
     pub(crate) fn has_body_required(&self) -> bool {
         self.sources.iter().any(|s| s.from == SourceFrom::Body)
+            // Flattened fields deserialize from the same request payload, so their
+            // descendants must participate in deciding whether to read the body.
+            || (self.flatten && self.metadata.is_some_and(Metadata::has_body_required))
     }
 }
 
